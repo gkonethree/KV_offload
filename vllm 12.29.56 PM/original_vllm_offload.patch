@@ -1,0 +1,259 @@
+This patch targets vllm @ 9a35c08.
+
+It modifies three files in vllm/v1/worker/ and adds one new file.
+Apply with:  git apply vllm_offload.patch
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 1 — vllm/v1/worker/gpu_worker.py
+────────────────────────────────────────────────────────────────────────────────
+
+Add after the existing imports at the top of gpu_worker.py:
+
+    # ---- offload_package integration ----
+    try:
+        from offload_package.vllm_adapter import build_orchestrator, OrchestratorConfig
+        _OFFLOAD_AVAILABLE = True
+    except ImportError:
+        _OFFLOAD_AVAILABLE = False
+
+Add to GPUWorker.__init__ (after self.cache_config is set):
+
+    self.kv_orchestrator = None  # populated in initialize_cache()
+
+Replace / augment GPUWorker.initialize_cache():
+
+    def initialize_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        # --- original body (unchanged) ---
+        ...existing code...
+
+        # ---- offload_package ----------------------------------------
+        if _OFFLOAD_AVAILABLE and self.vllm_config.offload_config is not None:
+            oc = self.vllm_config.offload_config          # see OffloadVllmConfig below
+            # kv_cache[layer_idx] is a tuple (k_tensor, v_tensor) in NHD layout.
+            # Use layer 0 as the representative for the scorer norm kernel.
+            k0, v0 = self.model_runner.kv_cache[0]
+            self.kv_orchestrator = build_orchestrator(
+                cfg=OrchestratorConfig(
+                    gpu_budget_blocks=oc.gpu_budget_blocks,
+                    num_cpu_slots=oc.num_cpu_slots,
+                    num_staging_slots=oc.num_staging_slots,
+                    interval_tokens=oc.interval_tokens,
+                    page_size=self.cache_config.block_size,
+                    num_layers=self.model_config.get_num_layers(
+                        self.parallel_config
+                    ),
+                    num_kv_heads=self.model_config.get_num_kv_heads(
+                        self.parallel_config
+                    ),
+                    head_dim=self.model_config.get_head_size(),
+                    dtype=k0.dtype,
+                    device=torch.device("cuda", self.local_rank),
+                    kv_layout="NHD",
+                    scorer_decay=oc.scorer_decay,
+                    scorer_head_reduction=oc.scorer_head_reduction,
+                ),
+                gpu_cache_k=k0,
+                gpu_cache_v=v0,
+            )
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 2 — vllm/v1/worker/gpu_model_runner.py
+────────────────────────────────────────────────────────────────────────────────
+
+The model runner already has access to self.worker (or receives scheduler_output).
+We need to hook into three places: block registration, decode step, and the
+point between "build kv_cache_params / attn_metadata" and "FlashInfer plan()".
+
+---- 2a. Block registration ----
+
+In _prepare_inputs (or wherever the block table is constructed per-request),
+after writing a new page to the block table for request req_id:
+
+    # NEW: tell the orchestrator about the new page
+    orc = getattr(self, '_orc', None)  # set in __init__, see 2c below
+    if orc is not None:
+        logical_bid = ...  # the logical block id just allocated
+        gpu_bid     = ...  # the physical GPU page id
+        orc.register_block(logical_bid, gpu_bid)
+
+        # If the *previous* block just became full (we crossed a page boundary):
+        if self._kv_ctrl.on_token_written():
+            prev_logical_bid = logical_bid - 1   # adjust for your indexing
+            prev_gpu_bid     = block_table[prev_logical_bid]
+            orc.on_block_full(prev_logical_bid, prev_gpu_bid)
+
+---- 2b. Prefill completion hook ----
+
+At the end of execute_model(), after the prefill forward but before returning,
+add:
+
+    if orc is not None and scheduler_output.num_prefill_tokens > 0:
+        for req in scheduler_output.scheduled_new_reqs:
+            orc.on_prefill_complete(
+                request_id=req.req_id,
+                logical_block_ids=req.block_ids,   # list[int]
+            )
+        self._kv_ctrl.on_prefill_complete(scheduler_output.num_prefill_tokens)
+
+---- 2c. Decode step + staging (the critical path) ----
+
+In execute_model(), AFTER building sparse_idx / sparse_len (from your
+selection module) but BEFORE calling wrapper.plan():
+
+    if orc is not None:
+        # 1. Tick the eviction schedule.
+        orc.on_decode_step(num_tokens=num_decode_tokens)
+
+        # 2. Fetch any CPU blocks needed by the sparse kernel to staging.
+        staging_map = orc.prepare_staging(sparse_idx, sparse_len)
+
+        # 3. Patch the paged_kv_indices so staged pages are visible to the kernel.
+        if staging_map:
+            attn_metadata.paged_kv_indices = orc.patch_paged_kv_indices(
+                attn_metadata.paged_kv_indices, staging_map
+            )
+
+Then pass attn_metadata as usual to your FlashInfer wrapper's plan() / run().
+
+---- 2d. Request completion hook ----
+
+In execute_model(), when processing finished requests
+(scheduler_output.finished_req_ids):
+
+    if orc is not None:
+        for req_id in scheduler_output.finished_req_ids:
+            orc.on_request_done(req_id)
+
+---- 2e. __init__ wiring ----
+
+In GPUModelRunner.__init__(), after self.worker is available (or pass it in):
+
+    from offload_package.controller import KVCompressionController
+    self._orc = getattr(worker, 'kv_orchestrator', None)
+    if self._orc is not None:
+        self._kv_ctrl = KVCompressionController(
+            W=vllm_config.offload_config.interval_tokens,
+            page_size=cache_config.block_size,
+        )
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 3 — vllm/config.py  (or vllm/v1/config.py — wherever VllmConfig lives)
+────────────────────────────────────────────────────────────────────────────────
+
+Add a new config dataclass (can live in a new file vllm/offload_config.py):
+
+    # vllm/offload_config.py
+    from __future__ import annotations
+    from dataclasses import dataclass, field
+    from typing import Optional
+
+    @dataclass
+    class OffloadVllmConfig:
+        \"\"\"
+        Configuration for the offload_package KV offloading integration.
+
+        Pass via:
+            engine_args = EngineArgs(
+                ...
+                offload_config=OffloadVllmConfig(
+                    gpu_budget_blocks=1000,
+                    num_cpu_slots=4096,
+                    num_staging_slots=64,
+                    interval_tokens=16,
+                ),
+            )
+        \"\"\"
+
+        # Max GPU pages allowed to stay resident; excess are offloaded to CPU.
+        gpu_budget_blocks: int = 1000
+
+        # Capacity of the pinned CPU offload buffer (in pages).
+        num_cpu_slots: int = 4096
+
+        # GPU staging pages (reserved at the tail of the GPU cache tensor).
+        # Rule of thumb: ~2x the max sparse_len budget in blocks.
+        num_staging_slots: int = 64
+
+        # Eviction fires every this many decoded tokens.
+        # Must be a multiple of page_size.
+        interval_tokens: int = 16
+
+        # PagedEvictionScorer knobs.
+        scorer_decay: float = 1.0
+        scorer_head_reduction: str = "mean"   # "mean" | "min"
+
+Add ``offload_config: Optional[OffloadVllmConfig] = None`` to VllmConfig.
+
+Register in EngineArgs.__init__ / from_cli_args as needed.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 4 (NEW) — vllm/v1/worker/sparse_attn_backend.py
+────────────────────────────────────────────────────────────────────────────────
+
+This is your attention backend registration shim.  It wraps
+BatchDecodeWithPagedKVCacheWrapper from your sparse kernel package and is
+selected via the VLLM_ATTENTION_BACKEND env-var or --attention-backend flag.
+
+See the skeleton below — fill in the import path for your kernel wrapper.
+
+    \"\"\"
+    Sparse FlashInfer attention backend for vLLM v1.
+
+    Select with:  VLLM_ATTENTION_BACKEND=sparse_flashinfer
+    or:           --attention-backend sparse_flashinfer
+    \"\"\"
+
+    from __future__ import annotations
+    from typing import Any, Optional, Tuple, TYPE_CHECKING
+
+    import torch
+
+    from vllm.attention.backends.abstract import (
+        AttentionBackend, AttentionImpl, AttentionMetadata, AttentionType,
+    )
+
+    # Your sparse kernel wrapper (adjust import path).
+    from your_sparse_kernel_pkg import BatchDecodeWithPagedKVCacheWrapper
+
+    class SparseFlashInferBackend(AttentionBackend):
+        @staticmethod
+        def get_name() -> str:
+            return "sparse_flashinfer"
+
+        @staticmethod
+        def get_impl_cls():
+            return SparseFlashInferImpl
+
+        # ... implement get_metadata_cls, get_builder_cls etc. following
+        # vllm/attention/backends/flashinfer.py as a template.
+
+    class SparseFlashInferImpl(AttentionImpl):
+        def forward(
+            self,
+            layer,
+            query, key, value,
+            kv_cache,
+            attn_metadata,
+            output,
+        ):
+            # Pull sparse selection tensors from attn_metadata
+            # (your builder sets them there).
+            sparse_len     = attn_metadata.sparse_len
+            sparse_idx     = attn_metadata.sparse_idx
+            sparse_weights = attn_metadata.sparse_weights
+
+            return layer._wrapper.run(
+                q=query,
+                paged_kv_cache=kv_cache,
+                sparse_len=sparse_len,
+                sparse_idx=sparse_idx,
+                sparse_weights=sparse_weights,
+            )
+
+Register in vllm/attention/backends/registry.py:
+
+    _BACKEND_REGISTRY = {
+        ...
+        "sparse_flashinfer": "vllm.v1.worker.sparse_attn_backend.SparseFlashInferBackend",
+    }
+
