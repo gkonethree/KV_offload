@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+
+# Editable install metadata (pip < 21.3)
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# torch.utils.cpp_extension JIT caches sometimes appear here when a user runs
+# scripts from the repo root.
+torch_extensions/

@@ -1,0 +1,21 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Ship the full csrc/ trees of the optimized packages in sdists. These
+# sources are JIT-compiled at first use, so they must be in the dist.
+recursive-include original_optimized/csrc *.cu *.cuh *.h
+recursive-include sparse_optimized/csrc *.cu *.cuh *.h
+recursive-include sparse_oracle_topk_optimized/csrc *.cu *.cuh *.h
+
+# Per-subpackage READMEs are nice-to-have inside the wheel/sdist.
+include sparse_optimized/README.md
+include sparse_oracle_topk_optimized/README.md
+
+# Never ship build / cache artifacts.
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude *.egg-info
+prune build
+prune dist

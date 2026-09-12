@@ -1,0 +1,105 @@
+[build-system]
+# torch + ninja are needed at build time because setup.py uses
+# torch.utils.cpp_extension.{CUDAExtension, BuildExtension} to compile
+# the four optimized kernels ahead of time. With PEP 517 build isolation,
+# the build env doesn't see runtime deps — so they must be listed here.
+requires = ["setuptools>=64", "wheel", "torch>=2.0", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skylight-kernels"
+version = "0.1.0"
+description = "FlashInfer-style paged-decode wrappers with optimized sparse and oracle top-k variants for long-context LLM serving."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "skylight-kernels contributors" }]
+keywords = [
+    "attention",
+    "flashinfer",
+    "cuda",
+    "llm",
+    "sparse-attention",
+    "paged-kv-cache",
+    "long-context",
+    "top-k",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+    # PyTorch is required at runtime for tensors. The four optimized
+    # kernels are AOT-compiled at install time (see setup.py); ninja is
+    # only needed at build time and lives in [build-system].requires.
+    "torch>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# `flashinfer` enables (a) the dense-decode baseline used by the profiling
+# scripts and (b) the radix-based `flashinfer.top_k` selection in
+# `sparse_oracle_topk_optimized` (a `torch.topk` fallback runs without it).
+flashinfer = ["flashinfer-python"]
+test = ["pytest"]
+dev = ["pytest", "build"]
+
+# ---------------------------------------------------------------------------
+# Packaging layout.
+#
+# This distribution ships six sibling top-level Python packages. The four
+# `*_optimized` packages embed a `csrc/` directory of CUDA sources that are
+# **compiled ahead of time** by setup.py (CUDAExtension + BuildExtension);
+# each produces a `<pkg>._cuda_ops` extension module that loads in O(ms) at
+# import. The .cu / .h sources are still shipped (the package-data globs
+# below) so sdist consumers can rebuild from source.
+# ---------------------------------------------------------------------------
+
+[tool.setuptools]
+# Listed explicitly (rather than `find:`) so the test/profile scripts that
+# live at the repo root are NOT accidentally included in the wheel.
+packages = [
+    "original",
+    "original_optimized",
+    "sparse",
+    "sparse_optimized",
+    "sparse_oracle_topk",
+    "sparse_oracle_topk_optimized",
+    "sparse_oracle_topk_sink_local_optimized",
+]
+
+[tool.setuptools.package-data]
+"original_optimized" = [
+    "csrc/*.cu",
+    "csrc/*.cuh",
+    "csrc/*.h",
+    "csrc/**/*.cu",
+    "csrc/**/*.cuh",
+    "csrc/**/*.h",
+]
+"sparse_optimized" = [
+    "csrc/*.cu",
+    "csrc/*.cuh",
+    "csrc/*.h",
+    "csrc/**/*.cu",
+    "csrc/**/*.cuh",
+    "csrc/**/*.h",
+    "README.md",
+]
+"sparse_oracle_topk_optimized" = [
+    "csrc/*.cu",
+    "csrc/*.cuh",
+    "csrc/*.h",
+    "csrc/**/*.cu",
+    "csrc/**/*.cuh",
+    "csrc/**/*.h",
+    "README.md",
+]
