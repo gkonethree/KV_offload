@@ -1,0 +1,42 @@
+model: Qwen/Qwen3.5-9B
+model_revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+tokenizer_revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+hardware:
+  architecture: hopper
+  expected_name: NVIDIA H200
+  device: 0
+  memory_utilization: 0.99
+server:
+  mode: cudagraph
+  max_model_len: 32896
+  dtype: bfloat16
+  block_size: 16
+  gdn_prefill_backend: triton
+  timeout_seconds: 1800
+  client_timeout_seconds: 1800
+  hf_overrides:
+    text_config:
+      max_position_embeddings: 1048576
+      rope_parameters:
+        rope_type: yarn
+        factor: 4.0
+        original_max_position_embeddings: 262144
+        rope_theta: 10000000
+        partial_rotary_factor: 0.25
+        mrope_interleaved: true
+        mrope_section: [11, 11, 10]
+workload:
+  dataset: random
+  context_length: 32768
+  output_length: 128
+  concurrencies: [64, 32, 16, 8, 4, 2, 1]
+  request_rate: inf
+  warmups: 2
+  temperature: 0
+  ignore_eos: true
+bmm:
+  method: block_minmax
+  densities: [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 1.0]
+  sink: 64
+  local: 64
+  channel_num: -1

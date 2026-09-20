@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.bak
+*.egg-info/
+build/
+dist/
+
+# uv / venv
+.venv/
+*.egg-link
+
+# Per-host workspace artifacts (NOT committed; recreate per host)
+env.sh
+# symlink to sibling kernels checkout (per-host)
+skylight_kernels
+
+# Per-run bench artifacts (transient)
+logs/
+results/
+bench-results/
+*.tgz
+*.tar.gz
+node-out/
+agent*-out/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Hidden caches / state
+/.skylight/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Per-host sync timestamps
+scripts/dev/.last_sync.*

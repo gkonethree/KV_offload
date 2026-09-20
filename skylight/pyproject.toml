@@ -1,0 +1,69 @@
+# Minimal workspace pyproject for B200 kernel verification.
+# Source of truth for the .venv at /data/users/krishna/sky/skylight/.venv.
+#
+# Pins torch to the cu130 wheel index (sm_100, B200). Workspaces in the
+# skylight_kernels checkout that lives at ./skylight_kernels/ (rsynced
+# from the Mac by scripts/dev/sync.sh).
+
+[project]
+name = "skylight"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "skylight-kernels",  # the skylight_kernels package; provided by the workspace
+    "pytest",
+    "huggingface-hub>=1,<2",
+    "pyyaml>=6,<7",
+    "torch==2.11.0+cu130",
+    "vllm==0.21.0",
+    "flashinfer-python==0.6.8.post1",
+    "nvidia-cuda-nvcc==13.0.88",
+    "nvidia-cuda-cccl==13.0.85",
+    "nvidia-cuda-crt==13.0.88",
+    "nvidia-cuda-runtime==13.0.96",
+    "nvidia-cuda-cupti==13.0.85",
+    "nvidia-cuda-nvrtc==13.0.88",
+    "nvidia-nvjitlink==13.0.88",
+    "nvidia-nvvm==13.0.88",
+    "nvidia-nvtx==13.0.85",
+]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.entry-points."vllm.general_plugins"]
+skylight = "skylight.plugin:install_plugin"
+
+[project.optional-dependencies]
+agentic = [
+  "mini-swe-agent",
+  "swebench"
+]
+longctx = [
+  "rouge",
+  "bert-score",
+  "fuzzywuzzy",
+  "jieba",
+  "nltk",
+]
+
+[project.scripts]
+skylight = "skylight.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.workspace]
+members = ["skylight_kernels"]
+
+[tool.uv]
+
+[tool.uv.sources]
+skylight-kernels = { workspace = true }
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
