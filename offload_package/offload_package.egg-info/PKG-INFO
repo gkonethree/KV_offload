@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: offload-package
+Version: 0.2.0
+Summary: Score-guided KV cache offload and sparse-attention staging for vLLM
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.0

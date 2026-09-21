@@ -11,7 +11,6 @@ class Residency(Enum):
     GPU = auto()
     CPU = auto()
     STAGING = auto()
-    IN_FLIGHT = auto()
 
 
 @dataclass
@@ -59,18 +58,6 @@ class ResidencyTable:
             raise KeyError(f"No CPU slot recorded for {ref}")
         self._blocks[ref] = BlockLocation(
             residency=Residency.STAGING,
-            gpu_block_id=old.gpu_block_id,
-            cpu_slot=old.cpu_slot,
-            staging_slot=int(staging_slot),
-            complete=old.complete,
-        )
-
-    def mark_in_flight(self, ref: BlockRef, staging_slot: int) -> None:
-        old = self._blocks[ref]
-        if old.cpu_slot is None:
-            raise KeyError(f"No CPU slot recorded for {ref}")
-        self._blocks[ref] = BlockLocation(
-            residency=Residency.IN_FLIGHT,
             gpu_block_id=old.gpu_block_id,
             cpu_slot=old.cpu_slot,
             staging_slot=int(staging_slot),

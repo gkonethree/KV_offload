@@ -55,7 +55,7 @@ class PagedEvictionScorer(BlockScorer):
 
     def scores(self, block_ids: Sequence[Hashable]) -> torch.Tensor:
         return torch.tensor(
-            [self._scores.get(block_id, 0.0) for block_id in block_ids],
+            [self._scores.get(block_id, float('inf')) for block_id in block_ids],
             dtype=torch.float32,
         )
 

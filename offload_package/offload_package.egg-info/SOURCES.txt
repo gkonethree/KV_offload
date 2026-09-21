@@ -1,0 +1,7 @@
+pyproject.toml
+offload_package.egg-info/PKG-INFO
+offload_package.egg-info/SOURCES.txt
+offload_package.egg-info/dependency_links.txt
+offload_package.egg-info/requires.txt
+offload_package.egg-info/top_level.txt
+tests/test_core.py

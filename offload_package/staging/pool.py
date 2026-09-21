@@ -8,16 +8,7 @@ import torch
 from ..offload.manager import KVOffloadManager
 from ..scoring.base import BlockRef
 from .residency import Residency, ResidencyTable
-# FIX — lazy stream property (same pattern in both classes):
-@property
-def _copy_stream(self) -> torch.cuda.Stream:
-    if self.__copy_stream is None:
-        self.__copy_stream = torch.cuda.Stream(
-            device=self.gpu_k_caches[0].device
-        )
-    return self.__copy_stream
 
-# In __init__: self.__copy_stream: torch.cuda.Stream | None = None
 
 class KVStagingPool:
     """Temporary GPU pages used to satisfy sparse attention requests.
@@ -55,9 +46,16 @@ class KVStagingPool:
         self.cpu_cache = cpu_cache
         self.residency = residency
         self.offload_manager = offload_manager
-        self.copy_stream = torch.cuda.Stream(device=self.gpu_k_caches[0].device)
+        self._copy_stream: torch.cuda.Stream | None = None
         self._lru: OrderedDict[BlockRef, int] = OrderedDict()
         self._free = list(range(num_slots - 1, -1, -1))
+
+    @property
+    def copy_stream(self) -> torch.cuda.Stream:
+        """Lazily initialize the copy stream."""
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=self.gpu_k_caches[0].device)
+        return self._copy_stream
 
     def ensure_resident(self, refs: Sequence[BlockRef]) -> dict[BlockRef, int]:
         result: dict[BlockRef, int] = {}
@@ -67,8 +65,7 @@ class KVStagingPool:
                 raise KeyError(f"Unknown logical block {ref}")
             if loc.residency == Residency.GPU:
                 continue
-            if loc.residency in (Residency.STAGING, Residency.IN_FLIGHT) \
-                    and loc.staging_slot is not None:
+            if loc.residency == Residency.STAGING and loc.staging_slot is not None:
                 self._lru.move_to_end(ref)
                 result[ref] = loc.staging_slot
                 continue
@@ -89,7 +86,8 @@ class KVStagingPool:
                     )
                 event = torch.cuda.Event()
                 event.record(self.copy_stream)
-            torch.cuda.current_stream(device=k_cache.device).wait_event(event)
+            # Ensure copy is visible to the default stream (where attention runs)
+            torch.cuda.current_stream(device=k_cache.device).wait_stream(self.copy_stream)
             self.residency.mark_staging(ref, slot)
             result[ref] = slot
         return result
@@ -98,11 +96,18 @@ class KVStagingPool:
         if self._free:
             slot = self._free.pop()
         else:
-            evicted, slot = self._lru.popitem(last=False)
+            # Score-aware eviction: evict lowest-scored staging block
+            lru_candidates = list(self._lru.keys())
+            if not lru_candidates:
+                raise RuntimeError("No staging slots available and no candidates to evict")
+            scores = self.offload_manager.scorer.scores(lru_candidates)
+            evict_idx = int(torch.argmin(scores).item())
+            evicted = lru_candidates[evict_idx]
             old = self.residency.get(evicted)
             if old is None or old.cpu_slot is None:
                 raise RuntimeError(f"Cannot evict staging block {evicted}")
             self.residency.mark_cpu(evicted, old.cpu_slot)
+            slot = self._lru.pop(evicted)
         self._lru[incoming] = slot
         return slot
 
@@ -110,16 +115,3 @@ class KVStagingPool:
         slot = self._lru.pop(ref, None)
         if slot is not None:
             self._free.append(slot)
-
-    def release_all(self) -> None:
-        for ref in list(self._lru):
-            self.release(ref)
-
-    def physical_page(self, slot: int) -> int:
-        if not 0 <= slot < self.num_slots:
-            raise ValueError("invalid staging slot")
-        return self.base + slot
-
-    @property
-    def num_used_slots(self) -> int:
-        return len(self._lru)

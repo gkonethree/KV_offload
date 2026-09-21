@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 import torch
 
-from ..scoring.base import BlockRef, BlockScorer
+from ..scoring.base import BlockRef, BlockScorer, BlockKVStats
 from ..scoring.norm_kernel import compute_block_kv_norms
 from ..staging.residency import Residency, ResidencyTable
 
@@ -67,15 +67,28 @@ class KVOffloadManager:
         self._store_events: dict[int, torch.cuda.Event] = {}
 
     def score_block(self, ref: BlockRef, gpu_block_id: int) -> None:
-        # The representative layer is sufficient for a query-agnostic scorer.
-        stats = compute_block_kv_norms(
-            self.gpu_k_caches[0],
-            self.gpu_v_caches[0],
-            [gpu_block_id],
-            logical_block_ids=[ref],
-            layout=self.kv_layout,
-        )
-        self.scorer.update(stats)
+        """Score block using all attention layers, aggregate by mean."""
+        # Skip warmup requests
+        if str(ref.request_id).startswith("_warmup_"):
+            return
+            
+        all_v_norms = []
+        all_k_norms = []
+        for k_cache, v_cache in zip(self.gpu_k_caches, self.gpu_v_caches):
+            stats = compute_block_kv_norms(
+                k_cache,
+                v_cache,
+                [gpu_block_id],
+                logical_block_ids=[ref],
+                layout=self.kv_layout,
+            )
+            all_v_norms.append(stats.v_norm)
+            all_k_norms.append(stats.k_norm)
+        # Mean across layers
+        v_norm = torch.stack(all_v_norms).mean(dim=0)
+        k_norm = torch.stack(all_k_norms).mean(dim=0)
+        
+        self.scorer.update(BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=[ref]))
 
     def on_block_full(self, ref: BlockRef) -> None:
         loc = self.residency.get(ref)
@@ -87,6 +100,75 @@ class KVOffloadManager:
             # Log and leave block as incomplete so it is re-scored on next write.
             raise
         self.residency.mark_complete(ref)
+        
+    def offload_fraction(
+        self,
+        candidates: Sequence[BlockRef],
+        fraction: float,
+        scored_blocks: set[BlockRef] | None = None,
+    ) -> list[BlockRef]:
+        """Offload the lowest-scoring fraction of complete GPU blocks."""
+
+        if not 0.0 <= fraction < 1.0:
+            raise ValueError("fraction must be in [0, 1)")
+
+        # Only consider blocks that have been scored
+        if scored_blocks is None:
+            scored_blocks = set()
+        
+        scored_candidates = [
+            ref
+            for ref in candidates
+            if ref in scored_blocks
+            and (loc := self.residency.get(ref)) is not None
+            and loc.residency == Residency.GPU
+            and loc.complete
+        ]
+
+        n_offload = int(len(scored_candidates) * fraction)
+
+        if n_offload <= 0:
+            return []
+
+        # select_for_eviction() interprets budget as the number to KEEP.
+        keep = len(scored_candidates) - n_offload
+
+        refs_to_evict = self.scorer.select_for_eviction(
+            scored_candidates,
+            keep,
+        )
+
+        offloaded = []
+        events = []
+
+        for ref in refs_to_evict:
+            loc = self.residency.get(ref)
+
+            if (
+                loc is None
+                or loc.gpu_block_id is None
+                or loc.residency != Residency.GPU
+            ):
+                continue
+
+            try:
+                cpu_slot, event = self._copy_gpu_to_cpu(loc.gpu_block_id)
+                events.append(event)
+
+                self.residency.mark_cpu(
+                    ref,
+                    cpu_slot,
+                )
+
+                offloaded.append(ref)
+            except Exception as e:
+                continue
+
+        # Wait for all async copies to complete
+        for event in events:
+            event.synchronize()
+
+        return offloaded
 
     def maybe_offload(self, candidates: Sequence[BlockRef]) -> list[BlockRef]:
         gpu_candidates = [
@@ -102,32 +184,43 @@ class KVOffloadManager:
             gpu_candidates, self.gpu_budget_blocks
         )
         offloaded: list[BlockRef] = []
+        events = []
         for ref in refs_to_evict:
             loc = self.residency.get(ref)
             if loc is None or loc.gpu_block_id is None or loc.residency != Residency.GPU:
                 continue
-            cpu_slot = self._copy_gpu_to_cpu(loc.gpu_block_id)
+            cpu_slot, event = self._copy_gpu_to_cpu(loc.gpu_block_id)
+            events.append(event)
             self.residency.mark_cpu(ref, cpu_slot)
             offloaded.append(ref)
+        # Wait for all async copies to complete
+        for event in events:
+            event.synchronize()
         return offloaded
 
-    def _copy_gpu_to_cpu(self, gpu_block_id: int) -> int:
+    def _copy_gpu_to_cpu(self, gpu_block_id: int) -> tuple[int, torch.cuda.Event]:
         slot = self._cpu_pool.allocate()
         with torch.cuda.stream(self._copy_stream):
             # vLLM's K/V caches are separate per attention layer.
             for layer, (k_cache, v_cache) in enumerate(
                 zip(self.gpu_k_caches, self.gpu_v_caches)
             ):
-                self.cpu_cache[layer, slot, 0].copy_(
-                    k_cache[gpu_block_id], non_blocking=True
-                )
-                self.cpu_cache[layer, slot, 1].copy_(
-                    v_cache[gpu_block_id], non_blocking=True
-                )
+                # GPU cache has shape [num_kv_heads, page_size, 2*head_dim]
+                # CPU cache expects [page_size, num_kv_heads, 2*head_dim]
+                k_block = k_cache[gpu_block_id]
+                v_block = v_cache[gpu_block_id]
+                
+                # Transpose from [num_kv_heads, page_size, 2*head_dim] 
+                # to [page_size, num_kv_heads, 2*head_dim]
+                k_block = k_block.permute(1, 0, 2)
+                v_block = v_block.permute(1, 0, 2)
+                
+                self.cpu_cache[layer, slot, 0].copy_(k_block, non_blocking=True)
+                self.cpu_cache[layer, slot, 1].copy_(v_block, non_blocking=True)
             event = torch.cuda.Event()
             event.record(self._copy_stream)
         self._store_events[slot] = event
-        return slot
+        return slot, event
 
     def wait_cpu_slot(self, slot: int) -> None:
         event = self._store_events.get(slot)
