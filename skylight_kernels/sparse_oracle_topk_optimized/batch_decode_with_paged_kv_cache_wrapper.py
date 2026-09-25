@@ -219,6 +219,24 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
         self._n_keys_cfg: Optional[int] = (
             int(n_keys) if n_keys is not None else None
         )
+        # Store last top-k indices for debugging/inspection
+        self._last_topk_idx: Optional[torch.Tensor] = None
+
+    def get_last_topk_indices(self) -> Optional[torch.Tensor]:
+        """Return the top-k token indices selected in the last run().
+        
+        Returns tensor of shape [batch_size, num_qo_heads, k_eff] with the
+        selected token indices for each (batch, query_head) pair.
+        """
+        return self._last_topk_idx
+
+    def get_last_topk_indices_for_batch(self, batch_idx: int, head_idx: int = 0) -> Optional[list[int]]:
+        """Return top-k indices for a specific batch and head as a list."""
+        if self._last_topk_idx is None:
+            return None
+        if batch_idx >= self._last_topk_idx.shape[0]:
+            return None
+        return self._last_topk_idx[batch_idx, head_idx].tolist()
 
     def set_topk(self, topk: Optional[float]) -> None:
         """Update the default fractional ``topk`` after construction.
@@ -339,6 +357,9 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        print(f"[SPARSE KERNEL DEBUG] run() CALLED! q.shape={q.shape if hasattr(q, 'shape') else type(q)}", flush=True)
+        import sys
+        sys.stdout.flush()
         del args, enable_pdl, sinks, skip_softmax_threshold_scale_factor, kv_cache_sf
         if not self._planned:
             raise RuntimeError("plan() must be called before run().")
@@ -499,6 +520,12 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
         # available, or ``torch.topk`` as a fallback. Result is int64 in both
         # paths, shape [B, H_q, k_eff].
         topk_idx = self._topk_impl(scores, k_eff)
+        # Store for inspection
+        self._last_topk_idx = topk_idx.detach().cpu()
+        # Also store the scores for debugging
+        self._last_topk_scores = scores.detach().cpu() if 'scores' in locals() else None
+        print(f"[SPARSE KERNEL DEBUG] run() called: batch_size={batch_size}, H_q={num_qo_heads}, L_max={L_max}, k_eff={k_eff}, n_keys_for_topk={n_keys_for_topk}", flush=True)
+        print(f"[SPARSE KERNEL DEBUG] topk_idx shape: {topk_idx.shape}, first batch/head tokens: {topk_idx[0, 0].tolist()[:10]}", flush=True)
         del scores  # free 4 * B * H_q * L_max bytes early
 
         # ---- 4. Build sparse plan (uniform top_k across all heads) ----------

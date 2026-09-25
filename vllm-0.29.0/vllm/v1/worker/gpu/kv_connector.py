@@ -57,6 +57,11 @@ class ActiveKVConnector(KVConnector):
         self._pending_load_start = False
         self._disabled = False
 
+    def set_runner(self, runner) -> None:
+        """Delegate set_runner to the wrapped connector."""
+        if hasattr(self.kv_connector, 'set_runner'):
+            self.kv_connector.set_runner(runner)
+
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         if self._disabled:
             return

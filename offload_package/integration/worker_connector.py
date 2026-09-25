@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -24,8 +24,8 @@ from vllm.forward_context import ForwardContext
 
 from offload_package.config import OffloadConfig
 from offload_package.controller import KVCompressionController
-if TYPE_CHECKING:
-    from offload_package.integration.manager import OffloadOrchestrator
+from offload_package.integration.manager import OffloadOrchestrator
+from offload_package.scoring.base import BlockRef
 from offload_package.integration.metadata import (
     OffloadPackageMetadata,
     OffloadPackageWorkerMetadata,
@@ -35,7 +35,7 @@ from offload_package.selection.adapter import (
     collect_needed_block_refs,
     patch_paged_kv_indices_with_staging,
 )
-
+from offload_package.staging.pool import KVStagingPool
 from offload_package.staging.residency import Residency, ResidencyTable
 from offload_package.shared.types import (
     OrchestratorConfig,
@@ -46,121 +46,6 @@ from offload_package.shared.types import (
 logger = init_logger(__name__)
 
 INVALID_JOB_ID = -1
-
-
-class KVStagingPool:
-    """Temporary GPU pages used to satisfy sparse attention requests.
-
-    The staging pages are expected to be the tail pages of the same per-layer
-    KV cache tensors passed to the attention kernel.  This is important:
-    without a shared address space, the existing sparse kernel cannot address
-    staging pages without a CUDA-kernel change.
-    """
-
-    def __init__(
-        self,
-        *,
-        num_slots: int,
-        staging_base_page: int,
-        gpu_k_caches: Sequence[torch.Tensor],
-        gpu_v_caches: Sequence[torch.Tensor],
-        cpu_cache: torch.Tensor,
-        residency: ResidencyTable,
-        offload_manager: KVOffloadManager,
-    ) -> None:
-        if num_slots <= 0:
-            raise ValueError("num_slots must be > 0")
-        if len(gpu_k_caches) != len(gpu_v_caches):
-            raise ValueError("GPU K/V layer counts must match")
-        if staging_base_page < 0:
-            raise ValueError("staging_base_page must be >= 0")
-        if staging_base_page + num_slots > gpu_k_caches[0].shape[0]:
-            raise ValueError("staging pages do not fit in GPU cache")
-
-        self.num_slots = int(num_slots)
-        self.base = int(staging_base_page)
-        self.gpu_k_caches = list(gpu_k_caches)
-        self.gpu_v_caches = list(gpu_v_caches)
-        self.cpu_cache = cpu_cache
-        self.residency = residency
-        self.offload_manager = offload_manager
-        self._copy_stream: torch.cuda.Stream | None = None
-        self._lru: OrderedDict[BlockRef, int] = OrderedDict()
-        self._free = list(range(num_slots - 1, -1, -1))
-
-    @property
-    def copy_stream(self) -> torch.cuda.Stream:
-        """Lazily initialize the copy stream."""
-        if self._copy_stream is None:
-            self._copy_stream = torch.cuda.Stream(device=self.gpu_k_caches[0].device)
-        return self._copy_stream
-
-    def ensure_resident(self, refs: Sequence[BlockRef]) -> dict[BlockRef, int]:
-        result: dict[BlockRef, int] = {}
-        for ref in dict.fromkeys(refs):
-            loc = self.residency.get(ref)
-            if loc is None:
-                raise KeyError(f"Unknown logical block {ref}")
-            if loc.residency == Residency.GPU:
-                continue
-            if loc.residency == Residency.STAGING and loc.staging_slot is not None:
-                self._lru.move_to_end(ref)
-                result[ref] = loc.staging_slot
-                continue
-            if loc.cpu_slot is None:
-                raise RuntimeError(f"{ref} is not backed by a CPU slot")
-
-            self.offload_manager.wait_cpu_slot(loc.cpu_slot)
-            slot = self._allocate_slot(ref)
-            with torch.cuda.stream(self.copy_stream):
-                for layer, (k_cache, v_cache) in enumerate(
-                    zip(self.gpu_k_caches, self.gpu_v_caches)
-                ):
-                    # CPU cache: [page_size, num_kv_heads, head_dim] -> GPU: [num_kv_heads, page_size, head_dim*2] (K and V combined)
-                    k_src = self.cpu_cache[layer, loc.cpu_slot, 0]  # [page_size, num_kv_heads, head_dim]
-                    v_src = self.cpu_cache[layer, loc.cpu_slot, 1]  # [page_size, num_kv_heads, head_dim]
-                    
-                    # Transpose from [page_size, num_kv_heads, head_dim] to [num_kv_heads, page_size, head_dim]
-                    k_src = k_src.permute(1, 0, 2).contiguous()
-                    v_src = v_src.permute(1, 0, 2).contiguous()
-                    
-                    # Combine K and V in last dimension: [num_kv_heads, page_size, 2*head_dim]
-                    combined = torch.cat([k_src, v_src], dim=-1)
-                    
-                    k_cache[self.base + slot].copy_(combined, non_blocking=True)
-                    # v_cache is not used since K and V are combined in the same tensor
-                    # (vllM stores K and V in separate tensors but with combined head_dim)
-                event = torch.cuda.Event()
-                event.record(self.copy_stream)
-            # Ensure copy is visible to the default stream (where attention runs)
-            torch.cuda.current_stream(device=k_cache.device).wait_stream(self.copy_stream)
-            self.residency.mark_staging(ref, slot)
-            result[ref] = slot
-        return result
-
-    def _allocate_slot(self, incoming: BlockRef) -> int:
-        if self._free:
-            slot = self._free.pop()
-        else:
-            # Score-aware eviction: evict lowest-scored staging block
-            lru_candidates = list(self._lru.keys())
-            if not lru_candidates:
-                raise RuntimeError("No staging slots available and no candidates to evict")
-            scores = self.offload_manager.scorer.scores(lru_candidates)
-            evict_idx = int(torch.argmin(scores).item())
-            evicted = lru_candidates[evict_idx]
-            old = self.residency.get(evicted)
-            if old is None or old.cpu_slot is None:
-                raise RuntimeError(f"Cannot evict staging block {evicted}")
-            self.residency.mark_cpu(evicted, old.cpu_slot)
-            slot = self._lru.pop(evicted)
-        self._lru[incoming] = slot
-        return slot
-
-    def release(self, ref: BlockRef) -> None:
-        slot = self._lru.pop(ref, None)
-        if slot is not None:
-            self._free.append(slot)
 
 
 class OffloadPackageWorker(KVConnectorBase_V1):
@@ -175,11 +60,12 @@ class OffloadPackageWorker(KVConnectorBase_V1):
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
         self.offload_config = offload_config
+        self._vllm_config = vllm_config
 
         # Will be initialized from vLLM runtime
         self.kv_cache_config: Optional[KVCacheConfig] = None
         self.kv_cache_spec = None
-        self._orchestrator: Optional["OffloadOrchestrator"] = None
+        self._orchestrator: Optional[OffloadOrchestrator] = None
 
         # Worker reference for getting request IDs
         self._worker = None
@@ -191,6 +77,9 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         # Transfer tracking
         self._load_events: list[tuple[int, torch.cuda.Event]] = []
         self._store_events: list[tuple[int, torch.cuda.Event]] = []
+
+        # Model runner reference (set by set_runner)
+        self._model_runner = None
 
         # Completion watermarks
         self._load_hwm = -1
@@ -239,16 +128,11 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         self.kv_cache_spec = spec
         self._staging_base_page = self.kv_cache_config.num_blocks - self._staging_slots
 
-        # Build orchestrator
-        self._build_orchestrator()
-
     def _build_orchestrator(self) -> None:
         """Build the offload orchestrator with all components."""
-        from offload_package.shared.types import build_orchestrator, normalize_runner_kv_caches
-
         # Normalize KV caches to get the view
         kv_cache_view = normalize_runner_kv_caches(
-            self._worker.model_runner.kv_caches,
+            self._model_runner.kv_caches,
             self.kv_cache_config,
             staging_slots=self._staging_slots,
         )
@@ -271,12 +155,43 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         # Build orchestrator using the factory function
         self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
 
+        # Inject orchestrator into metadata builders
+        if self._orchestrator is not None:
+            # Get layer names from kv_cache_config
+            for group in self.kv_cache_config.kv_cache_groups:
+                for layer_name in group.layer_names:
+                    layer_spec = self.kv_cache_spec
+                    if hasattr(layer_spec, 'metadata_builder') and layer_spec.metadata_builder is not None:
+                        builder_cls = type(layer_spec.metadata_builder)
+                        if hasattr(builder_cls, '_offload_orchestrator'):
+                            builder_cls._offload_orchestrator = self._orchestrator
+                            layer_spec.metadata_builder._offload_orchestrator = self._orchestrator
+
+        logger.info("OffloadPackageWorker orchestrator built successfully")
+
     def bind_worker(self, worker) -> None:
-        """Bind to the GPU worker for accessing request IDs."""
+        """Bind to the GPU worker for accessing model runner."""
         self._worker = worker
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Set the connector metadata from the scheduler."""
+        assert isinstance(connector_metadata, OffloadPackageMetadata)
+        self._metadata = connector_metadata
+        print(f"[WORKER DEBUG] bind_connector_metadata: load_event={connector_metadata.load_event}, store_event={connector_metadata.store_event}, request_ids={connector_metadata.request_ids}, store_gpu_blocks={connector_metadata.store_gpu_blocks}", flush=True)
+
+    def clear_connector_metadata(self) -> None:
+        """Clear the connector metadata."""
+        self._metadata = None
+        print(f"[WORKER DEBUG] clear_connector_metadata", flush=True)
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        """Handle preempted requests."""
+        pass
 
     def start_load_kv(self, forward_context: ForwardContext) -> None:
         """Launch async CPU→GPU copies for staging (sparse attention fetch)."""
+        # Try to sync blocks before staging
+        self._try_sync_blocks()
         print(f"[WORKER DEBUG] start_load_kv called: metadata={self._metadata is not None}", flush=True)
         if self._metadata is None:
             print(f"[WORKER DEBUG] start_load_kv: early return - no metadata", flush=True)
@@ -302,6 +217,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         print(f"[WORKER DEBUG] sparse_idx shape={sparse_idx.shape}, sparse_len shape={sparse_len.shape}", flush=True)
 
         # Use orchestrator's staging pool to fetch blocks
+        print(f"[WORKER DEBUG] prepare_staging: request_ids={request_ids}, sparse_idx.shape={sparse_idx.shape}, sparse_len.shape={sparse_len.shape}", flush=True)
         staging_map = self._orchestrator.prepare_staging(
             request_ids,
             sparse_idx.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
@@ -332,14 +248,14 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             sparse_idx = skylight_backend._sparse_pattern_cache.get('sparse_idx', None)
             sparse_len = skylight_backend._sparse_pattern_cache.get('sparse_len', None)
             request_ids = skylight_backend._sparse_pattern_cache.get('request_ids', None)
-            
+
             print(f"[WORKER DEBUG] pid={os.getpid()}, _get_cached_sparse_pattern: skylight_backend id={id(skylight_backend)}, sparse_idx id={id(sparse_idx)}", flush=True)
             print(f"[WORKER DEBUG] _cached_sparse_idx={sparse_idx is not None}, _cached_sparse_len={sparse_len is not None}, _cached_request_ids={request_ids}", flush=True)
-            
+
             # If cached request_ids not available, try to get from model runner
             if request_ids is None and self._worker is not None:
-                if hasattr(self._worker, 'model_runner') and self._worker.model_runner is not None:
-                    runner = self._worker.model_runner
+                if hasattr(self._worker, 'model_runner') and self._model_runner is not None:
+                    runner = self._model_runner
                     if hasattr(runner, 'execute_model_state') and runner.execute_model_state is not None:
                         input_batch = runner.execute_model_state.input_batch
                         if input_batch is not None and hasattr(input_batch, 'req_ids'):
@@ -347,7 +263,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                             print(f"[WORKER DEBUG] Got request_ids from model runner: {request_ids}", flush=True)
                             # Store in cache for next time
                             skylight_backend._sparse_pattern_cache['request_ids'] = request_ids
-            
+
             return sparse_idx, sparse_len, request_ids
         except Exception as e:
             logger.warning(f"Could not get cached sparse pattern: {e}")
@@ -363,12 +279,20 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             for layer, (k_cache, v_cache) in enumerate(zip(
                 staging_pool.gpu_k_caches, staging_pool.gpu_v_caches
             )):
-                k_cache[staging_pool.base + staging_slot].copy_(
-                    staging_pool.cpu_cache[layer, cpu_slot, 0], non_blocking=True
-                )
-                v_cache[staging_pool.base + staging_slot].copy_(
-                    staging_pool.cpu_cache[layer, cpu_slot, 1], non_blocking=True
-                )
+                # CPU cache: [page_size, num_kv_heads, head_dim] -> GPU: [num_kv_heads, page_size, 2*head_dim]
+                k_src = staging_pool.cpu_cache[layer, cpu_slot, 0]  # [page_size, num_kv_heads, head_dim]
+                v_src = staging_pool.cpu_cache[layer, cpu_slot, 1]  # [page_size, num_kv_heads, head_dim]
+                
+                # Transpose from [page_size, num_kv_heads, head_dim] to [num_kv_heads, page_size, head_dim]
+                k_src = k_src.permute(1, 0, 2).contiguous()
+                v_src = v_src.permute(1, 0, 2).contiguous()
+                
+                # Combine K and V in last dimension: [num_kv_heads, page_size, 2*head_dim]
+                combined = torch.cat([k_src, v_src], dim=-1)
+                
+                # Copy to GPU staging (K and V are combined in the same tensor)
+                k_cache[staging_pool.base + staging_slot].copy_(combined, non_blocking=True)
+                # v_cache is not used since K and V are combined
         # Ensure visibility to default stream
         torch.cuda.current_stream().wait_stream(self._load_stream)
 
@@ -465,12 +389,11 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             self._store_hwm = event_idx
         self._store_events.clear()
 
-    # Abstract methods from KVConnectorBase_V1
+    # Abstract methods from KVConnectorBase_V1 (minimal implementations for testing)
     
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        pass
-
     def wait_for_layer_load(self, layer_name: str) -> None:
+        """Block until the KV for a specific layer is loaded."""
+        # For testing, we don't do layer-by-layer pipelining
         pass
 
     def save_kv_layer(
@@ -480,6 +403,8 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
+        """Start saving a layer of KV cache to the connector."""
+        # For testing, we don't do layer-by-layer saves
         pass
 
     def get_num_new_matched_tokens(
@@ -487,6 +412,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
+        """Get number of new matched tokens for prefix caching."""
         return 0, False
 
     def update_state_after_alloc(
@@ -495,6 +421,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
+        """Update state after block allocation."""
         pass
 
     def request_finished(
@@ -502,6 +429,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        """Called when a request finishes."""
         return False, None
 
     def request_finished_all_groups(
@@ -509,64 +437,137 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        """Called when a request finishes in all KV cache groups."""
         return self.request_finished(request, block_ids=[])
 
     def shutdown(self) -> None:
+        """Shutdown the connector."""
         self.flush_and_sync()
 
     def get_handshake_metadata(self):
+        """Get handshake metadata for P/D workers."""
         return None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         return set()
 
+    def build_connector_meta(self) -> KVConnectorWorkerMetadata | None:
+        """Build worker metadata for the scheduler."""
+        return self.build_worker_meta()
+
+    def _sync_blocks_from_runner(self) -> None:
+        """Sync block IDs from model runner's block table to orchestrator."""
+        print(f"[SYNC DEBUG] _sync_blocks_from_runner called, id={id(self)}", flush=True)
+        if self._model_runner is None or self._orchestrator is None:
+            print(f"[SYNC DEBUG] model_runner or orchestrator is None", flush=True)
+            return
+        runner = self._model_runner
+        # runner IS the model_runner
+        if not hasattr(runner, 'block_tables') or not runner.block_tables:
+            print(f"[SYNC DEBUG] no block_tables", flush=True)
+            return
+        
+        block_tables = runner.block_tables
+        if not hasattr(block_tables, 'block_tables') or not block_tables.block_tables:
+            print(f"[SYNC DEBUG] no block_tables.block_tables", flush=True)
+            return
+        
+        # Get block tables for the first KV cache group (group 0)
+        group_0_table = block_tables.block_tables[0]
+        num_blocks_tensor = block_tables.num_blocks
+        
+        # Get request IDs from the model runner's execute_model_state
+        if not hasattr(runner, 'execute_model_state') or runner.execute_model_state is None:
+            print(f"[SYNC DEBUG] no execute_model_state", flush=True)
+            return
+        input_batch = runner.execute_model_state.input_batch
+        if not hasattr(input_batch, 'req_ids'):
+            print(f"[SYNC DEBUG] no req_ids", flush=True)
+            return
+        
+        req_ids = input_batch.req_ids
+        print(f"[SYNC DEBUG] req_ids={req_ids}", flush=True)
+        for req_idx, req_id in enumerate(req_ids):
+            # Get number of blocks for this request in group 0
+            num_blocks = int(num_blocks_tensor.np[0, req_idx]) if num_blocks_tensor.np.ndim == 2 else 0
+            print(f"[SYNC DEBUG] req_idx={req_idx}, req_id={req_id}, num_blocks={num_blocks}", flush=True)
+            if num_blocks == 0:
+                continue
+            
+            # Get block IDs for this request
+            block_ids = group_0_table.gpu[req_idx, :num_blocks].tolist()
+            print(f"[SYNC DEBUG] block_ids={block_ids}", flush=True)
+            
+            # Sync with orchestrator
+            self._orchestrator.sync_request_blocks(req_id, block_ids, 0)
+            # Mark as complete since we're in decode phase
+            for block_idx, gpu_block_id in enumerate(block_ids):
+                ref = BlockRef(str(req_id), block_idx)
+                loc = self._orchestrator.residency.get(ref)
+                if loc and not loc.complete:
+                    self._orchestrator.residency.mark_complete(ref)
+        
+        req_ids = input_batch.req_ids
+        print(f"[SYNC DEBUG] req_ids={req_ids}", flush=True)
+        for req_idx, req_id in enumerate(req_ids):
+            # Get number of blocks for this request in group 0
+            num_blocks = int(num_blocks_tensor.np[0, req_idx]) if num_blocks_tensor.np.ndim == 2 else 0
+            print(f"[SYNC DEBUG] req_idx={req_idx}, req_id={req_id}, num_blocks={num_blocks}", flush=True)
+            if num_blocks == 0:
+                continue
+            
+            # Get block IDs for this request
+            block_ids = group_0_table.gpu[req_idx, :num_blocks].tolist()
+            print(f"[SYNC DEBUG] block_ids={block_ids}", flush=True)
+            
+            # Sync with orchestrator
+            self._orchestrator.sync_request_blocks(req_id, block_ids, 0)
+            # Mark as complete since we're in decode phase
+            for block_idx, gpu_block_id in enumerate(block_ids):
+                ref = BlockRef(str(req_id), block_idx)
+                loc = self._orchestrator.residency.get(ref)
+                if loc and not loc.complete:
+                    self._orchestrator.residency.mark_complete(ref)
+
+    def _try_sync_blocks(self) -> None:
+        """Try to sync blocks, retrying if model_runner not ready."""
+        print(f"[TRY SYNC DEBUG] _try_sync_blocks called, id={id(self)}, _model_runner={id(self._model_runner) if self._model_runner else None}", flush=True)
+        if self._model_runner is None or self._orchestrator is None:
+            print(f"[TRY SYNC DEBUG] model_runner or orchestrator is None", flush=True)
+            return
+        runner = self._model_runner
+        # runner IS the model_runner, no need to check for model_runner attribute
+        if not hasattr(runner, 'block_tables') or not runner.block_tables:
+            print(f"[TRY SYNC DEBUG] no block_tables", flush=True)
+            return
+        block_tables = runner.block_tables
+        print(f"[TRY SYNC DEBUG] block_tables={block_tables}, block_tables.block_tables={block_tables.block_tables}", flush=True)
+        if not hasattr(block_tables, 'block_tables') or not block_tables.block_tables:
+            print(f"[TRY SYNC DEBUG] no block_tables.block_tables", flush=True)
+            return
+        ems = getattr(runner, 'execute_model_state', None)
+        print(f"[TRY SYNC DEBUG] execute_model_state={ems}", flush=True)
+        if not hasattr(runner, 'execute_model_state') or runner.execute_model_state is None:
+            # execute_model_state not ready yet (e.g., during warmup), skip this sync
+            print(f"[TRY SYNC DEBUG] execute_model_state not ready, skipping sync", flush=True)
+            return
+        # All checks passed, do the sync
+        self._sync_blocks_from_runner()
+        input_batch = runner.execute_model_state.input_batch
+        if not hasattr(input_batch, 'req_ids') or not input_batch.req_ids:
+            print(f"[TRY SYNC DEBUG] no req_ids", flush=True)
+            return
+        # All checks passed, do the sync
+        print(f"[TRY SYNC DEBUG] All checks passed, calling _sync_blocks_from_runner", flush=True)
+        self._sync_blocks_from_runner()
+
     def set_runner(self, runner) -> None:
-        """Bind the GPU model runner for accessing request IDs."""
-        self._worker = runner
+        """Bind the GPU model runner for accessing request IDs and block tables."""
+        print(f"[SET RUNNER DEBUG] set_runner called, id={id(self)}, runner={type(runner)}", flush=True)
+        # vLLM calls this with the model_runner (self), not the worker
+        self._model_runner = runner
+        print(f"[SET RUNNER DEBUG] _model_runner set to {type(self._model_runner)}, id={id(self._model_runner)}", flush=True)
         if self._orchestrator is None:
             self._build_orchestrator()
-
-    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        """Set the connector metadata from the scheduler."""
-        assert isinstance(connector_metadata, OffloadPackageMetadata)
-        self._metadata = connector_metadata
-        print(f"[WORKER DEBUG] bind_connector_metadata: load_event={connector_metadata.load_event}, store_event={connector_metadata.store_event}, request_ids={connector_metadata.request_ids}, store_gpu_blocks={connector_metadata.store_gpu_blocks}", flush=True)
-
-    def clear_connector_metadata(self) -> None:
-        self._metadata = None
-        print(f"[WORKER DEBUG] clear_connector_metadata", flush=True)
-
-    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
-        pass
-
-    def _flush_and_sync_all(self) -> None:
-        for event_idx, event in self._load_events:
-            event.synchronize()
-            self._load_hwm = event_idx
-        self._load_events.clear()
-        for event_idx, event in self._store_events:
-            event.synchronize()
-            self._store_hwm = event_idx
-        self._store_events.clear()
-
-    def build_worker_meta(self) -> KVConnectorWorkerMetadata:
-        """Build metadata to send back to scheduler."""
-        if not self._completed_store_events and not self._completed_load_events:
-            return None
-        meta = OffloadPackageWorkerMetadata(
-            completed_store_events=self._completed_store_events,
-            completed_load_events=self._completed_load_events,
-        )
-        self._completed_store_events = {}
-        self._completed_load_events = {}
-        return meta
-
-    def _flush_and_sync_all(self) -> None:
-        for event_idx, event in self._load_events:
-            event.synchronize()
-            self._load_hwm = event_idx
-        self._load_events.clear()
-        for event_idx, event in self._store_events:
-            event.synchronize()
-            self._store_hwm = event_idx
-        self._store_events.clear()
+        # Try to sync blocks (will succeed when model_runner is ready)
+        self._try_sync_blocks()

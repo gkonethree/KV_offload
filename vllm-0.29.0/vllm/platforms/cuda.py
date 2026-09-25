@@ -411,7 +411,8 @@ class CudaPlatformBase(Platform):
         assert device_capability is not None
 
         # First try checking just the selected backend, if there is one.
-        if selected_backend is not None:
+        # Handle CUSTOM backend explicitly since AttentionBackendEnum.CUSTOM = None
+        if selected_backend is not None or selected_backend is AttentionBackendEnum.CUSTOM:
             try:
                 backend_class = _get_attn_backend_class(selected_backend)
                 invalid_reasons = backend_class.validate_configuration(

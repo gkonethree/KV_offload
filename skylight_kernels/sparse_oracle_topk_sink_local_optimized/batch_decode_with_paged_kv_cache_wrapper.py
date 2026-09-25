@@ -258,6 +258,14 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
         """
         return replace(self._sparsity_stats)
 
+    def get_last_topk_indices(self):
+        """Return the top-k indices from the most recent ``run()`` call.
+
+        Returns a tensor of shape ``[batch_size, num_heads, total_k]`` on CPU,
+        or ``None`` if ``run()`` has not been called yet.
+        """
+        return getattr(self, '_last_topk_idx', None)
+
     # ------------------------------------------------------------------ overloads
 
     @overload
@@ -548,6 +556,14 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
                 (batch_size, self._num_qo_heads, 0),
                 dtype=torch.int64, device=q.device,
             )
+        # DEBUG: Print top-k indices for first batch/head (only once per run)
+        if not hasattr(self, '_debug_printed'):
+            print(f"[SPARSE SINK_LOCAL DEBUG] topk_idx shape: {topk_idx.shape}, k_eff_mid={k_eff_mid}, batch_size={batch_size}", flush=True)
+            if batch_size > 0 and self._num_qo_heads > 0:
+                print(f"[SPARSE SINK_LOCAL DEBUG] batch=0, head=0 tokens: {topk_idx[0, 0].tolist()[:10]}", flush=True)
+            self._debug_printed = True
+        import sys
+        sys.stdout.flush()
         if scores is not None:
             del scores
 
@@ -574,6 +590,9 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
                 ).expand(batch_size, self._num_qo_heads, -1)  # [B, H_q, local_sz]
                 parts.append(local_idx)
             sparse_idx = torch.cat(parts, dim=-1).contiguous()  # [B, H_q, total_k]
+
+        # Store the combined sparse indices for debugging access
+        self._last_topk_idx = sparse_idx.detach().cpu()
 
         # ---- 6. Sparse decode over the selected total_k tokens ----------------
         # Cap sparse_len per request at L_b. When L_b < total_k (short context

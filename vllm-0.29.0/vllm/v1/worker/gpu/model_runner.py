@@ -168,20 +168,6 @@ from vllm.v1.worker.utils import (
 )
 from vllm.v1.worker.workspace import use_workspace_lane
 
-from offload_package_bridge import (
-    install_runner_state,
-    on_initialize_kv_cache,
-    on_new_request,
-    on_cached_request_update,
-    on_prefill_new_request,
-    on_decode_batch,
-    on_request_done,
-)
-
-# Global orchestrator for sparse attention staging
-_offload_orchestrator_global = None
-
-
 logger = init_logger(__name__)
 
 
@@ -361,8 +347,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.routed_experts_capturer: RoutedExpertsCapturer | None = None
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
-
-        install_runner_state(self)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -562,8 +546,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
-        from offload_package_hooks import install_all
-        install_all()
+        from offload_package.cache_allocator import install as install_cache_allocator
+        install_cache_allocator()
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
@@ -704,32 +688,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
-        from offload_package.integration.vllm_bridge import initialize_for_runner
-        from offload_package.config import OffloadConfig
-
-        cfg = OffloadConfig.from_env()
-        print(f"[DEBUG model_runner] Offload enabled: {cfg.enabled}", file=sys.stderr, flush=True)
-        # Only create orchestrator if offload is enabled AND sparse scorer will be registered
-
-        if cfg.enabled:
-            print("[DEBUG model_runner] Calling initialize_for_runner...", file=sys.stderr, flush=True)
-            self._offload_orchestrator_instance = initialize_for_runner(
-                self,
-                normal_gpu_pages=kv_cache_config.num_blocks,
-                block_size=kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
-            )
-            # Store globally for sparse attention staging access
-            global _offload_orchestrator_global
-            _offload_orchestrator_global = self._offload_orchestrator_instance
-            print(f"[DEBUG model_runner] Orchestrator created: {self._offload_orchestrator_instance is not None}", file=sys.stderr, flush=True)
-        else:
-            print("[DEBUG model_runner] Offload disabled, skipping orchestrator", file=sys.stderr, flush=True)
-        print("[DEBUG model_runner] After offload setup", file=sys.stderr, flush=True)
-        on_initialize_kv_cache(self, self.kv_cache_config)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            # Set runner on the connector for offload package
+            if hasattr(self.kv_connector, 'set_runner'):
+                self.kv_connector.set_runner(self)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1044,7 +1009,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
         for req_id in sorted(finished_req_ids):
-            on_request_done(self, req_id)
             self._remove_request(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
@@ -1100,13 +1064,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
-            # Extract block_ids for the first KV cache group (attention)
-            block_ids = new_req_data.block_ids[0] if new_req_data.block_ids else []
-            on_new_request(self, type('obj', (object,), {
-                'req_id': new_req_data.req_id,
-                'prompt_token_ids': new_req_data.prompt_token_ids,
-                'block_ids': block_ids
-            })())
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
@@ -1140,7 +1097,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 # Extract block_ids for the first KV cache group (attention)
                 new_block_ids = req_new_block_ids[0] if req_new_block_ids else []
-                on_cached_request_update(self, req_id, new_block_ids, num_computed_tokens)
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1614,7 +1570,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     batch_req_state.is_prefilling_np,
                 )
             # Call offload hooks for prefill and decode
-            if not dummy_run and self._offload_orchestrator_instance is not None:
+            if not dummy_run:
                 req_ids = batch_req_state.req_ids
                 is_prefilling = batch_req_state.is_prefilling_np
                 num_scheduled_tokens = batch_req_state.num_scheduled_tokens
@@ -1625,11 +1581,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         # Get block IDs from block_tables for the first KV cache group
                         num_blocks = self.block_tables.num_blocks.np[0, req_index]
                         block_ids = self.block_tables.block_tables[0].gpu[req_index, :num_blocks].tolist()
-                        on_prefill_new_request(self, type('obj', (object,), {
-                            'req_id': req_id,
-                            'prompt_token_ids': [],
-                            'block_ids': block_ids
-                        })(), int(num_scheduled_tokens[i]))
                 # Handle decode requests
                 decode_req_ids = [req_ids[i] for i in range(len(req_ids)) if not is_prefilling[i]]
                 if decode_req_ids:
@@ -1637,7 +1588,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         req_ids[i]: int(num_scheduled_tokens[i])
                         for i in range(len(req_ids)) if not is_prefilling[i]
                     }
-                    on_decode_batch(self, decode_req_ids, num_scheduled_tokens_by_request)
 
         num_active_loras = 0
         if self.lora_config:

@@ -108,6 +108,7 @@ class KVOffloadManager:
         scored_blocks: set[BlockRef] | None = None,
     ) -> list[BlockRef]:
         """Offload the lowest-scoring fraction of complete GPU blocks."""
+        print(f"[OFFLOAD MANAGER DEBUG] offload_fraction called: candidates={len(candidates)}, fraction={fraction}", flush=True)
 
         if not 0.0 <= fraction < 1.0:
             raise ValueError("fraction must be in [0, 1)")
@@ -124,10 +125,14 @@ class KVOffloadManager:
             and loc.residency == Residency.GPU
             and loc.complete
         ]
+        print(f"[OFFLOAD MANAGER DEBUG] scored_candidates={len(scored_candidates)}, scored_blocks={len(scored_blocks)}, candidates={len(candidates)}", flush=True)
 
-        n_offload = int(len(scored_candidates) * fraction)
+        # Use ceiling to ensure at least 1 block is offloaded when fraction > 0
+        n_offload = max(1, int(len(scored_candidates) * fraction + 0.5))
+        print(f"[OFFLOAD MANAGER DEBUG] n_offload={n_offload}, scored_candidates={len(scored_candidates)}, fraction={fraction}", flush=True)
 
-        if n_offload <= 0:
+        if n_offload <= 0 or len(scored_candidates) == 0:
+            print(f"[OFFLOAD MANAGER DEBUG] returning empty: n_offload={n_offload}, scored_candidates={len(scored_candidates)}", flush=True)
             return []
 
         # select_for_eviction() interprets budget as the number to KEEP.
@@ -137,18 +142,23 @@ class KVOffloadManager:
             scored_candidates,
             keep,
         )
+        print(f"[OFFLOAD MANAGER DEBUG] refs_to_evict={refs_to_evict}", flush=True)
 
         offloaded = []
         events = []
 
         for ref in refs_to_evict:
             loc = self.residency.get(ref)
+            print(f"[OFFLOAD MANAGER DEBUG] Processing ref={ref}, loc={loc}", flush=True)
 
-            if (
-                loc is None
-                or loc.gpu_block_id is None
-                or loc.residency != Residency.GPU
-            ):
+            if loc is None:
+                print(f"[OFFLOAD MANAGER DEBUG] Skipping: loc is None", flush=True)
+                continue
+            if loc.gpu_block_id is None:
+                print(f"[OFFLOAD MANAGER DEBUG] Skipping: gpu_block_id is None", flush=True)
+                continue
+            if loc.residency != Residency.GPU:
+                print(f"[OFFLOAD MANAGER DEBUG] Skipping: residency={loc.residency}", flush=True)
                 continue
 
             try:
@@ -162,12 +172,16 @@ class KVOffloadManager:
 
                 offloaded.append(ref)
             except Exception as e:
+                print(f"[OFFLOAD MANAGER DEBUG] Exception during copy: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
                 continue
 
         # Wait for all async copies to complete
         for event in events:
             event.synchronize()
 
+        print(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}", flush=True)
         return offloaded
 
     def maybe_offload(self, candidates: Sequence[BlockRef]) -> list[BlockRef]:
@@ -196,25 +210,33 @@ class KVOffloadManager:
         # Wait for all async copies to complete
         for event in events:
             event.synchronize()
+        print(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}", flush=True)
         return offloaded
 
     def _copy_gpu_to_cpu(self, gpu_block_id: int) -> tuple[int, torch.cuda.Event]:
         slot = self._cpu_pool.allocate()
         with torch.cuda.stream(self._copy_stream):
             # vLLM's K/V caches are separate per attention layer.
+            # GPU cache has shape [num_pages, num_kv_heads, page_size, head_dim*2] with K/V combined
+            # CPU cache expects separate K/V: [layers, slots, 2, page_size, num_kv_heads, head_dim]
             for layer, (k_cache, v_cache) in enumerate(
                 zip(self.gpu_k_caches, self.gpu_v_caches)
             ):
-                # GPU cache has shape [num_kv_heads, page_size, 2*head_dim]
-                # CPU cache expects [page_size, num_kv_heads, 2*head_dim]
                 k_block = k_cache[gpu_block_id]
                 v_block = v_cache[gpu_block_id]
                 
-                # Transpose from [num_kv_heads, page_size, 2*head_dim] 
-                # to [page_size, num_kv_heads, 2*head_dim]
+                # GPU cache: [num_kv_heads, page_size, 2*head_dim] with K and V combined
+                # Split K and V from combined dimension
+                head_dim = k_block.shape[-1] // 2
+                k_block = k_block[..., :head_dim]  # [num_kv_heads, page_size, head_dim]
+                v_block = v_block[..., head_dim:]  # [num_kv_heads, page_size, head_dim]
+                
+                # Transpose from [num_kv_heads, page_size, head_dim] to [page_size, num_kv_heads, head_dim]
                 k_block = k_block.permute(1, 0, 2)
                 v_block = v_block.permute(1, 0, 2)
                 
+                # Copy to CPU cache
+                # cpu_cache: [layers, slots, 2, page_size, num_kv_heads, head_dim]
                 self.cpu_cache[layer, slot, 0].copy_(k_block, non_blocking=True)
                 self.cpu_cache[layer, slot, 1].copy_(v_block, non_blocking=True)
             event = torch.cuda.Event()

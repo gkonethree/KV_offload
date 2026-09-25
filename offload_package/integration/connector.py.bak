@@ -6,7 +6,7 @@ import sys
 import torch
 
 from ..config import OffloadConfig
-from ..vllm_adapter import KVCacheView
+
 from ..shared.types import (
     OrchestratorConfig,
     build_orchestrator,
@@ -46,6 +46,7 @@ def initialize_for_runner(
     # the correct staging_base_page.
     staging_slots = cfg.num_staging_slots
 
+    from ..vllm_adapter import KVCacheView
     kv_cache_view = normalize_runner_kv_caches(
         runner.kv_caches, runner.kv_cache_config, staging_slots=cfg.num_staging_slots
     )

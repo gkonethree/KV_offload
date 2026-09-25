@@ -64,10 +64,18 @@ class PagedEvictionScorer(BlockScorer):
         block_ids: Sequence[Hashable],
         budget: int,
     ) -> list[Hashable]:
+        print(f"[SCORER DEBUG] select_for_eviction: block_ids={len(block_ids)}, budget={budget}", flush=True)
         if budget < 0:
             raise ValueError("budget must be non-negative")
         if len(block_ids) <= budget:
+            print(f"[SCORER DEBUG] returning empty: len={len(block_ids)} <= budget={budget}", flush=True)
             return []
+        scores = self.scores(block_ids)
+        print(f"[SCORER DEBUG] scores={scores}", flush=True)
+        count = len(block_ids) - budget
+        order = torch.argsort(scores, stable=True)
+        print(f"[SCORER DEBUG] count={count}, order={order}", flush=True)
+        return [block_ids[i] for i in order[:count].tolist()]
         scores = self.scores(block_ids)
         count = len(block_ids) - budget
         order = torch.argsort(scores, stable=True)

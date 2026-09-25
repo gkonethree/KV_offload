@@ -145,15 +145,24 @@ class OffloadOrchestrator:
         sparse_idx: torch.Tensor,
         sparse_len: torch.Tensor,
     ) -> dict[BlockRef, int]:
+        print(f"[ORCHESTRATOR DEBUG] prepare_staging called: request_ids={request_ids}, sparse_idx.shape={sparse_idx.shape}", flush=True)
         needed = collect_needed_block_refs(
             request_ids, sparse_idx, sparse_len, self.page_size
         )
+        print(f"[ORCHESTRATOR DEBUG] needed blocks: {[(ref.request_id, ref.block_idx) for ref in needed]}", flush=True)
         cpu_needed = [
             ref for ref in needed
             if (loc := self.residency.get(ref)) is not None
             and loc.residency == Residency.CPU
         ]
-        return self.staging_pool.ensure_resident(cpu_needed)
+        print(f"[ORCHESTRATOR DEBUG] cpu_needed: {[(ref.request_id, ref.block_idx) for ref in cpu_needed]}", flush=True)
+        for ref in needed:
+            loc = self.residency.get(ref)
+            if loc:
+                print(f"[ORCHESTRATOR DEBUG]   Block {ref}: residency={loc.residency.name}, gpu_block={loc.gpu_block_id}, cpu_slot={loc.cpu_slot}, staging_slot={loc.staging_slot}", flush=True)
+        result = self.staging_pool.ensure_resident(cpu_needed)
+        print(f"[ORCHESTRATOR DEBUG] ensure_resident result: {result}", flush=True)
+        return result
 
     def patch_paged_kv_indices(
         self,

@@ -148,11 +148,16 @@ class Scheduler(SchedulerInterface):
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
             )
-            self.connector = KVConnectorFactory.create_connector(
-                config=self.vllm_config,
-                role=KVConnectorRole.SCHEDULER,
-                kv_cache_config=self.kv_cache_config,
-            )
+            # In uni-process mode, reuse the existing connector if available
+            from vllm.distributed.kv_transfer import has_kv_transfer_group, get_kv_transfer_group
+            if has_kv_transfer_group():
+                self.connector = get_kv_transfer_group()
+            else:
+                self.connector = KVConnectorFactory.create_connector(
+                    config=self.vllm_config,
+                    role=KVConnectorRole.SCHEDULER,
+                    kv_cache_config=self.kv_cache_config,
+                )
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
             kv_load_failure_policy = kv_transfer_config.kv_load_failure_policy
