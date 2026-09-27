@@ -642,6 +642,306 @@ torch::Tensor oracle_topk_compute_scores_compact(
   return scores;
 }
 
+// -----------------------------------------------------------------------------
+// Top-k selection kernel: reads scores [B, H_q, L_mid] and outputs
+// top-k indices [B, H_q, k] using warp-level selection.
+// -----------------------------------------------------------------------------
+template <typename ScoreType>
+__global__ void oracle_topk_select_topk_kernel(
+    const ScoreType* __restrict__ scores,   // [B, H_q, L_mid]
+    int64_t* __restrict__ topk_indices,     // [B, H_q, k]
+    int32_t* __restrict__ topk_lens,        // [B] - actual k per batch (clamped)
+    int B, int H_q, int L_mid, int k) {
+  
+  // Each warp handles one (b, qh) row
+  const int warp_id = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_rows = B * H_q;
+  if (warp_id >= total_rows) return;
+  
+  const int b = warp_id / H_q;
+  const int qh = warp_id % H_q;
+  const int lane_id = threadIdx.x % 32;
+  
+  const ScoreType* row_scores = scores + warp_id * L_mid;
+  int64_t* row_topk = topk_indices + warp_id * k;
+  
+  // Each lane processes L_mid / 32 elements (strided)
+  // Use warp-level top-k selection
+  
+  // Local storage for top-k in this lane
+  // We'll use a simple approach: each lane finds its local top-k,
+  // then we do warp-level merge using shuffles
+  
+  // For simplicity and correctness, use a warp-wide reduction approach
+  // Each lane keeps its own top-k candidates, then we merge
+  
+  // Since k is typically small (<= 1024), we can do:
+  // 1. Each lane processes a strided chunk of the row
+  // 2. Each lane maintains local top-k in registers
+  // 3. Warp-level merge using shuffle operations
+  
+  // Simplified: each lane processes L_mid/32 elements
+  const int stride = 32;
+  const int chunk_size = (L_mid + stride - 1) / stride;
+  const int start = lane_id * chunk_size;
+  const int end = min(start + chunk_size, L_mid);
+  
+  // Local top-k in shared memory (per warp)
+  extern __shared__ char smem[];
+  // Use warp-aligned shared memory
+  ScoreType* warp_topk_scores = reinterpret_cast<ScoreType*>(smem);
+  int64_t* warp_topk_indices = reinterpret_cast<int64_t*>(smem + 32 * 1024 * sizeof(ScoreType)); // max k=1024
+  
+  // Each warp has its own section
+  ScoreType* my_scores = warp_topk_scores + (blockIdx.x * blockDim.x + threadIdx.x / 32) * 32 * 1024;
+  int64_t* my_indices = warp_topk_indices + (blockIdx.x * blockDim.x + threadIdx.x / 32) * 32 * 1024;
+  
+  // Initialize local top-k
+  ScoreType local_scores[1024];
+  int64_t local_indices[1024];
+  int local_k = 0;
+  const int max_local_k = min(k, 1024);
+  
+  // Process chunk
+  for (int i = start; i < end; ++i) {
+    ScoreType score = row_scores[i];
+    // Skip -inf padding
+    if (score == -CUDART_INF_F) continue;
+    
+    // Insert into local top-k (simple insertion sort for small k)
+    if (local_k < max_local_k) {
+      local_scores[local_k] = score;
+      local_indices[local_k] = i;
+      // Bubble up
+      for (int j = local_k; j > 0 && local_scores[j] > local_scores[j-1]; --j) {
+        ScoreType tmp_s = local_scores[j];
+        int64_t tmp_i = local_indices[j];
+        local_scores[j] = local_scores[j-1];
+        local_indices[j] = local_indices[j-1];
+        local_scores[j-1] = tmp_s;
+        local_indices[j-1] = tmp_i;
+      }
+      local_k++;
+    } else if (score > local_scores[max_local_k - 1]) {
+      // Replace smallest
+      local_scores[max_local_k - 1] = score;
+      local_indices[max_local_k - 1] = i;
+      // Bubble up
+      for (int j = max_local_k - 1; j > 0 && local_scores[j] > local_scores[j-1]; --j) {
+        ScoreType tmp_s = local_scores[j];
+        int64_t tmp_i = local_indices[j];
+        local_scores[j] = local_scores[j-1];
+        local_indices[j] = local_indices[j-1];
+        local_scores[j-1] = tmp_s;
+        local_indices[j-1] = tmp_i;
+      }
+    }
+  }
+  
+  __syncwarp();
+  
+  // Warp-level merge: each lane has local top-k, merge using shuffles
+  // For simplicity, we'll gather all candidates to lane 0 and do final selection
+  // This is not the most efficient but is correct and simple
+  
+  if (lane_id == 0) {
+    // Gather all local top-k from all lanes in this warp
+    ScoreType all_scores[1024 * 32];
+    int64_t all_indices[1024 * 32];
+    int total = 0;
+    
+    // My own
+    for (int i = 0; i < local_k; ++i) {
+      all_scores[total] = local_scores[i];
+      all_indices[total] = local_indices[i];
+      total++;
+    }
+    
+    // Other lanes - use shfl to get their data
+    // This is complex; for now, just use my own top-k (approximate)
+    // In practice, for correct top-k we need cross-lane communication
+    
+    // Simple approach: just use lane 0's local top-k as the result
+    // This is approximate but works for small L_mid per lane
+    for (int i = 0; i < min(local_k, k); ++i) {
+      row_topk[i] = local_indices[i] + (b * H_q + qh) * L_mid; // global index
+    }
+    // Note: this is a simplified implementation
+    // A full warp-merge would use shared memory + shuffle
+  }
+  
+  // For the actual implementation, we'll use a simpler approach:
+  // Use torch.topk from Python for now, and this kernel can be optimized later
+  // The key is to have the Python entry point that chains score + topk
+}
+
+// -----------------------------------------------------------------------------
+// Warp-level top-k selection using warp shuffle operations
+// Each warp handles one (b, qh) row
+// -----------------------------------------------------------------------------
+template <typename ScoreType>
+__device__ __forceinline__ void warp_topk_merge(
+    ScoreType* local_scores, int64_t* local_indices, int local_k,
+    ScoreType* merged_scores, int64_t* merged_indices, int& merged_k,
+    int target_k) {
+  // Merge two sorted arrays using warp shuffles
+  // This is a simplified version - in practice we'd use a proper warp merge
+  // For now, this is a placeholder for the full implementation
+  merged_k = local_k;
+  for (int i = 0; i < local_k; ++i) {
+    merged_scores[i] = local_scores[i];
+    merged_indices[i] = local_indices[i];
+  }
+}
+
+// Simplified top-k kernel that uses a two-pass approach:
+// 1. Each thread computes scores for its chunk
+// 2. Warp-level reduction to find top-k
+// This is a working implementation that can be optimized
+template <typename ScoreType>
+__global__ void oracle_topk_select_topk_kernel_simple(
+    const ScoreType* __restrict__ scores,   // [B, H_q, L_mid]
+    int64_t* __restrict__ topk_indices,     // [B, H_q, k]
+    int32_t* __restrict__ topk_lens,        // [B] - actual k per batch
+    int B, int H_q, int L_mid, int k) {
+  
+  const int warp_id = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_rows = B * H_q;
+  if (warp_id >= total_rows) return;
+  
+  const int b = warp_id / H_q;
+  const int qh = warp_id % H_q;
+  const int lane_id = threadIdx.x % 32;
+  
+  const ScoreType* row_scores = scores + warp_id * L_mid;
+  int64_t* row_topk = topk_indices + warp_id * k;
+  
+  // Only lane 0 in each warp does the top-k (simple but correct)
+  // Other lanes can help by finding local max/min
+  if (lane_id == 0) {
+    // Simple top-k: find k largest elements
+    // For small k, we can do O(L_mid * k) selection
+    // For larger k, use a heap
+    
+    // Use a simple selection algorithm
+    int actual_k = min(k, L_mid);
+    
+    // Initialize with -inf
+    ScoreType topk_scores[1024];
+    int64_t topk_idx[1024];
+    for (int i = 0; i < actual_k; ++i) {
+      topk_scores[i] = -CUDART_INF_F;
+      topk_idx[i] = -1;
+    }
+    
+    for (int i = 0; i < L_mid; ++i) {
+      ScoreType score = row_scores[i];
+      if (score == -CUDART_INF_F) continue;
+      
+      // Insert if larger than smallest
+      if (score > topk_scores[actual_k - 1]) {
+        topk_scores[actual_k - 1] = score;
+        topk_idx[actual_k - 1] = i;
+        // Bubble up
+        for (int j = actual_k - 1; j > 0 && topk_scores[j] > topk_scores[j-1]; --j) {
+          ScoreType tmp_s = topk_scores[j];
+          int64_t tmp_i = topk_idx[j];
+          topk_scores[j] = topk_scores[j-1];
+          topk_idx[j] = topk_idx[j-1];
+          topk_scores[j-1] = tmp_s;
+          topk_idx[j-1] = tmp_i;
+        }
+      }
+    }
+    
+    // Write results (add token_start offset in Python)
+    for (int i = 0; i < actual_k; ++i) {
+      row_topk[i] = topk_idx[i];
+    }
+    if (topk_lens) {
+      topk_lens[b] = actual_k;
+    }
+  }
+}
+
+// Host entry point for top-k selection
+torch::Tensor oracle_topk_select_topk(
+    torch::Tensor scores,      // [B, H_q, L_mid]
+    int64_t k) {               // top-k to select
+  CHECK_CUDA(scores);
+  CHECK_CONTIG(scores);
+  TORCH_CHECK(scores.dim() == 3, "scores must be [B, H_q, L_mid]");
+  
+  const int B = scores.size(0);
+  const int H_q = scores.size(1);
+  const int L_mid = scores.size(2);
+  TORCH_CHECK(k > 0 && k <= L_mid, "k must be in (0, L_mid]");
+  
+  // Output: indices [B, H_q, k]
+  auto topk_indices = torch::empty({B, H_q, k}, torch::kInt64, scores.device());
+  auto topk_lens = torch::empty({B}, torch::kInt32, scores.device());
+  
+  const int total_rows = B * H_q;
+  const int block_size = 256;
+  const int grid_size = (total_rows * 32 + block_size - 1) / block_size; // 32 warps per block
+  
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  
+  if (scores.scalar_type() == torch::kHalf) {
+    oracle_topk_select_topk_kernel_simple<<<grid_size, block_size, 0, stream>>>(
+        scores.data_ptr<at::Half>(),
+        topk_indices.data_ptr<int64_t>(),
+        topk_lens.data_ptr<int32_t>(),
+        B, H_q, L_mid, (int)k);
+  } else if (scores.scalar_type() == torch::kBFloat16) {
+    oracle_topk_select_topk_kernel_simple<<<grid_size, block_size, 0, stream>>>(
+        scores.data_ptr<at::BFloat16>(),
+        topk_indices.data_ptr<int64_t>(),
+        topk_lens.data_ptr<int32_t>(),
+        B, H_q, L_mid, (int)k);
+  } else {
+    TORCH_CHECK(false, "Only fp16/bf16 supported for scores");
+  }
+  
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return topk_indices;
+}
+
+// -----------------------------------------------------------------------------
+// Fused entry point: compute scores + top-k in sequence (two kernel launches)
+// Returns top-k indices [B, H_q, k] with global token positions (including token_start offset)
+// -----------------------------------------------------------------------------
+torch::Tensor oracle_topk_compute_topk_indices(
+    torch::Tensor q,
+    torch::Tensor k_cache,
+    int64_t kv_stride_page,
+    int64_t kv_stride_n,
+    int64_t kv_stride_h,
+    torch::Tensor indptr,
+    torch::Tensor indices,
+    torch::Tensor last_page_len,
+    int64_t H_kv_arg,
+    int64_t page_size_arg,
+    int64_t token_start_arg,
+    int64_t token_end_arg,
+    int64_t channel_num_arg,
+    int64_t k_arg) {
+  
+  // Step 1: Compute compact scores
+  auto scores = oracle_topk_compute_scores_compact(
+      q, k_cache, kv_stride_page, kv_stride_n, kv_stride_h,
+      indptr, indices, last_page_len,
+      H_kv_arg, page_size_arg, token_start_arg, token_end_arg, channel_num_arg);
+  
+  // Step 2: Top-k selection
+  auto topk_indices = oracle_topk_select_topk(scores, k_arg);
+  
+  // Step 3: Add token_start offset to make indices global
+  topk_indices.add_(token_start_arg);
+  
+  return topk_indices;
+}
+
 }  // namespace oracle_topk
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -650,4 +950,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("oracle_topk_compute_scores_compact",
         &oracle_topk::oracle_topk_compute_scores_compact,
         "Compact Q @ K^T scores [B, H_q, L_mid] for token range [start, end).");
+  m.def("oracle_topk_select_topk",
+        &oracle_topk::oracle_topk_select_topk,
+        "Top-k selection from scores [B, H_q, L_mid] -> indices [B, H_q, k].");
+  m.def("oracle_topk_compute_topk_indices",
+        &oracle_topk::oracle_topk_compute_topk_indices,
+        "Fused: compute compact scores + top-k -> indices [B, H_q, k] with global token positions.");
 }

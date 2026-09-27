@@ -114,6 +114,10 @@ def _import_sparse_wrapper_cls():
             from block_minmax_incr_optimized import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
             )
+        elif method == "sparse_optimized":
+            from offload_package.integration.sparse_optimized_adapter import (
+                SparseOptimizedAdapterWrapper as cls,
+            )
         elif method in ("oracle", ""):
             from sparse_oracle_topk_sink_local_optimized import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
@@ -121,7 +125,7 @@ def _import_sparse_wrapper_cls():
         else:
             raise ValueError(
                 f"SKYLIGHT_SPARSE_METHOD={method!r} not recognized "
-                "(expected 'oracle' or 'block_minmax')."
+                "(expected 'oracle', 'block_minmax', or 'sparse_optimized')."
             )
     except ImportError as exc:
         raise ImportError(
