@@ -6,6 +6,8 @@ Sets offload_fraction=1.0 to offload all blocks, then verifies they are fetched 
 
 import os
 import sys
+import os
+os.environ["PYTHONUNBUFFERED"] = "1"
 
 # Disable multiprocessing
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -17,7 +19,7 @@ os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
 
 # Set sparse config (required by SkylightSparseBackend)
-os.environ["SKYLIGHT_SPARSE_TOPK"] = "0.01"
+os.environ["SKYLIGHT_SPARSE_TOPK"] = "0.5"
 os.environ["SKYLIGHT_SPARSE_SINK"] = "8"
 os.environ["SKYLIGHT_SPARSE_LOCAL"] = "8"
 os.environ["SKYLIGHT_SPARSE_CHANNEL_NUM"] = "-1"
@@ -28,37 +30,12 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 # Disable v2 model runner (encoder-only) for decoder models
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
-# Install skylight plugin to register CUSTOM backend
-from skylight.plugin import install_plugin
-install_plugin()
-
-# Disable multiprocessing
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-# Disable v2 model runner (encoder-only) for decoder models
-os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-
-# Set up attention backend BEFORE importing vllm
-os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
-
-# Set sparse config (required by SkylightSparseBackend)
-os.environ["SKYLIGHT_SPARSE_TOPK"] = "0.01"
-os.environ["SKYLIGHT_SPARSE_SINK"] = "8"
-os.environ["SKYLIGHT_SPARSE_LOCAL"] = "8"
-os.environ["SKYLIGHT_SPARSE_CHANNEL_NUM"] = "-1"
 
 # Install skylight plugin to register CUSTOM backend
 from skylight.plugin import install_plugin
 install_plugin()
 
-# Disable multiprocessing
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
-# Disable v2 model runner (encoder-only) for decoder models
-os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-
-# Monkey-patch vLLM to register SparseAttentionBackend as CUSTOM backend
-# and force use_sparse=True when CUSTOM backend is explicitly selected
 def _apply_vllm_patches():
     import importlib
     
@@ -150,14 +127,14 @@ _apply_vllm_patches()
 # Now import vLLM
 
 
-# Register SparseAttentionBackend as CUSTOM attention backend
+# Register SparseOptimizedBackend as CUSTOM attention backend
 try:
     from vllm.v1.attention.backends.registry import register_backend, AttentionBackendEnum
     register_backend(
         AttentionBackendEnum.CUSTOM,
-        "offload_package.integration.sparse_backend.SparseAttentionBackend"
+        "offload_package.integration.sparse_optimized_backend.SparseOptimizedBackend"
     )
-    print("[REG] SparseAttentionBackend registered as CUSTOM attention backend")
+    print("[REG] SparseOptimizedBackend registered as CUSTOM attention backend")
 except (ImportError, ValueError) as e:
     print(f"[REG] Could not register sparse backend: {e}")
     pass
@@ -168,13 +145,19 @@ from vllm.config import KVTransferConfig
 # Add skylight_kernels path
 sys.path.insert(0, '/home/gaurav_kumar/KV_offload/skylight_kernels')
 
-# Set up KV Transfer config with offload_fraction=1.0 (offload all blocks)
+# EASY TOGGLE: Set ENABLE_OFFLOADING = False to disable offloading
+ENABLE_OFFLOADING = False
+
+# Offload fraction (0 = no offloading, 0.99 = max offloading)
+OFFLOAD_FRACTION = 0.0
+
+# Set up KV Transfer config
 kv_transfer_config = KVTransferConfig(
     kv_connector="OffloadPackageConnector",
     kv_connector_module_path="vllm.distributed.kv_transfer.kv_connector.v1.offload_package_connector",
     kv_connector_extra_config={
-        "enabled": True,
-        "offload_fraction": 0.99,  # Offload 99% of blocks (max allowed < 1.0)
+        "enabled": ENABLE_OFFLOADING,
+        "offload_fraction": OFFLOAD_FRACTION,
         "num_cpu_slots": 4096,
         "num_staging_slots": 64,
         "interval_tokens": 16,
@@ -184,12 +167,14 @@ kv_transfer_config = KVTransferConfig(
     kv_role="kv_both",
 )
 
+print(f"[DEBUG] Offloading enabled: {ENABLE_OFFLOADING}, fraction: {OFFLOAD_FRACTION}")
+
 def test_offload_fetch():
     """Test that offloaded blocks are fetched from CPU during sparse decode."""
     
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     prompts = ["The future of AI is"]
-    max_tokens = 128
+    max_tokens = 1024
     temperature = 0.7
     top_p = 0.9
     max_seq_len = 2048
@@ -225,7 +210,7 @@ def test_offload_fetch():
         sampling_params=SamplingParams(
             temperature=0.7,
             top_p=0.9,
-            max_tokens=16,
+            max_tokens=1024,
         )
     )
     
