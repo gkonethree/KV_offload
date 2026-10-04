@@ -11,6 +11,7 @@ from offload_package.scoring.base import BlockRef
 from offload_package.staging.pool import KVStagingPool
 from offload_package.staging.residency import Residency, ResidencyTable
 from offload_package.controller import KVCompressionController
+from offload_package.tests.conftest import combined_caches
 
 
 class TestGlobalBudgetEviction:
@@ -35,6 +36,8 @@ class TestGlobalBudgetEviction:
             v_cache = torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)
             k_caches.append(k_cache)
             v_caches.append(v_cache)
+        k_caches = combined_caches(k_caches, v_caches)
+        v_caches = k_caches
 
         cpu_cache = torch.empty(
             (num_layers, 64, 2, page_size, num_heads, head_dim),
@@ -50,7 +53,7 @@ class TestGlobalBudgetEviction:
             gpu_v_caches=v_caches,
             cpu_cache=cpu_cache,
             gpu_budget_blocks=100,
-            kv_layout="NHD",
+            kv_layout="HND",
         )
         staging_pool = KVStagingPool(
             num_slots=8,
@@ -93,9 +96,12 @@ class TestGlobalBudgetEviction:
             for ref in orchestrator._request_blocks[req_id]:
                 orchestrator.residency.mark_gpu(ref, ref.block_idx, complete=True)
         
-        # Trigger prefill complete for one request
-        # This should offload globally lowest-scoring blocks
-        offloaded = orchestrator.on_prefill_complete("req1")
+        # Global offload: offload_fraction is the single offload path the
+        # scheduler's _trigger_global_offload drives after prefill completion.
+        candidates = orchestrator.residency.all_gpu_blocks(complete_only=True)
+        offloaded = orchestrator.offload_manager.offload_fraction(
+            candidates, orchestrator.offload_fraction, orchestrator._scored
+        )
         
         # Should have offloaded some blocks globally
         assert len(offloaded) > 0
@@ -123,7 +129,10 @@ class TestGlobalBudgetEviction:
         assert initial_gpu == total_blocks
         
         # Offload 30% fraction
-        offloaded = orchestrator.on_prefill_complete("req1")
+        candidates = orchestrator.residency.all_gpu_blocks(complete_only=True)
+        offloaded = orchestrator.offload_manager.offload_fraction(
+            candidates, orchestrator.offload_fraction, orchestrator._scored
+        )
         
         # GPU blocks should decrease
         remaining_gpu = len(orchestrator.residency.all_gpu_blocks(complete_only=True))
@@ -170,6 +179,8 @@ class TestOnPrefillCompleteReturnsList:
 
         k_caches = [torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)]
         v_caches = [torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)]
+        k_caches = combined_caches(k_caches, v_caches)
+        v_caches = k_caches
 
         cpu_cache = torch.empty(
             (num_layers, 32, 2, page_size, num_heads, head_dim),
@@ -185,7 +196,7 @@ class TestOnPrefillCompleteReturnsList:
             gpu_v_caches=v_caches,
             cpu_cache=cpu_cache,
             gpu_budget_blocks=40,
-            kv_layout="NHD",
+            kv_layout="HND",
         )
         staging_pool = KVStagingPool(
             num_slots=4,
@@ -245,6 +256,8 @@ class TestScoreAwareStagingEviction:
 
         k_caches = [torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)]
         v_caches = [torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)]
+        k_caches = combined_caches(k_caches, v_caches)
+        v_caches = k_caches
 
         cpu_cache = torch.empty(
             (num_layers, 16, 2, page_size, num_heads, head_dim),
@@ -260,7 +273,7 @@ class TestScoreAwareStagingEviction:
             gpu_v_caches=v_caches,
             cpu_cache=cpu_cache,
             gpu_budget_blocks=40,
-            kv_layout="NHD",
+            kv_layout="HND",
         )
         staging_pool = KVStagingPool(
             num_slots=4,
@@ -339,6 +352,8 @@ class TestAsyncCopySync:
 
         k_caches = [torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)]
         v_caches = [torch.randn(num_pages, page_size, num_heads, head_dim, dtype=dtype, device=device)]
+        k_caches = combined_caches(k_caches, v_caches)
+        v_caches = k_caches
 
         cpu_cache = torch.empty(
             (num_layers, 16, 2, page_size, num_heads, head_dim),
@@ -354,7 +369,7 @@ class TestAsyncCopySync:
             gpu_v_caches=v_caches,
             cpu_cache=cpu_cache,
             gpu_budget_blocks=40,
-            kv_layout="NHD",
+            kv_layout="HND",
         )
         return offload_manager
 
@@ -367,8 +382,15 @@ class TestAsyncCopySync:
         for ref in refs:
             manager.residency.mark_gpu(ref, ref.block_idx, complete=True)
         
-        # Offload with fraction 0.8 -> 4 blocks offloaded (5 * 0.8 = 4)
-        offloaded = manager.offload_fraction(refs, 0.8)
+        # Score all blocks, then offload with fraction 0.8 -> 4 of 5 offloaded.
+        from offload_package.scoring.base import BlockKVStats
+        stats = BlockKVStats(
+            v_norm=torch.ones(len(refs), 1, dtype=torch.float32),
+            k_norm=torch.ones(len(refs), 1, dtype=torch.float32),
+            block_ids=refs,
+        )
+        manager.scorer.update(stats)
+        offloaded = manager.offload_fraction(refs, 0.8, set(refs))
         
         assert len(offloaded) == 4
         # All should be marked CPU

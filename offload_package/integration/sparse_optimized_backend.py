@@ -29,6 +29,8 @@ from vllm.v1.attention.backends.flashinfer import (
 from vllm.v1.attention.backends.utils import get_flashinfer_layout_string
 from vllm.v1.kv_cache_interface import AttentionSpec
 from skylight.config import SkylightSparseConfig
+from offload_package.integration.offload_sparse_adapter import OffloadSparseAdapter, create_offload_sparse_adapter
+from offload_package.debug import dbg as _dbg  # gated by OFFLOAD_PACKAGE_DEBUG=1
 
 logger = init_logger(__name__)
 
@@ -51,19 +53,32 @@ class _NoFastPlanDecodeWrapper:
             sparse_idx = None
             sparse_len = None
         
+        # Get expected shapes from the inner wrapper
+        batch_size = self._inner._paged_kv_last_page_len_buf.numel()
+        num_qo_heads = self._inner._num_qo_heads
+        
         if sparse_idx is not None and sparse_len is not None:
+            # Ensure correct shapes
+            if sparse_idx.shape[0] != batch_size or sparse_idx.shape[1] != num_qo_heads:
+                # Resize if needed
+                if sparse_idx.shape[1] == num_qo_heads:
+                    # Expand batch dimension
+                    sparse_idx = sparse_idx.expand(batch_size, -1, -1).contiguous()
+                    sparse_len = sparse_len.expand(batch_size, -1, -1).contiguous()
+            
             import torch
+            sparse_weights = torch.ones_like(sparse_idx, dtype=torch.float32)
             return self._inner.run(
                 q, paged_kv_cache,
                 sparse_len, sparse_idx,
-                torch.ones_like(sparse_idx, dtype=torch.float32),
+                sparse_weights,
                 *args, **kwargs
             )
         else:
-            import torch
-            dummy_len = torch.ones((1, 32, 1), dtype=torch.int32, device='cuda') * 16
-            dummy_idx = torch.zeros((1, 32, 16), dtype=torch.int64, device='cuda')
-            dummy_weights = torch.ones((1, 32, 16), dtype=torch.float32, device='cuda')
+            # Create proper dummy tensors with correct shapes
+            dummy_len = torch.ones((batch_size, num_qo_heads, 1), dtype=torch.int32, device=q.device) * 16
+            dummy_idx = torch.zeros((batch_size, num_qo_heads, 16), dtype=torch.int64, device=q.device)
+            dummy_weights = torch.ones((batch_size, num_qo_heads, 16), dtype=torch.float32, device=q.device)
             return self._inner.run(q, paged_kv_cache, dummy_len, dummy_idx, dummy_weights, *args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
@@ -138,13 +153,17 @@ class SparseOptimizedBackend(FlashInferBackend):
 
 
 class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
-    """Metadata builder with sparse decode wrapper from sparse_optimized kernel."""
+    """Metadata builder with sparse decode wrapper from sparse_optimized kernel.
+
+    Uses OffloadSparseAdapter to get sparse pattern from OffloadController's scores.
+    """
 
     _offload_orchestrator: object | None = None
     _cached_sparse_idx: torch.Tensor | None = None
     _cached_sparse_len: torch.Tensor | None = None
     _cached_request_ids: list[str] | None = None
     _last_decode_wrapper: object | None = None
+    _offload_adapter: Optional[OffloadSparseAdapter] = None
 
     def __init__(
         self,
@@ -201,8 +220,10 @@ class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
     ) -> Any:
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = self._import_sparse_wrapper_cls()
-        print(f"[SparseOptimizedBackend] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
-        return self._sparse_wrapper_cls(
+        _dbg(f"[SparseOptimizedBackend] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}")
+        
+        # Create base sparse_optimized wrapper
+        inner = self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),
             use_cuda_graph=use_cudagraph,
@@ -210,9 +231,28 @@ class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
             paged_kv_indices_buffer=paged_kv_indices,
             paged_kv_last_page_len_buffer=paged_kv_last_page_len,
             use_tensor_cores=True,
-            # Pass config via environment (sparse_optimized reads from env)
-            # The kernel reads these from environment internally
         )
+        
+        # Wrap with OffloadSparseAdapter if orchestrator is available
+        if self._offload_orchestrator is not None and self._offload_adapter is None:
+            from offload_package.integration.offload_sparse_adapter import create_offload_sparse_adapter
+            self._offload_adapter = create_offload_sparse_adapter(
+                self._offload_orchestrator,
+                inner,
+                kv_layout=self.kv_cache_layout,
+                page_size=self._kv_cache_spec.block_size,
+                num_kv_heads=self._kv_cache_spec.num_kv_heads,
+                head_dim=self.head_dim,
+                device=str(self.device),
+            )
+            _dbg(f"[SparseOptimizedBackend] Created OffloadSparseAdapter for orchestrator")
+        
+        # Use adapter's run() which will inject offload scores
+        if self._offload_adapter is not None:
+            return _NoFastPlanDecodeWrapper(self._offload_adapter)
+        
+        # Fallback to original _NoFastPlanDecodeWrapper
+        return _NoFastPlanDecodeWrapper(inner)
 
     @staticmethod
     def _import_sparse_wrapper_cls():
@@ -233,16 +273,21 @@ class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
-        print(f"[SparseOptimizedBackend] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}", flush=True)
+        _dbg(f"[SparseOptimizedBackend] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build=fast_build,
         )
 
+        # Set active request IDs on orchestrator for adapter to use
+        if self._offload_orchestrator is not None and hasattr(common_attn_metadata, 'req_ids'):
+            self._offload_orchestrator._active_request_ids = common_attn_metadata.req_ids
+            _dbg(f"[SparseOptimizedBackend] Set active_request_ids: {common_attn_metadata.req_ids}")
+
         # Replace the decode wrapper with sparse wrapper
         if attn_metadata.decode is not None:
-            print(f"[SparseOptimizedBackend] Replacing decode wrapper with sparse wrapper", flush=True)
+            _dbg(f"[SparseOptimizedBackend] Replacing decode wrapper with sparse wrapper")
             batch_size = getattr(common_attn_metadata, 'num_decodes', 0)
             if batch_size > 0:
                 sparse_wrapper = self._get_sparse_decode_wrapper(
@@ -250,14 +295,14 @@ class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
                     use_cudagraph=False,
                 )
                 attn_metadata.decode = type(attn_metadata.decode)(wrapper=sparse_wrapper)
-                print(f"[SparseOptimizedBackend] Replaced decode wrapper with sparse wrapper", flush=True)
+                _dbg(f"[SparseOptimizedBackend] Replaced decode wrapper with sparse wrapper")
 
         return attn_metadata
 
     def _get_decode_wrapper(
         self, batch_size: int, use_cudagraph: bool = False
     ) -> Any:
-        print(f"[SparseOptimizedBackend] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseOptimizedBackend] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}")
         # Mirror ``FlashInferMetadataBuilder._get_decode_wrapper`` but build
         # the sparse wrapper. When ``use_cudagraph`` is requested, slice the
         # persistent paged-KV buffers and cache one wrapper per captured
@@ -290,7 +335,7 @@ class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
             else:
                 self._decode_wrapper = decode_wrapper  # type: ignore[assignment]
 
-        print(f"[SparseOptimizedBackend] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}", flush=True)
+        _dbg(f"[SparseOptimizedBackend] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}")
         return decode_wrapper
 
     def _make_sparse_decode_wrapper(
@@ -302,7 +347,7 @@ class SparseOptimizedMetadataBuilder(FlashInferMetadataBuilder):
     ) -> Any:
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = self._import_sparse_wrapper_cls()
-        print(f"[SparseOptimizedBackend] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseOptimizedBackend] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}")
         
         # Create wrapper with default config, sparse pattern will be set via _cached_sparse_idx/len
         wrapper = self._sparse_wrapper_cls(

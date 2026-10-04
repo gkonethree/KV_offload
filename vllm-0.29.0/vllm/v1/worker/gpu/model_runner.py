@@ -546,6 +546,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
+        print(f"[MODEL RUNNER DEBUG] initialize_kv_cache START: is_profiling={is_profiling}", flush=True)
         from offload_package.cache_allocator import install as install_cache_allocator
         install_cache_allocator()
         # GPUWorker finalizes the PD interleave before KV cache initialization.
@@ -693,6 +694,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
             # Set runner on the connector for offload package
+            print(f"[MODEL RUNNER DEBUG] initialize_kv_cache: calling set_runner on kv_connector={type(self.kv_connector)}", flush=True)
             if hasattr(self.kv_connector, 'set_runner'):
                 self.kv_connector.set_runner(self)
 

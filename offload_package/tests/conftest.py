@@ -48,3 +48,21 @@ def sample_cpu_cache():
         dtype=torch.float32
     )
     return cpu_cache
+
+
+def combined_caches(k_caches, v_caches):
+    """Convert separate NHD [P, tokens, H, D] K/V lists into the fork's
+    combined per-layer layout [P, H, tokens, 2D] (K in [..., :D]).
+
+    The KVOffloadManager/KVStagingPool copy paths assume a single combined
+    tensor per layer (k_caches[i] is v_caches[i]); tests that model the
+    production layout must use this conversion.
+    """
+    out = []
+    for kc, vc in zip(k_caches, v_caches):
+        P, N, H, D = kc.shape
+        t = torch.empty(P, H, N, 2 * D, dtype=kc.dtype, device=kc.device)
+        t[..., :D] = kc.permute(0, 2, 1, 3)
+        t[..., D:] = vc.permute(0, 2, 1, 3)
+        out.append(t)
+    return out

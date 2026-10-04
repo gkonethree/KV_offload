@@ -94,6 +94,9 @@ def ensure_kv_transfer_initialized(
             role=KVConnectorRole.WORKER,
             kv_cache_config=kv_cache_config,
         )
+        # Initialize the connector with KV cache config
+        if hasattr(_KV_CONNECTOR_AGENT, 'initialize_from_config'):
+            _KV_CONNECTOR_AGENT.initialize_from_config(kv_cache_config)
 
 
 def ensure_kv_transfer_shutdown() -> None:

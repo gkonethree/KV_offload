@@ -28,6 +28,11 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+import os as _os
+_DBG = _os.environ.get("OFFLOAD_PACKAGE_DEBUG", "0") == "1"
+def _dbg(msg: str) -> None:
+    if _DBG:
+        print(msg, flush=True)
 
 
 class BlockHashToBlockMap:
@@ -728,23 +733,32 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
+        # Snapshot once: ordered_blocks may be a generator; consuming it twice
+        # (e.g. for a debug print) would silently skip the actual freeing.
+        blocks_list = list(ordered_blocks)
+        _dbg(f"[BLOCKPOOL DEBUG] free_blocks called with {len(blocks_list)} blocks")
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
-        for block in ordered_blocks:
+        for block in blocks_list:
             block.ref_cnt -= 1
+            _dbg(f"[BLOCKPOOL DEBUG] free_blocks: block_id={block.block_id}, ref_cnt={block.ref_cnt}, block_hash={block.block_hash}, is_null={block.is_null}")
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                    _dbg(f"[BLOCKPOOL DEBUG] block_id={block.block_id} added to evict_first (no hash or no caching)")
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
+                    _dbg(f"[BLOCKPOOL DEBUG] block_id={block.block_id} added to evict_last (cached)")
 
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        
+        _dbg(f"[BLOCKPOOL DEBUG] free_blocks done: free_blocks={self.get_num_free_blocks()}, total={self.num_gpu_blocks}")
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

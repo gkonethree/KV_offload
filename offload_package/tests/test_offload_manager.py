@@ -57,15 +57,22 @@ class TestKVOffloadManager:
 
     @pytest.fixture
     def offload_setup(self, sample_kv_cache, sample_cpu_cache):
-        """Create a pre-configured offload manager."""
+        """Create a pre-configured offload manager.
+
+        Uses the fork's combined per-layer layout: one [P, H, N, 2D] tensor
+        per layer shared as both k_cache and v_cache (copy paths split the
+        last axis internally).
+        """
+        from offload_package.tests.conftest import combined_caches
         k_cache, v_cache = sample_kv_cache
-        k_caches = [k_cache]
-        v_caches = [v_cache]
-        
+        combined = combined_caches([k_cache], [v_cache])[0]
+        k_caches = [combined]
+        v_caches = [combined]
+
         residency = ResidencyTable()
         scorer = PagedEvictionScorer()
         cpu_cache = sample_cpu_cache
-        
+
         manager = KVOffloadManager(
             scorer=scorer,
             residency=residency,
@@ -73,7 +80,7 @@ class TestKVOffloadManager:
             gpu_v_caches=v_caches,
             cpu_cache=cpu_cache,
             gpu_budget_blocks=64,
-            kv_layout="NHD",
+            kv_layout="HND",
         )
         return manager, residency, k_caches, v_caches
 
@@ -200,7 +207,7 @@ class TestKVOffloadManager:
         manager.scorer.update(stats)
         
         # Offload 50%
-        offloaded = manager.offload_fraction(refs, fraction=0.5)
+        offloaded = manager.offload_fraction(refs, fraction=0.5, scored_blocks=set(refs))
         
         assert len(offloaded) == 5
         # Check they're marked as CPU resident

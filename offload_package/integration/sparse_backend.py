@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.flashinfer import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from skylight.config import SkylightSparseConfig
+from offload_package.debug import dbg as _dbg  # gated by OFFLOAD_PACKAGE_DEBUG=1
 
 logger = init_logger(__name__)
 
@@ -353,7 +354,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = self._import_sparse_wrapper_cls()
-        print(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}")
         return self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),
@@ -390,7 +391,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
-        print(f"[SparseBackend DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
@@ -399,7 +400,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         # Replace the decode wrapper with sparse wrapper
         if attn_metadata.decode is not None:
-            print(f"[SparseBackend DEBUG] Replacing decode wrapper with sparse wrapper", flush=True)
+            _dbg(f"[SparseBackend DEBUG] Replacing decode wrapper with sparse wrapper")
             batch_size = getattr(common_attn_metadata, 'num_decodes', 0)
             if batch_size > 0:
                 sparse_wrapper = self._get_sparse_decode_wrapper(
@@ -407,14 +408,14 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
                     use_cudagraph=False,
                 )
                 attn_metadata.decode = type(attn_metadata.decode)(wrapper=sparse_wrapper)
-                print(f"[SparseBackend DEBUG] Replaced decode wrapper with sparse wrapper", flush=True)
+                _dbg(f"[SparseBackend DEBUG] Replaced decode wrapper with sparse wrapper")
         
         return attn_metadata
 
     def _get_decode_wrapper(
         self, batch_size: int, use_cudagraph: bool = False
     ) -> Any:
-        print(f"[SparseBackend DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}")
         # Mirror ``FlashInferMetadataBuilder._get_decode_wrapper`` but build
         # the sparse wrapper. When ``use_cudagraph`` is requested, slice the
         # persistent paged-KV buffers and cache one wrapper per captured
@@ -447,7 +448,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
             else:
                 self._decode_wrapper = decode_wrapper  # type: ignore[assignment]
 
-        print(f"[SparseBackend DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}")
         return decode_wrapper
 
     def _make_sparse_decode_wrapper(
@@ -462,7 +463,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = self._import_sparse_wrapper_cls()
-        print(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}")
         return self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),
@@ -499,7 +500,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
-        print(f"[SparseBackend DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
@@ -508,7 +509,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         # Replace the decode wrapper with sparse wrapper
         if attn_metadata.decode is not None:
-            print(f"[SparseBackend DEBUG] Replacing decode wrapper with sparse wrapper", flush=True)
+            _dbg(f"[SparseBackend DEBUG] Replacing decode wrapper with sparse wrapper")
             batch_size = getattr(common_attn_metadata, 'num_decodes', 0)
             if batch_size > 0:
                 sparse_wrapper = self._get_sparse_decode_wrapper(
@@ -516,14 +517,14 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
                     use_cudagraph=False,
                 )
                 attn_metadata.decode = type(attn_metadata.decode)(wrapper=sparse_wrapper)
-                print(f"[SparseBackend DEBUG] Replaced decode wrapper with sparse wrapper", flush=True)
+                _dbg(f"[SparseBackend DEBUG] Replaced decode wrapper with sparse wrapper")
         
         return attn_metadata
 
     def _get_decode_wrapper(
         self, batch_size: int, use_cudagraph: bool = False
     ) -> Any:
-        print(f"[SparseBackend DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}")
         # Mirror ``FlashInferMetadataBuilder._get_decode_wrapper`` but build
         # the sparse wrapper. When ``use_cudagraph`` is requested, slice the
         # persistent paged-KV buffers and cache one wrapper per captured
@@ -556,7 +557,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
             else:
                 self._decode_wrapper = decode_wrapper  # type: ignore[assignment]
 
-        print(f"[SparseBackend DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}")
         return decode_wrapper
 
     def _make_sparse_decode_wrapper(
@@ -571,7 +572,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = self._import_sparse_wrapper_cls()
-        print(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}")
         return self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),
@@ -608,7 +609,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
-        print(f"[SparseBackend DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
@@ -617,7 +618,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         # Replace the decode wrapper with sparse wrapper
         if attn_metadata.decode is not None:
-            print(f"[SparseBackend DEBUG] Replacing decode wrapper with sparse wrapper", flush=True)
+            _dbg(f"[SparseBackend DEBUG] Replacing decode wrapper with sparse wrapper")
             batch_size = getattr(common_attn_metadata, 'num_decodes', 0)
             if batch_size > 0:
                 sparse_wrapper = self._get_sparse_decode_wrapper(
@@ -625,14 +626,14 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
                     use_cudagraph=False,
                 )
                 attn_metadata.decode = type(attn_metadata.decode)(wrapper=sparse_wrapper)
-                print(f"[SparseBackend DEBUG] Replaced decode wrapper with sparse wrapper", flush=True)
+                _dbg(f"[SparseBackend DEBUG] Replaced decode wrapper with sparse wrapper")
         
         return attn_metadata
 
     def _get_decode_wrapper(
         self, batch_size: int, use_cudagraph: bool = False
     ) -> Any:
-        print(f"[SparseBackend DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}")
         # Mirror ``FlashInferMetadataBuilder._get_decode_wrapper`` but build
         # the sparse wrapper. When ``use_cudagraph`` is requested, slice the
         # persistent paged-KV buffers and cache one wrapper per captured
@@ -668,7 +669,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         # Store the wrapper in class attribute for debugging access
         SparseAttentionMetadataBuilder._last_decode_wrapper = decode_wrapper
 
-        print(f"[SparseBackend DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}")
         return decode_wrapper
 
     def _make_sparse_decode_wrapper(
@@ -683,7 +684,7 @@ class SparseAttentionMetadataBuilder(FlashInferMetadataBuilder):
         
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = self._import_sparse_wrapper_cls()
-        print(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SparseBackend DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}")
         return self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),

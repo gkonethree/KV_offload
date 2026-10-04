@@ -666,6 +666,14 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
+    # Paged KV indices for staging (used by offload package)
+    paged_kv_indices: torch.Tensor | None = None
+    paged_kv_indptr: torch.Tensor | None = None
+
+    # Paged KV indices for staging (used by offload package)
+    paged_kv_indices: torch.Tensor | None = None
+    paged_kv_indptr: torch.Tensor | None = None
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
@@ -1718,6 +1726,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     disable_split_kv=self.disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+
+        # Populate paged KV indices for offload package staging
+        if hasattr(self, 'paged_kv_indices') and self.paged_kv_indices is not None:
+            attn_metadata.paged_kv_indices = self.paged_kv_indices[:]
+        if hasattr(self, 'paged_kv_indptr') and self.paged_kv_indptr is not None:
+            attn_metadata.paged_kv_indptr = self.paged_kv_indptr.gpu[:num_reqs + 1]
+
+                # Populate paged KV indices for offload package staging
+        if hasattr(self, 'paged_kv_indices') and self.paged_kv_indices is not None:
+            attn_metadata.paged_kv_indices = self.paged_kv_indices[:]
+        if hasattr(self, 'paged_kv_indptr') and self.paged_kv_indptr is not None:
+            attn_metadata.paged_kv_indptr = self.paged_kv_indptr.gpu[:num_reqs + 1]
+
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:

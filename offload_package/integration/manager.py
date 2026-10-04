@@ -13,6 +13,7 @@ from ..selection.adapter import (
 from ..scoring.base import BlockRef
 from ..staging.pool import KVStagingPool
 from ..staging.residency import Residency, ResidencyTable
+from offload_package.debug import dbg as _dbg
 
 
 class OffloadOrchestrator:
@@ -39,6 +40,11 @@ class OffloadOrchestrator:
         self._request_blocks: dict[str, list[BlockRef]] = {}
         self._scored: set[BlockRef] = set()
         self._sparse_mode = True  # Enable offloading by default
+        self._last_offload_step = 0  # Track offload steps for pattern caching
+        self._active_request_ids: list[str] = []  # Track active requests for staging
+        # Set by the scheduler: with true freeing, offloaded pages are
+        # recycled, so CPU-resident unstaged indices must be null-filled.
+        self.true_freeing = False
 
     def _enable_sparse_mode(self) -> None:
         """Enable sparse attention offloading mode."""
@@ -56,42 +62,68 @@ class OffloadOrchestrator:
             ref = BlockRef(str(request_id), int(block_idx))
             complete = (block_idx + 1) * self.page_size <= int(num_computed_tokens)
             old = self.residency.get(ref)
+            if old is not None and old.residency in (Residency.CPU, Residency.STAGING):
+                # Offloaded blocks keep their CPU copy as the source of truth
+                # and never rebind to a GPU page: after true-free surgery the
+                # table entry is a placeholder (or a stale id from the runner's
+                # block table), never a valid live page.
+                if complete and not old.complete:
+                    self.residency.mark_complete(ref)
+                refs.append(ref)
+                continue
             if old is None or old.gpu_block_id != int(gpu_id):
                 self.residency.mark_gpu(ref, int(gpu_id), complete=complete)
             elif complete and not old.complete:
                 self.residency.mark_complete(ref)
             refs.append(ref)
 
-        # Score newly added blocks
+        # Score newly added blocks (batched: one GPU pass, one host sync)
+        _score_refs, _score_gids = [], []
         for ref in refs[prev_count:]:
             loc = self.residency.get(ref)
             if loc is not None and loc.complete and ref not in self._scored:
                 if loc.residency == Residency.GPU:
-                    self.offload_manager.on_block_full(ref)
+                    _score_refs.append(ref)
+                    _score_gids.append(loc.gpu_block_id)
                     self._scored.add(ref)
-        
         # Also score previously tracked blocks that just became complete
         for ref in refs[:prev_count]:
             loc = self.residency.get(ref)
             if loc is not None and loc.complete and ref not in self._scored:
                 if loc.residency == Residency.GPU:
-                    self.offload_manager.on_block_full(ref)
+                    _score_refs.append(ref)
+                    _score_gids.append(loc.gpu_block_id)
                     self._scored.add(ref)
+        # Mark completes BEFORE the batch score (scoring reads GPU pages).
+        for ref in _score_refs:
+            self.residency.mark_complete(ref)
+        if _score_refs:
+            self.offload_manager.score_blocks(_score_refs, _score_gids)
         
         self._request_blocks[request_id] = refs
         return refs
 
     def on_prefill_complete(self, request_id: str) -> list[BlockRef]:
-        """Offload globally lowest-scoring complete GPU blocks across all requests."""
+        """Mark this request's blocks complete and score them.
+
+        Offloading itself is NOT done here: the scheduler-side
+        _trigger_global_offload() runs right after prefill completion and is
+        the single offload path (it sets store events + touches GPU blocks so
+        completions are tracked). Offloading here as well would double-copy
+        to different CPU slots and leak slots.
+
+        Returns an empty list (kept for call-site compatibility).
+        """
         # Skip warmup requests
         if str(request_id).startswith("_warmup_"):
             return []
-            
+
         if not self._sparse_mode:
             return []
-        
+
         # Mark all blocks for this request as complete (prefill is done)
         refs = self._request_blocks.get(request_id, [])
+        _score_refs, _score_gids = [], []
         for ref in refs:
             loc = self.residency.get(ref)
             if loc is not None and not loc.complete:
@@ -99,13 +131,12 @@ class OffloadOrchestrator:
             # Score blocks that became complete now
             if loc is not None and loc.complete and ref not in self._scored:
                 if loc.residency == Residency.GPU:
-                    self.offload_manager.on_block_full(ref)
+                    _score_refs.append(ref)
+                    _score_gids.append(loc.gpu_block_id)
                     self._scored.add(ref)
-        
-        # Global candidate pool: all complete GPU blocks across all requests
-        all_gpu_complete = self.residency.all_gpu_blocks(complete_only=True)
-        result = self.offload_manager.offload_fraction(all_gpu_complete, self.offload_fraction, self._scored)
-        return result
+        if _score_refs:
+            self.offload_manager.score_blocks(_score_refs, _score_gids)
+        return []
 
     def on_decode_step(
         self,
@@ -125,19 +156,30 @@ class OffloadOrchestrator:
         if not triggered_requests:
             return []
 
+        # Track active request IDs for staging
+        self._active_request_ids = list(request_ids)
+
         # Debug: Print block residency for each active request
         for request_id in request_ids:
             refs = self.residency.refs_for_request(request_id)
             if refs:
-                print(f"[ORCH DECODE] req={request_id}:")
+                _dbg(f"[ORCH DECODE] req={request_id}:")
                 for bref in refs:
                     loc = self.residency.get(bref)
                     if loc:
-                        print(f"  block_idx={bref.block_idx}, gpu_block_id={loc.gpu_block_id}, residency={loc.residency.name}, complete={loc.complete}")
+                        _dbg(f"  block_idx={bref.block_idx}, gpu_block_id={loc.gpu_block_id}, residency={loc.residency.name}, complete={loc.complete}")
 
         # Global candidate pool for all triggered requests
         all_gpu_complete = self.residency.all_gpu_blocks(complete_only=True)
-        return self.offload_manager.offload_fraction(all_gpu_complete, self.offload_fraction)
+        
+        # Increment offload step counter for pattern caching
+        if triggered_requests:
+            self._last_offload_step += 1
+            _dbg(f"[ORCH DEBUG] Offload triggered! Step={self._last_offload_step}")
+
+        return self.offload_manager.offload_fraction(
+            all_gpu_complete, self.offload_fraction, self._scored
+        )
 
     def prepare_staging(
         self,
@@ -145,23 +187,23 @@ class OffloadOrchestrator:
         sparse_idx: torch.Tensor,
         sparse_len: torch.Tensor,
     ) -> dict[BlockRef, int]:
-        print(f"[ORCHESTRATOR DEBUG] prepare_staging called: request_ids={request_ids}, sparse_idx.shape={sparse_idx.shape}", flush=True)
+        _dbg(f"[ORCHESTRATOR DEBUG] prepare_staging called: request_ids={request_ids}, sparse_idx.shape={sparse_idx.shape}")
         needed = collect_needed_block_refs(
             request_ids, sparse_idx, sparse_len, self.page_size
         )
-        print(f"[ORCHESTRATOR DEBUG] needed blocks: {[(ref.request_id, ref.block_idx) for ref in needed]}", flush=True)
+        _dbg(f"[ORCHESTRATOR DEBUG] needed blocks: {[(ref.request_id, ref.block_idx) for ref in needed]}")
         cpu_needed = [
             ref for ref in needed
             if (loc := self.residency.get(ref)) is not None
             and loc.residency == Residency.CPU
         ]
-        print(f"[ORCHESTRATOR DEBUG] cpu_needed: {[(ref.request_id, ref.block_idx) for ref in cpu_needed]}", flush=True)
+        _dbg(f"[ORCHESTRATOR DEBUG] cpu_needed: {[(ref.request_id, ref.block_idx) for ref in cpu_needed]}")
         for ref in needed:
             loc = self.residency.get(ref)
             if loc:
-                print(f"[ORCHESTRATOR DEBUG]   Block {ref}: residency={loc.residency.name}, gpu_block={loc.gpu_block_id}, cpu_slot={loc.cpu_slot}, staging_slot={loc.staging_slot}", flush=True)
+                _dbg(f"[ORCHESTRATOR DEBUG]   Block {ref}: residency={loc.residency.name}, gpu_block={loc.gpu_block_id}, cpu_slot={loc.cpu_slot}, staging_slot={loc.staging_slot}")
         result = self.staging_pool.ensure_resident(cpu_needed)
-        print(f"[ORCHESTRATOR DEBUG] ensure_resident result: {result}", flush=True)
+        _dbg(f"[ORCHESTRATOR DEBUG] ensure_resident result: {result}")
         return result
 
     def patch_paged_kv_indices(
@@ -184,6 +226,42 @@ class OffloadOrchestrator:
             self.residency,
             staging_map,
         )
+
+    def promote_hot_cpu_blocks(
+        self, request_id: str, max_count: int = 4
+    ) -> dict[BlockRef, int]:
+        """Pre-stage the highest-scored CPU-resident blocks of a request (R2).
+
+        The oracle sparse scorer cannot see CPU-resident blocks (their paged
+        indices are null-remapped), so a cold page becomes selectable again
+        only by being staged BEFORE the score pass; capture that page and the
+        stage it lands in. Ranking reuses the offload scorer (highest score =
+        most important — the same signal that picks eviction victims, so a
+        promoted block was by definition retained as long as possible under
+        memory pressure). Staging-pool overflow evicts the lowest-scored
+        staging resident back to CPU, never silently.
+
+        Returns the {BlockRef: staging_slot} map actually staged.
+        """
+        if max_count <= 0 or not self._sparse_mode:
+            return {}
+        refs = [
+            ref
+            for ref in self.residency.refs_for_request(str(request_id))
+            if (loc := self.residency.get(ref)) is not None
+            and loc.residency == Residency.CPU
+        ]
+        if not refs:
+            return {}
+        scores = self.offload_manager.scorer.scores(refs)
+        order = torch.argsort(scores, descending=True)
+        picked = [refs[i] for i in order[:max_count].tolist()]
+        staged = self.staging_pool.ensure_resident(picked)
+        _dbg(
+            f"[ORCH PROMOTE] req={request_id}: promoted {len(staged)}/{len(refs)} "
+            f"cold blocks (cpu_blocks={self.residency.num_cpu_blocks})"
+        )
+        return staged
 
     def on_request_done(self, request_id: str) -> None:
         self._cleanup_request(request_id)

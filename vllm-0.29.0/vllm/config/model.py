@@ -2513,6 +2513,20 @@ def _get_and_verify_max_len(
             )
             if envs.VLLM_ALLOW_LONG_MAX_MODEL_LEN:
                 logger.warning_once("%s %s", msg, warning)
+                # The compiled RoPE path (piecewise compile / cudagraph) reads
+                # a prebuilt cos_sin_cache table sized from hf_config's
+                # max_position_embeddings. When the user overrides
+                # max_model_len past that value, the table must be resized or
+                # the inductor-generated kernels hit their baked bounds check
+                # (assert index < 2048) at runtime.
+                _cur = getattr(hf_config, "max_position_embeddings", None)
+                if _cur is not None and max_model_len > _cur:
+                    hf_config.max_position_embeddings = int(max_model_len)
+                    logger.info(
+                        "VLLM_ALLOW_LONG_MAX_MODEL_LEN: bumped hf_config.max_position_embeddings "
+                        "from %d to %d so RoPE tables are sized for the override",
+                        _cur, int(max_model_len),
+                    )
             else:
                 raise ValueError(
                     f"{msg} To allow overriding this maximum, set "

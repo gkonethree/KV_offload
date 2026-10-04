@@ -28,6 +28,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 from offload_package.config import OffloadConfig
+from offload_package.debug import dbg as _dbg
 from offload_package.controller import KVCompressionController
 from offload_package.integration.manager import OffloadOrchestrator
 from offload_package.integration.vllm_bridge import initialize_for_runner
@@ -98,12 +99,7 @@ class OffloadPackageScheduler:
         # Event counters
         self._store_event_counter = 0
         self._load_event_counter = 0
-        
-        # Pending store events: event_idx -> (gpu_block_ids, cpu_block_ids, req_ids)
-        self._pending_store_events: dict[int, tuple[list[int], list[int], list[str]]] = {}
-        # Pending load events: event_idx -> (staging_slot_ids, cpu_block_ids, req_ids)
-        self._pending_load_events: dict[int, tuple[list[int], list[int], list[str]]] = {}
-        
+
         # World size for multi-worker completion tracking
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = defaultdict(int)
@@ -112,8 +108,54 @@ class OffloadPackageScheduler:
         self._prefill_completed: set[str] = set()
         # Track prompt lengths for prefill completion detection
         self._prompt_lens: dict[str, int] = {}
-        # Pending store metadata to include in next metadata
-        self._pending_store_metadata: dict = {}
+        # Per-step accumulator for offload batches: each entry is
+        # (refs, gpu_block_ids, cpu_block_ids, req_ids). Multiple triggers within
+        # one build_connector_meta call are flushed into a SINGLE store event
+        # at the end of the step so the worker sees all of them.
+        self._step_store_acc: list[tuple[list, list[int], list[int], list[str]]] = []
+        # Pending store events: event_idx -> (refs, gpu_block_ids, cpu_block_ids, req_ids)
+        self._pending_store_events: dict[int, tuple[list, list[int], list[int], list[str]]] = {}
+        # Pending load events: event_idx -> (staging_slot_ids, cpu_block_ids, req_ids)
+        self._pending_load_events: dict[int, tuple[list[int], list[int], list[str]]] = {}
+        # Full cumulative GPU block-id list per request (mirrors the model
+        # runner's block table: append new_block_ids, replace on resume).
+        self._req_block_table: dict[str, list[int]] = {}
+
+        # Scheduler-side kv_cache_manager (bound via bind_gpu_block_pool);
+        # needed for req_to_blocks surgery when truly freeing GPU blocks.
+        self._kv_cache_manager = None
+
+        # True freeing recycles GPU pages after offload. Only safe in
+        # uni-process, single-worker, synchronous scheduling: with async
+        # scheduling the next step may already be reading those pages when the
+        # completion event is processed. With CUDA graphs the in-run fetch can't
+        # run during replay, so freed pages must stay readable (shadow tier).
+        import os as _os
+        _async = bool(getattr(vllm_config.scheduler_config, "async_scheduling", False))
+        _mp = _os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") not in ("0", "false", "False")
+        _world = vllm_config.parallel_config.world_size
+        _cg_mode = getattr(
+            getattr(vllm_config, "compilation_config", None), "cudagraph_mode", None
+        )
+        _graphs = getattr(_cg_mode, "name", str(_cg_mode)).upper() not in (
+            None, "NONE", "OFF",
+        ) if _cg_mode is not None else False
+        self._graphs_active = _graphs
+        self._true_free_enabled = (
+            offload_config.enabled
+            and offload_config.true_free
+            and not _async
+            and not _mp
+            and _world == 1
+            and not _graphs
+        )
+        if not self._true_free_enabled:
+            logger.info(
+                "OffloadPackageScheduler: true GPU freeing disabled "
+                "(async_scheduling=%s, multiprocess=%s, world_size=%s, graphs=%s); "
+                "running in shadow-tier mode (no memory reclamation)",
+                _async, _mp, _world, _graphs,
+            )
         
     def _derive_cpu_config(self, gpu_config) -> "KVCacheConfig":
         """Derive CPU KVCacheConfig from GPU config, scaling num_blocks by CPU/GPU ratio."""
@@ -155,11 +197,40 @@ class OffloadPackageScheduler:
     def _get_page_size(self, kv_cache_config) -> int:
         return kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
         
-    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool, kv_cache_manager=None) -> None:
         """Bind GPU BlockPool - enables freeing blocks after offload."""
         self._gpu_block_pool = gpu_block_pool
+        self._kv_cache_manager = kv_cache_manager
+        if self._true_free_enabled and kv_cache_manager is None:
+            logger.warning(
+                "OffloadPackageScheduler: kv_cache_manager not provided; "
+                "true GPU freeing needs block-table surgery and is disabled"
+            )
+            self._true_free_enabled = False
         logger.info("OffloadPackageScheduler: Bound GPU BlockPool (%d blocks)",
                     gpu_block_pool.num_gpu_blocks)
+        # Permanently reserve the tail pages for the staging pool so the
+        # allocator never hands them to a request. Without this, staging slots
+        # ([num_blocks - S, num_blocks)) overlap allocatable pages and fetch
+        # writes corrupt live KV data (and vice versa).
+        if self.offload_config.enabled and self.offload_config.num_staging_slots > 0:
+            from offload_package.cache_allocator import reserve_staging_tail
+            reserved = reserve_staging_tail(
+                gpu_block_pool, self.offload_config.num_staging_slots
+            )
+            # Cross-check against the worker-side staging base derived from the
+            # KV views: view.shape[0] - S. Both must point at the same pages.
+            expected_base = self.kv_cache_config.num_blocks - self.offload_config.num_staging_slots
+            assert reserved[0] == expected_base, (
+                f"staging tail mismatch: reserved starts at {reserved[0]}, "
+                f"connector expects staging base {expected_base}"
+            )
+            self._reserved_staging_ids = reserved
+            logger.info(
+                "OffloadPackageScheduler: reserved staging tail [%d, %d] "
+                "(%d allocatable blocks remain)",
+                reserved[0], reserved[-1], gpu_block_pool.get_num_free_blocks(),
+            )
         
     def initialize_orchestrator(self, runner) -> None:
         """Called from worker after KV caches initialized to set up orchestrator."""
@@ -173,66 +244,70 @@ class OffloadPackageScheduler:
         
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
         """Build metadata for this step's offload/staging operations."""
-        print(f"[SCHEDULER DEBUG] build_connector_meta called, orchestrator={self._orchestrator is not None}, gpu_block_pool={self._gpu_block_pool is not None}", flush=True)
+        _dbg(f"[SCHEDULER DEBUG] build_connector_meta called, orchestrator={self._orchestrator is not None}, gpu_block_pool={self._gpu_block_pool is not None}")
         # Get orchestrator from worker handler
         if self._worker_handler is not None:
             self._orchestrator = self._worker_handler._orchestrator
+        if self._orchestrator is not None:
+            # The Skylight builder null-fills CPU-resident paged indices only
+            # when their original pages may have been freed.
+            self._orchestrator.true_freeing = self._true_free_enabled
         if self._orchestrator is None or self._gpu_block_pool is None:
             from offload_package.integration.metadata import OffloadPackageMetadata
             return OffloadPackageMetadata()
         
         from offload_package.integration.metadata import OffloadPackageMetadata
         metadata = OffloadPackageMetadata()
-        
-        # Include pending store metadata from previous step
-        if self._pending_store_metadata:
-            metadata.store_event = self._pending_store_metadata.get('store_event', INVALID_JOB_ID)
-            metadata.store_gpu_blocks = self._pending_store_metadata.get('store_gpu_blocks', [])
-            metadata.store_cpu_blocks = self._pending_store_metadata.get('store_cpu_blocks', [])
-            metadata.store_event_to_reqs = self._pending_store_metadata.get('store_event_to_reqs', {})
-            print(f"[SCHEDULER DEBUG] Included pending store metadata: store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}", flush=True)
-        
+
         # 1. Track new requests and update block mappings
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             block_ids = new_req_data.block_ids[0] if new_req_data.block_ids else []
-            self._orchestrator.sync_request_blocks(req_id, block_ids, 0)
+            self._req_block_table[req_id] = list(block_ids)
+            self._orchestrator.sync_request_blocks(req_id, block_ids, new_req_data.num_computed_tokens)
             if req_id not in self._prefill_completed:
                 self._controller.on_prefill_complete(req_id)
             # Store prompt length for prefill completion detection
             self._prompt_lens[req_id] = new_req_data.prompt_len
         
         # 2. Update existing requests
+        cached = scheduler_output.scheduled_cached_reqs
         for req_id, num_computed, new_block_ids in zip(
-            scheduler_output.scheduled_cached_reqs.req_ids,
-            scheduler_output.scheduled_cached_reqs.num_computed_tokens,
-            scheduler_output.scheduled_cached_reqs.new_block_ids,
+            cached.req_ids,
+            cached.num_computed_tokens,
+            cached.new_block_ids,
         ):
-            block_ids = new_block_ids[0] if new_block_ids else []
-            self._orchestrator.sync_request_blocks(req_id, block_ids, num_computed)
+            # Reconstruct the FULL block list, mirroring the model runner's
+            # block-table update: append new tail blocks, replace on resume
+            # from preemption. new_block_ids is append-only in vLLM 0.29, so
+            # syncing it directly would re-enumerate logical block_idx from 0
+            # and never re-mark prefill blocks complete.
+            new_ids = new_block_ids[0] if new_block_ids else None
+            if req_id in cached.resumed_req_ids:
+                full = list(new_ids) if new_ids is not None else []
+            elif new_ids is not None:
+                full = self._req_block_table.get(req_id, []) + list(new_ids)
+            else:
+                full = self._req_block_table.get(req_id, [])
+            self._req_block_table[req_id] = full
+            self._orchestrator.sync_request_blocks(req_id, full, num_computed)
         
             # Check for prefill completion (transition from prefill to decode)
             prompt_len = self._prompt_lens.get(req_id, 0)
             if prompt_len > 0 and num_computed >= prompt_len and req_id not in self._prefill_completed:
                 self._prefill_completed.add(req_id)
                 self._orchestrator.on_prefill_complete(req_id)
-                self._trigger_global_offload(metadata)
+                self._trigger_global_offload(metadata, scheduler_output)
         
-            # Track decode tokens for interval-based scoring
-            # Use actual scheduled tokens for this request
+            # Track decode tokens for interval-based scoring - ONLY for requests that completed prefill
             num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            if num_scheduled > 0:
+            if num_scheduled > 0 and req_id in self._prefill_completed:
                 should_offload = self._controller.on_decode(req_id, num_scheduled)
-                print(f"[SCHEDULER DEBUG] on_decode req_id={req_id}, num_scheduled={num_scheduled}, should_offload={should_offload}", flush=True)
+                _dbg(f"[SCHEDULER DEBUG] on_decode req_id={req_id}, num_scheduled={num_scheduled}, should_offload={should_offload}")
                 if should_offload:
-                    print(f"[SCHEDULER DEBUG] Calling _trigger_global_offload", flush=True)
-                    try:
-                        self._trigger_global_offload(metadata)
-                        print(f"[SCHEDULER DEBUG] _trigger_global_offload returned normally", flush=True)
-                    except Exception as e:
-                        print(f"[SCHEDULER DEBUG] _trigger_global_offload failed: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
+                    _dbg(f"[SCHEDULER DEBUG] >>> TRIGGER OFFLOAD <<< req_id={req_id}")
+                    self._trigger_global_offload(metadata, scheduler_output)
+                    _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload returned")
         
         # 3. Handle prefill completions (detect when prefill done)
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -243,66 +318,130 @@ class OffloadPackageScheduler:
                 self._prefill_completed.add(req_id)
                 self._orchestrator.on_prefill_complete(req_id)
                 # Also trigger offload after prefill
-                self._trigger_global_offload(metadata)
+                self._trigger_global_offload(metadata, scheduler_output)
         
         # 4. Handle staging loads for sparse attention
         active_req_ids = self._get_active_decode_requests(scheduler_output)
         if active_req_ids:
             self._prepare_staging_loads(metadata, active_req_ids)
-        
-        print(f"[SCHEDULER DEBUG] build_connector_meta returning: load_event={metadata.load_event}, store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}", flush=True)
+            metadata.request_ids = active_req_ids
+            _dbg(f"[SCHEDULER DEBUG] Set metadata.request_ids = {active_req_ids}")
+
+        # 4b. Promotion watch (R2): pre-stage the highest-scored CPU-resident
+        # blocks of active decode requests so cold pages remain selectable.
+        # Without this, an offloaded page's null-remapped indices entry scores
+        # ~0 in the oracle pass and can never re-enter the top-k. Promotion
+        # runs at schedule time so this step's forward already sees them.
+        if (
+            self._true_free_enabled
+            and self.offload_config.promote_per_step > 0
+            and active_req_ids
+            and self._orchestrator is not None
+            and self._orchestrator.residency.num_cpu_blocks > 0
+        ):
+            for rid in active_req_ids:
+                self._orchestrator.promote_hot_cpu_blocks(
+                    rid, self.offload_config.promote_per_step
+                )
+
+        # 5. Flush ALL of this step's offload triggers into a single store
+        # event so the worker (and the completion free) sees every batch.
+        if self._step_store_acc:
+            refs_all = []
+            gpu_ids: list[int] = []
+            cpu_ids: list[int] = []
+            req_ids: list[str] = []
+            for r, g, c, q in self._step_store_acc:
+                refs_all.extend(r)
+                gpu_ids.extend(g)
+                cpu_ids.extend(c)
+                req_ids.extend(q)
+            self._step_store_acc = []
+
+            event_idx = self._store_event_counter
+            self._store_event_counter += 1
+            metadata.store_event = event_idx
+            metadata.store_gpu_blocks = gpu_ids
+            metadata.store_cpu_blocks = cpu_ids
+            metadata.store_event_to_reqs[event_idx] = sorted(set(req_ids))
+            self._pending_store_events[event_idx] = (
+                refs_all, gpu_ids, cpu_ids, metadata.store_event_to_reqs[event_idx],
+            )
+            self._store_event_pending_counts[event_idx] = 0
+            _dbg(f"[SCHEDULER DEBUG] Flushed store event {event_idx}: "
+                 f"{len(gpu_ids)} gpu blocks, {len(cpu_ids)} cpu blocks, "
+                 f"reqs={metadata.store_event_to_reqs[event_idx]}")
+
+        _dbg(f"[SCHEDULER DEBUG] build_connector_meta returning: load_event={metadata.load_event}, store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}")
         return metadata
         
-        # 4. Handle staging loads for sparse attention
-        active_req_ids = self._get_active_decode_requests(scheduler_output)
-        if active_req_ids:
-            self._prepare_staging_loads(metadata, active_req_ids)
-        
-        print(f"[SCHEDULER DEBUG] build_connector_meta returning: load_event={metadata.load_event}, store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}", flush=True)
-        return metadata
-        
-    def _get_active_decode_requests(self, scheduler_output: SchedulerOutput) -> list[str]:
+    def _get_active_decode_requests(self, scheduler_output: Optional[SchedulerOutput] = None) -> list[str]:
         """Get request IDs that are in decode phase."""
-        active = []
-        print(f"[SCHEDULER DEBUG] _get_active_decode_requests: scheduled_cached_reqs={scheduler_output.scheduled_cached_reqs.req_ids}, prefill_completed={self._prefill_completed}", flush=True)
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-            if req_id in self._prefill_completed:
-                active.append(req_id)
-        print(f"[SCHEDULER DEBUG] _get_active_decode_requests returning: {active}", flush=True)
-        return active
+        if scheduler_output is not None:
+            _dbg(f"[SCHEDULER DEBUG] _get_active_decode_requests: scheduled_cached_reqs={scheduler_output.scheduled_cached_reqs.req_ids}, prefill_completed={self._prefill_completed}")
+            active = []
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                if req_id in self._prefill_completed:
+                    active.append(req_id)
+            _dbg(f"[SCHEDULER DEBUG] _get_active_decode_requests returning: {active}")
+            return active
+        else:
+            # Fallback: return prefill_completed requests
+            active = list(self._prefill_completed)
+            _dbg(f"[SCHEDULER DEBUG] _get_active_decode_requests (fallback): returning {active}")
+            return active
         
-    def _trigger_global_offload(self, metadata):
+    def _trigger_global_offload(self, metadata, scheduler_output=None):
         """Score all complete GPU blocks globally and offload fraction.
         
         Re-scores ALL complete blocks every W steps to capture changing importance.
         """
-        print(f"[SCHEDULER DEBUG] _trigger_global_offload called, orchestrator={self._orchestrator is not None}", flush=True)
+        _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload called, orchestrator={self._orchestrator is not None}")
         if self._orchestrator is None:
             # Try to get from worker handler
             if self._worker_handler is not None:
                 self._orchestrator = self._worker_handler._orchestrator
-                print(f"[SCHEDULER DEBUG] Got orchestrator from worker handler: {self._orchestrator is not None}", flush=True)
+                _dbg(f"[SCHEDULER DEBUG] Got orchestrator from worker handler: {self._orchestrator is not None}")
             if self._orchestrator is None:
-                print(f"[SCHEDULER DEBUG] _trigger_global_offload: orchestrator is None", flush=True)
+                _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload: orchestrator is None")
                 return
         
-        # Get all complete GPU blocks across all requests
+# Score all complete GPU blocks and offload fraction directly
         all_gpu_complete = self._orchestrator.residency.all_gpu_blocks(complete_only=True)
-        print(f"[SCHEDULER DEBUG] _trigger_global_offload: all_gpu_complete={len(all_gpu_complete)}, _scored={len(self._orchestrator._scored)}", flush=True)
-        
-        # Re-score ALL complete blocks (not just unscored) to capture changing importance
-        for ref in all_gpu_complete:
+        _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload: all_gpu_complete={len(all_gpu_complete)}, _scored={len(self._orchestrator._scored)}")
+
+        # Only sole-owned blocks are eligible: prefix-shared blocks (ref_cnt>1)
+        # belong to several requests and must never be copied/freed under one
+        # request's BlockRef.
+        if self._true_free_enabled:
+            allowed = []
+            for ref in all_gpu_complete:
+                loc = self._orchestrator.residency.get(ref)
+                if loc is None or loc.gpu_block_id is None:
+                    continue
+                if self._gpu_block_pool.blocks[loc.gpu_block_id].ref_cnt == 1:
+                    allowed.append(ref)
+        else:
+            allowed = all_gpu_complete
+
+        # Re-score ALL complete blocks (not just unscored) to capture changing
+        # importance — batched: one index_select per layer over ALL blocks and
+        # one host sync total, instead of per-block*per-layer syncs.
+        _score_refs, _score_gids = [], []
+        for ref in allowed:
             loc = self._orchestrator.residency.get(ref)
             if loc and loc.gpu_block_id is not None:
-                self._orchestrator.offload_manager.on_block_full(ref)
-                # Mark as scored for this interval (but we'll re-score next interval)
-                self._orchestrator._scored.add(ref)
-        
-        # Offload fraction globally
+                _score_refs.append(ref)
+                _score_gids.append(loc.gpu_block_id)
+        if _score_refs:
+            for ref in _score_refs:
+                self._orchestrator.residency.mark_complete(ref)
+            self._orchestrator.offload_manager.score_blocks(_score_refs, _score_gids)
+            self._orchestrator._scored.update(_score_refs)
+
+        # Offload fraction of scored blocks
         offloaded = self._orchestrator.offload_manager.offload_fraction(
-            all_gpu_complete,
-            self.offload_config.offload_fraction,
-            self._orchestrator._scored
+            allowed, self.offload_config.offload_fraction, self._orchestrator._scored
         )
         
         if not offloaded:
@@ -329,34 +468,22 @@ class OffloadPackageScheduler:
                 if gpu_blk.block_hash:
                     cpu_blk._block_hash = gpu_blk.block_hash
         
-        # Record store event
-        event_idx = self._store_event_counter
-        self._store_event_counter += 1
-        
-        metadata.store_event = event_idx
-        metadata.store_gpu_blocks = gpu_block_ids
-        metadata.store_cpu_blocks = cpu_block_ids
-        metadata.store_event_to_reqs[event_idx] = list(set(r.request_id for r in offloaded))
-        print(f"[SCHEDULER DEBUG] _trigger_global_offload set store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}", flush=True)
-        
-        # Track for completion
-        self._pending_store_events[event_idx] = (gpu_block_ids, cpu_block_ids,
-                                                  metadata.store_event_to_reqs[event_idx])
-        self._store_event_pending_counts[event_idx] = 0
-        
-        # Touch GPU blocks to prevent premature freeing during async copy
-        self._gpu_block_pool.touch([self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids])
-        
-        logger.info("OffloadPackageScheduler: Offloaded %d blocks (event %d)",
-                    len(offloaded), event_idx)
-        
-        # Store metadata for next step's worker
-        self._pending_store_metadata = {
-            'store_event': event_idx,
-            'store_gpu_blocks': gpu_block_ids,
-            'store_cpu_blocks': cpu_block_ids,
-            'store_event_to_reqs': dict(metadata.store_event_to_reqs),
-        }
+        # Batch into this step's single store event, which is flushed at the
+        # end of build_connector_meta — setting the event here directly would
+        # lose earlier triggers' events when multiple fire in one step.
+        # NOTE: no touch() here. The GPU→CPU copies inside offload_fraction
+        # are event-synchronized, and with true freeing the request's own
+        # reference is replaced by null_block at store completion; touching
+        # would leave ref_cnt at 1 and blocks would never be reclaimed.
+        self._step_store_acc.append((
+            offloaded,
+            gpu_block_ids,
+            cpu_block_ids,
+            list(set(r.request_id for r in offloaded)),
+        ))
+
+        logger.info("OffloadPackageScheduler: offloaded %d blocks (batched this step)",
+                    len(offloaded))
         
     def _prepare_staging_loads(self, metadata, active_req_ids):
         """Prepare CPU->GPU staging loads for sparse attention."""
@@ -368,8 +495,8 @@ class OffloadPackageScheduler:
         self._load_event_counter += 1
         metadata.load_event = event_idx
         metadata.load_event_to_reqs[event_idx] = active_req_ids
-        print(f"[SCHEDULER DEBUG] _prepare_staging_loads: active_req_ids={active_req_ids}, load_event={event_idx}, metadata_id={id(metadata)}", flush=True)
-        print(f"[SCHEDULER DEBUG] metadata after: load_event={metadata.load_event}, request_ids={metadata.request_ids}", flush=True)
+        _dbg(f"[SCHEDULER DEBUG] _prepare_staging_loads: active_req_ids={active_req_ids}, load_event={event_idx}, metadata_id={id(metadata)}")
+        _dbg(f"[SCHEDULER DEBUG] metadata after: load_event={metadata.load_event}, request_ids={metadata.request_ids}")
         
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Process completed transfers from worker."""
@@ -394,24 +521,76 @@ class OffloadPackageScheduler:
                     del self._store_event_pending_counts[event_idx]
         
     def _process_store_completion(self, event_idx: int):
-        """Called when all workers report store completion - FREE GPU blocks."""
+        """Called when the worker reports the store event complete.
+
+        With true freeing enabled, the request's block-table entries for the
+        offloaded pages are replaced with the pool's null_block (so vLLM never
+        touches those page ids again), prefix-cache hashes are evicted, and the
+        pages are finally returned to the free queue by ``free_blocks`` (their
+        only remaining reference was the request's block table entry).
+        """
         if event_idx not in self._pending_store_events:
             return
-        
-        gpu_block_ids, cpu_block_ids, req_ids = self._pending_store_events.pop(event_idx)
-        
+
+        refs, gpu_block_ids, cpu_block_ids, req_ids = self._pending_store_events.pop(event_idx)
+        _dbg(f"[SCHED DEBUG] _process_store_completion event={event_idx}, gpu_blocks={len(gpu_block_ids)}, cpu_blocks={len(cpu_block_ids)}")
+
         # Register CPU blocks in CPU pool cache (for prefix caching)
         for cpu_blk_id in cpu_block_ids:
             cpu_blk = self.cpu_block_pool.blocks[cpu_blk_id]
             if cpu_blk.block_hash:
                 self.cpu_block_pool.cached_block_hash_to_block.insert(cpu_blk.block_hash, cpu_blk)
         self.cpu_block_pool.free_blocks([self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids])
-        
-        # CRITICAL: Free GPU blocks back to BlockPool - THIS SAVES MEMORY
-        if self._gpu_block_pool:
-            gpu_blocks = [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
-            self._gpu_block_pool.free_blocks(gpu_blocks)
-            logger.debug("Freed %d GPU blocks to pool after offload", len(gpu_block_ids))
+
+        if not self._gpu_block_pool:
+            return
+
+        gpu_blocks = [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
+        if not self._true_free_enabled:
+            # Shadow-tier mode: pages stay pinned to the request (no reclaim).
+            _dbg(f"[SCHED DEBUG] true freeing disabled; {len(gpu_block_ids)} blocks keep GPU residency")
+            return
+
+        mgr = None
+        if self._kv_cache_manager is not None:
+            mgrs = self._kv_cache_manager.coordinator.single_type_managers
+            mgr = mgrs[0] if mgrs else None
+        if mgr is None:
+            logger.warning("true freeing enabled but no kv_cache_manager; skipping free")
+            return
+
+        freed: list = []
+        evict_ids: set[int] = set()
+        for ref, gpu_id in zip(refs, gpu_block_ids):
+            blocks = mgr.req_to_blocks.get(ref.request_id)
+            if blocks is None:
+                # Request already finished; vLLM recycled all its blocks.
+                continue
+            idx = ref.block_idx
+            if idx >= len(blocks) or blocks[idx].block_id != gpu_id:
+                # Table entry no longer points at the offloaded page (e.g.
+                # preemption rewrote it); never free a mismatched block.
+                logger.warning(
+                    "offload table surgery mismatch for %s block %d (table=%s, gpu=%s); skipping",
+                    ref.request_id, idx,
+                    -1 if idx >= len(blocks) else blocks[idx].block_id, gpu_id,
+                )
+                continue
+            blocks[idx] = mgr._null_block
+            if idx < len(self._req_block_table.get(ref.request_id, [])):
+                self._req_block_table[ref.request_id][idx] = mgr._null_block.block_id
+            blk = self._gpu_block_pool.blocks[gpu_id]
+            if blk.block_hash is not None:
+                evict_ids.add(gpu_id)
+            freed.append(blk)
+
+        if evict_ids:
+            # Evict hash entries so prefix lookups never resolve to dead pages.
+            self._gpu_block_pool.evict_blocks(evict_ids)
+        if freed:
+            self._gpu_block_pool.free_blocks(freed)
+            _dbg(f"[SCHED DEBUG] True-freed {len(freed)} GPU blocks: free_gpu_blocks={self._gpu_block_pool.get_num_free_blocks()}")
+            logger.debug("True-freed %d GPU blocks to pool after offload", len(freed))
         
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int):
         # Not used for our offload pattern
@@ -426,9 +605,11 @@ class OffloadPackageScheduler:
         # Clean up orchestrator state
         if self._orchestrator:
             self._orchestrator.on_request_done(req_id)
-        # Clean up controller
+        # Clean up controller and block-table bookkeeping
         self._controller.remove(req_id)
         self._prefill_completed.discard(req_id)
+        self._req_block_table.pop(req_id, None)
+        self._prompt_lens.pop(req_id, None)
         return False, None
         
     def request_finished_all_groups(
@@ -443,5 +624,4 @@ class OffloadPackageScheduler:
         
     def reset(self) -> bool:
         # Clean up pending transfers
-        return self.cpu_block_pool.reset_prefix_cache() 
-        
+        return self.cpu_block_pool.reset_prefix_cache()

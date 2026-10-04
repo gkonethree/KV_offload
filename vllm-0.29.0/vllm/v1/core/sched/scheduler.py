@@ -308,7 +308,13 @@ class Scheduler(SchedulerInterface):
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
-            self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            _bind = self.connector.bind_gpu_block_pool
+            import inspect as _inspect
+            if "kv_cache_manager" in _inspect.signature(_bind).parameters:
+                _bind(self.kv_cache_manager.block_pool,
+                      kv_cache_manager=self.kv_cache_manager)
+            else:
+                _bind(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner

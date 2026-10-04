@@ -39,10 +39,19 @@ def compute_block_kv_norms(
     v_sel = v_cache.index_select(0, index).float()
 
     if layout == "NHD":
+        # [B, N, H, D] -> norm over D -> [B, N, H] -> mean over tokens (dim 1)
         k_norm = k_sel.norm(dim=-1).mean(dim=1)
         v_norm = v_sel.norm(dim=-1).mean(dim=1)
+        num_heads = k_cache.shape[2]
     else:
+        # [B, H, N, D] -> norm over D -> [B, H, N] -> mean over tokens (dim 2)
         k_norm = k_sel.norm(dim=-1).mean(dim=2)
         v_norm = v_sel.norm(dim=-1).mean(dim=2)
+        num_heads = k_cache.shape[1]
+
+    assert k_norm.shape[-1] == num_heads, (
+        f"norm last dim {k_norm.shape[-1]} != num heads {num_heads} "
+        f"(layout={layout}, input shape={tuple(k_cache.shape)})"
+    )
 
     return BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=logical_ids)

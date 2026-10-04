@@ -1,51 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Worker-side handler for async GPU↔CPU transfers and sparse attention staging."""
+"""GPU staging pool for offloaded KV pages (tail pages of the KV tensors)."""
 
 from __future__ import annotations
 
-import os
-import logging
-from typing import TYPE_CHECKING, Optional
+from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
-from collections import OrderedDict, defaultdict
 
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1,
-    KVConnectorMetadata,
-    KVConnectorRole,
-    KVConnectorWorkerMetadata,
-)
-from vllm.forward_context import ForwardContext
 
-from offload_package.config import OffloadConfig
-from offload_package.controller import KVCompressionController
-if TYPE_CHECKING:
-    from offload_package.integration.manager import OffloadOrchestrator
-from offload_package.integration.metadata import (
-    OffloadPackageMetadata,
-    OffloadPackageWorkerMetadata,
-)
 from offload_package.offload.manager import KVOffloadManager
-from offload_package.selection.adapter import (
-    collect_needed_block_refs,
-    patch_paged_kv_indices_with_staging,
-)
-
+from offload_package.scoring.base import BlockRef
 from offload_package.staging.residency import Residency, ResidencyTable
-from offload_package.shared.types import (
-    OrchestratorConfig,
-    build_orchestrator,
-    normalize_runner_kv_caches,
-)
 
 logger = init_logger(__name__)
-
-INVALID_JOB_ID = -1
 
 
 class KVStagingPool:
@@ -97,6 +66,7 @@ class KVStagingPool:
 
     def ensure_resident(self, refs: Sequence[BlockRef]) -> dict[BlockRef, int]:
         result: dict[BlockRef, int] = {}
+        to_fetch: list[tuple[BlockRef, int]] = []
         for ref in dict.fromkeys(refs):
             loc = self.residency.get(ref)
             if loc is None:
@@ -111,39 +81,65 @@ class KVStagingPool:
                 raise RuntimeError(f"{ref} is not backed by a CPU slot")
 
             self.offload_manager.wait_cpu_slot(loc.cpu_slot)
-            slot = self._allocate_slot(ref)
-            with torch.cuda.stream(self.copy_stream):
-                for layer, (k_cache, v_cache) in enumerate(
-                    zip(self.gpu_k_caches, self.gpu_v_caches)
-                ):
-                    # CPU cache: [page_size, num_kv_heads, head_dim] -> GPU: [num_kv_heads, page_size, head_dim*2] (K and V combined)
-                    k_src = self.cpu_cache[layer, loc.cpu_slot, 0]  # [page_size, num_kv_heads, head_dim]
-                    v_src = self.cpu_cache[layer, loc.cpu_slot, 1]  # [page_size, num_kv_heads, head_dim]
-                    
-                    # Transpose from [page_size, num_kv_heads, head_dim] to [num_kv_heads, page_size, head_dim]
-                    k_src = k_src.permute(1, 0, 2).contiguous()
-                    v_src = v_src.permute(1, 0, 2).contiguous()
-                    
-                    # Combine K and V in last dimension: [num_kv_heads, page_size, 2*head_dim]
-                    combined = torch.cat([k_src, v_src], dim=-1)
-                    
-                    k_cache[self.base + slot].copy_(combined, non_blocking=True)
-                    # v_cache is not used since K and V are combined in the same tensor
-                    # (vllM stores K and V in separate tensors but with combined head_dim)
-                event = torch.cuda.Event()
-                event.record(self.copy_stream)
-            # Ensure copy is visible to the default stream (where attention runs)
-            torch.cuda.current_stream(device=k_cache.device).wait_stream(self.copy_stream)
-            self.residency.mark_staging(ref, slot)
+            to_fetch.append((ref, loc.cpu_slot))
+        if not to_fetch:
+            return result
+
+        # Phase 1: allocate/evict staging slots for the whole incoming batch
+        # (eviction choice identical to the previous per-ref loop, except
+        # slots already assigned within this batch are protected: their page
+        # content is written by the batched copy in phase 2).
+        allocs: list[tuple[BlockRef, int, int]] = []
+        protected: set = set()
+        for ref, cpu_slot in to_fetch:
+            slot = self._allocate_slot(ref, exclude=protected)
+            protected.add(slot)
+            allocs.append((ref, cpu_slot, slot))
             result[ref] = slot
+
+        # Phase 2: batched copies — per layer, ONE gather on CPU, one H2D
+        # index_copy_ into the staging pages. Same bytes as before, ~L launches
+        # per batch instead of L per block.
+        device = self.gpu_k_caches[0].device
+        cpu_slots_t = torch.tensor(
+            [cs for _, cs, _ in allocs], dtype=torch.long
+        )
+        base_ids = (
+            torch.tensor([s for _, _, s in allocs], dtype=torch.long, device=device)
+            + self.base
+        )
+        with torch.cuda.stream(self.copy_stream):
+            for layer, (k_cache, _v_cache) in enumerate(
+                zip(self.gpu_k_caches, self.gpu_v_caches)
+            ):
+                # cpu_cache layer: [S, 2, P, H, C] -> gather slots -> split KV ->
+                # transpose to [n, H, P, C] each -> cat -> [n, H, P, 2C]
+                g = self.cpu_cache[layer].index_select(0, cpu_slots_t)
+                k = g[:, 0].permute(0, 2, 1, 3)
+                v = g[:, 1].permute(0, 2, 1, 3)
+                combined = torch.cat([k, v], dim=-1).contiguous()
+                combined_gpu = combined.to(device, non_blocking=True)
+                k_cache.index_copy_(0, base_ids, combined_gpu)
+            event = torch.cuda.Event()
+            event.record(self.copy_stream)
+        # One ordering point for the batch: attention reads staged pages only
+        # after this.
+        torch.cuda.current_stream(device=device).wait_stream(self.copy_stream)
+        for ref, _cs, slot in allocs:
+            self.residency.mark_staging(ref, slot)
         return result
 
-    def _allocate_slot(self, incoming: BlockRef) -> int:
+    def _allocate_slot(self, incoming: BlockRef, exclude: set | None = None) -> int:
         if self._free:
             slot = self._free.pop()
         else:
-            # Score-aware eviction: evict lowest-scored staging block
-            lru_candidates = list(self._lru.keys())
+            # Score-aware eviction: evict lowest-scored staging block.
+            # `exclude` protects slots already assigned to the current fetch
+            # batch, whose page content is written by the batched copy later.
+            lru_candidates = [
+                ref for ref in self._lru.keys()
+                if exclude is None or ref not in exclude
+            ]
             if not lru_candidates:
                 raise RuntimeError("No staging slots available and no candidates to evict")
             scores = self.offload_manager.scorer.scores(lru_candidates)
@@ -163,410 +159,3 @@ class KVStagingPool:
             self._free.append(slot)
 
 
-class OffloadPackageWorker(KVConnectorBase_V1):
-    """Worker-side handler for async GPU↔CPU transfers and sparse attention staging."""
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        role: KVConnectorRole,
-        kv_cache_config: KVCacheConfig,
-        offload_config: OffloadConfig,
-    ) -> None:
-        super().__init__(vllm_config, role, kv_cache_config)
-        self.offload_config = offload_config
-
-        # Will be initialized from vLLM runtime
-        self.kv_cache_config: Optional[KVCacheConfig] = None
-        self.kv_cache_spec = None
-        self._orchestrator: Optional["OffloadOrchestrator"] = None
-
-        # Worker reference for getting request IDs
-        self._worker = None
-
-        # Stream for async copies
-        self._load_stream = torch.cuda.Stream()
-        self._store_stream = torch.cuda.Stream()
-
-        # Transfer tracking
-        self._load_events: list[tuple[int, torch.cuda.Event]] = []
-        self._store_events: list[tuple[int, torch.cuda.Event]] = []
-
-        # Completion watermarks
-        self._load_hwm = -1
-        self._store_hwm = -1
-
-        # Pending event tracking
-        self._pending_load_event_indices: set[int] = set()
-        self._pending_store_event_indices: set[int] = set()
-
-        # Completed event counts (for multi-worker aggregation)
-        self._completed_load_events: dict[int, int] = defaultdict(int)
-        self._completed_store_events: dict[int, int] = defaultdict(int)
-
-        # Metadata from scheduler
-        self._metadata: Optional[OffloadPackageMetadata] = None
-
-        # Staging pool config
-        self._staging_slots = offload_config.num_staging_slots
-        self._staging_base_page = 0
-
-        logger.info("OffloadPackageWorker initialized")
-
-    def initialize_from_config(
-        self,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
-        """Initialize worker after KV cache config is known."""
-        self.kv_cache_config = kv_cache_config
-        # Extract AttentionSpec from KVCacheConfig
-        from vllm.v1.kv_cache_interface import AttentionSpec, UniformTypeKVCacheSpecs
-        spec = None
-        for group in kv_cache_config.kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                for layer_name in group.layer_names:
-                    layer_spec = group_spec.kv_cache_specs[layer_name]
-                    if isinstance(layer_spec, AttentionSpec):
-                        spec = layer_spec
-                        break
-            elif hasattr(group_spec, 'block_size') and hasattr(group_spec, 'num_kv_heads'):
-                spec = group_spec
-            if spec:
-                break
-        if spec is None:
-            raise ValueError("No AttentionSpec found in KVCacheConfig")
-        self.kv_cache_spec = spec
-        self._staging_base_page = self.kv_cache_config.num_blocks - self._staging_slots
-
-        # Build orchestrator
-        self._build_orchestrator()
-
-    def _build_orchestrator(self) -> None:
-        """Build the offload orchestrator with all components."""
-        from offload_package.shared.types import build_orchestrator, normalize_runner_kv_caches
-
-        # Normalize KV caches to get the view
-        kv_cache_view = normalize_runner_kv_caches(
-            self._worker.model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        # Build orchestrator config
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        # Build orchestrator using the factory function
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def bind_worker(self, worker) -> None:
-        """Bind to the GPU worker for accessing request IDs."""
-        self._worker = worker
-
-    def start_load_kv(self, forward_context: ForwardContext) -> None:
-        """Launch async CPU→GPU copies for staging (sparse attention fetch)."""
-        print(f"[WORKER DEBUG] start_load_kv called: metadata={self._metadata is not None}", flush=True)
-        if self._metadata is None:
-            print(f"[WORKER DEBUG] start_load_kv: early return - no metadata", flush=True)
-            return
-        # Use a dummy load_event if not set by scheduler
-        load_event = self._metadata.load_event if self._metadata.load_event != -1 else 0
-
-        if self._orchestrator is None:
-            print(f"[WORKER DEBUG] start_load_kv: no orchestrator", flush=True)
-            return
-
-        # Get cached sparse pattern from Skylight backend (from previous step)
-        sparse_idx, sparse_len, request_ids = self._get_cached_sparse_pattern()
-        # Fallback to metadata's request_ids if not in cache
-        if (request_ids is None or len(request_ids) == 0) and self._metadata is not None:
-            request_ids = self._metadata.request_ids
-        print(f"[WORKER DEBUG] cached pattern: sparse_idx={sparse_idx is not None}, sparse_len={sparse_len is not None}, request_ids={request_ids}", flush=True)
-        if sparse_idx is None or sparse_len is None or request_ids is None or len(request_ids) == 0:
-            # No cached pattern yet (first step) - skip staging for this step
-            print(f"[WORKER DEBUG] start_load_kv: no cached pattern, skipping", flush=True)
-            return
-
-        print(f"[WORKER DEBUG] sparse_idx shape={sparse_idx.shape}, sparse_len shape={sparse_len.shape}", flush=True)
-
-        # Use orchestrator's staging pool to fetch blocks
-        staging_map = self._orchestrator.prepare_staging(
-            request_ids,
-            sparse_idx.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
-            sparse_len.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
-        )
-        print(f"[WORKER DEBUG] staging_map: {staging_map}", flush=True)
-
-        # Launch async copies for each block
-        for ref, staging_slot in staging_map.items():
-            loc = self._orchestrator.residency.get(ref)
-            if loc and loc.cpu_slot is not None:
-                print(f"[WORKER DEBUG] Fetching block {ref} (cpu_slot={loc.cpu_slot}) to staging_slot={staging_slot}", flush=True)
-                self._launch_cpu_to_staging_copy(loc.cpu_slot, staging_slot)
-            else:
-                print(f"[WORKER DEBUG] Block {ref} not on CPU or no cpu_slot: loc={loc}", flush=True)
-
-        # Record completion event
-        event = torch.cuda.Event()
-        event.record(self._load_stream)
-        self._load_events.append((load_event, event))
-
-    def _get_cached_sparse_pattern(self):
-        """Get cached sparse pattern from Skylight backend."""
-        import os
-        try:
-            # Import the module to access module-level cached pattern
-            import skylight.backend as skylight_backend
-            sparse_idx = skylight_backend._sparse_pattern_cache.get('sparse_idx', None)
-            sparse_len = skylight_backend._sparse_pattern_cache.get('sparse_len', None)
-            request_ids = skylight_backend._sparse_pattern_cache.get('request_ids', None)
-            
-            print(f"[WORKER DEBUG] pid={os.getpid()}, _get_cached_sparse_pattern: skylight_backend id={id(skylight_backend)}, sparse_idx id={id(sparse_idx)}", flush=True)
-            print(f"[WORKER DEBUG] _cached_sparse_idx={sparse_idx is not None}, _cached_sparse_len={sparse_len is not None}, _cached_request_ids={request_ids}", flush=True)
-            
-            # If cached request_ids not available, try to get from model runner
-            if request_ids is None and self._worker is not None:
-                if hasattr(self._worker, 'model_runner') and self._worker.model_runner is not None:
-                    runner = self._worker.model_runner
-                    if hasattr(runner, 'execute_model_state') and runner.execute_model_state is not None:
-                        input_batch = runner.execute_model_state.input_batch
-                        if input_batch is not None and hasattr(input_batch, 'req_ids'):
-                            request_ids = input_batch.req_ids
-                            print(f"[WORKER DEBUG] Got request_ids from model runner: {request_ids}", flush=True)
-                            # Store in cache for next time
-                            skylight_backend._sparse_pattern_cache['request_ids'] = request_ids
-            
-            return sparse_idx, sparse_len, request_ids
-        except Exception as e:
-            logger.warning(f"Could not get cached sparse pattern: {e}")
-            return None, None, None
-
-    def _launch_cpu_to_staging_copy(self, cpu_slot: int, staging_slot: int):
-        """Launch async copy from CPU cache to GPU staging slot."""
-        if self._orchestrator is None:
-            return
-        # Access staging pool and copy
-        staging_pool = self._orchestrator.staging_pool
-        with torch.cuda.stream(self._load_stream):
-            for layer, (k_cache, v_cache) in enumerate(zip(
-                staging_pool.gpu_k_caches, staging_pool.gpu_v_caches
-            )):
-                k_cache[staging_pool.base + staging_slot].copy_(
-                    staging_pool.cpu_cache[layer, cpu_slot, 0], non_blocking=True
-                )
-                v_cache[staging_pool.base + staging_slot].copy_(
-                    staging_pool.cpu_cache[layer, cpu_slot, 1], non_blocking=True
-                )
-        # Ensure visibility to default stream
-        torch.cuda.current_stream().wait_stream(self._load_stream)
-
-    def wait_for_save(self) -> None:
-        """Launch async GPU→CPU copies for offloaded blocks."""
-        print(f"[WORKER DEBUG] wait_for_save called: store_event={self._metadata.store_event if self._metadata else None}, store_gpu_blocks={self._metadata.store_gpu_blocks if self._metadata else None}", flush=True)
-        if self._metadata is None or self._metadata.store_event == -1:
-            return
-        if not self._metadata.store_gpu_blocks:
-            return
-
-        if self._orchestrator is None:
-            return
-
-        # Wait for compute to finish before reading KV cache
-        compute_done = torch.cuda.Event()
-        compute_done.record(torch.cuda.current_stream())
-        self._store_stream.wait_event(compute_done)
-
-        # Launch copies for each block
-        for gpu_block_id, cpu_block_id in zip(
-            self._metadata.store_gpu_blocks, self._metadata.store_cpu_blocks
-        ):
-            print(f"[WORKER DEBUG] Copying gpu_block={gpu_block_id} to cpu_block", flush=True)
-            self._orchestrator.offload_manager._copy_gpu_to_cpu(gpu_block_id)
-
-        # Record completion event
-        event = torch.cuda.Event()
-        event.record(self._store_stream)
-        self._store_events.append((self._metadata.store_event, event))
-        self._pending_store_event_indices.add(self._metadata.store_event)
-
-    def get_finished(self, finished_req_ids: set[str]) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        """Poll for completed transfers and return finished request IDs."""
-        finished_recving: set[str] = set()
-
-        # Check load events (staging)
-        if self._pending_load_event_indices:
-            load_wm = self._poll_events(is_store=False)
-            for event_idx in [j for j in self._pending_load_event_indices if j <= load_wm]:
-                self._pending_load_event_indices.discard(event_idx)
-                self._completed_load_events[event_idx] = 1
-                # Map event to request IDs
-                if self._metadata and event_idx in self._metadata.load_event_to_reqs:
-                    finished_recving.update(self._metadata.load_event_to_reqs[event_idx])
-
-        # Check store events (offload)
-        if self._pending_store_event_indices:
-            store_wm = self._poll_events(is_store=True)
-            for event_idx in [j for j in self._pending_store_event_indices if j <= store_wm]:
-                self._pending_store_event_indices.discard(event_idx)
-                self._completed_store_events[event_idx] = 1
-
-        return None, finished_recving or None
-
-    def _poll_events(self, is_store: bool) -> int:
-        events = self._store_events if is_store else self._load_events
-        hwm = self._store_hwm if is_store else self._load_hwm
-        while events:
-            event_idx, event = events[0]
-            if not event.query():
-                break
-            hwm = event_idx
-            events.pop(0)
-        if is_store:
-            self._store_hwm = hwm
-        else:
-            self._load_hwm = hwm
-        return hwm
-
-    def build_worker_meta(self) -> KVConnectorWorkerMetadata:
-        """Build metadata to send back to scheduler."""
-        if not self._completed_store_events and not self._completed_load_events:
-            return None
-        meta = OffloadPackageWorkerMetadata(
-            completed_store_events=self._completed_store_events,
-            completed_load_events=self._completed_load_events,
-        )
-        self._completed_store_events = {}
-        self._completed_load_events = {}
-        return meta
-
-    def flush_and_sync(self) -> None:
-        """Wait for all pending transfers to complete."""
-        self._flush_and_sync_all()
-
-    def _flush_and_sync_all(self) -> None:
-        for event_idx, event in self._load_events:
-            event.synchronize()
-            self._load_hwm = event_idx
-        self._load_events.clear()
-        for event_idx, event in self._store_events:
-            event.synchronize()
-            self._store_hwm = event_idx
-        self._store_events.clear()
-
-    # Abstract methods from KVConnectorBase_V1
-    
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        pass
-
-    def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
-
-    def save_kv_layer(
-        self,
-        layer_name: str,
-        kv_layer: torch.Tensor,
-        attn_metadata: "AttentionMetadata",
-        **kwargs: Any,
-    ) -> None:
-        pass
-
-    def get_num_new_matched_tokens(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        return 0, False
-
-    def update_state_after_alloc(
-        self,
-        request: "Request",
-        blocks: "KVCacheBlocks",
-        num_external_tokens: int,
-    ) -> None:
-        pass
-
-    def request_finished(
-        self,
-        request: "Request",
-        block_ids: list[int],
-    ) -> tuple[bool, dict[str, Any] | None]:
-        return False, None
-
-    def request_finished_all_groups(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-    ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished(request, block_ids=[])
-
-    def shutdown(self) -> None:
-        self.flush_and_sync()
-
-    def get_handshake_metadata(self):
-        return None
-
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        return set()
-
-    def set_runner(self, runner) -> None:
-        """Bind the GPU model runner for accessing request IDs."""
-        self._worker = runner
-        if self._orchestrator is None:
-            self._build_orchestrator()
-
-    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        """Set the connector metadata from the scheduler."""
-        assert isinstance(connector_metadata, OffloadPackageMetadata)
-        self._metadata = connector_metadata
-        print(f"[WORKER DEBUG] bind_connector_metadata: load_event={connector_metadata.load_event}, store_event={connector_metadata.store_event}, request_ids={connector_metadata.request_ids}, store_gpu_blocks={connector_metadata.store_gpu_blocks}", flush=True)
-
-    def clear_connector_metadata(self) -> None:
-        self._metadata = None
-        print(f"[WORKER DEBUG] clear_connector_metadata", flush=True)
-
-    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
-        pass
-
-    def _flush_and_sync_all(self) -> None:
-        for event_idx, event in self._load_events:
-            event.synchronize()
-            self._load_hwm = event_idx
-        self._load_events.clear()
-        for event_idx, event in self._store_events:
-            event.synchronize()
-            self._store_hwm = event_idx
-        self._store_events.clear()
-
-    def build_worker_meta(self) -> KVConnectorWorkerMetadata:
-        """Build metadata to send back to scheduler."""
-        if not self._completed_store_events and not self._completed_load_events:
-            return None
-        meta = OffloadPackageWorkerMetadata(
-            completed_store_events=self._completed_store_events,
-            completed_load_events=self._completed_load_events,
-        )
-        self._completed_store_events = {}
-        self._completed_load_events = {}
-        return meta
-
-    def _flush_and_sync_all(self) -> None:
-        for event_idx, event in self._load_events:
-            event.synchronize()
-            self._load_hwm = event_idx
-        self._load_events.clear()
-        for event_idx, event in self._store_events:
-            event.synchronize()
-            self._store_hwm = event_idx
-        self._store_events.clear()

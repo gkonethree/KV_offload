@@ -5,6 +5,7 @@ from collections.abc import Hashable, Sequence
 import torch
 
 from .base import BlockKVStats, BlockScorer
+from offload_package.debug import dbg as _dbg
 
 
 class PagedEvictionScorer(BlockScorer):
@@ -64,17 +65,17 @@ class PagedEvictionScorer(BlockScorer):
         block_ids: Sequence[Hashable],
         budget: int,
     ) -> list[Hashable]:
-        print(f"[SCORER DEBUG] select_for_eviction: block_ids={len(block_ids)}, budget={budget}", flush=True)
+        _dbg(f"[SCORER DEBUG] select_for_eviction: block_ids={len(block_ids)}, budget={budget}")
         if budget < 0:
             raise ValueError("budget must be non-negative")
         if len(block_ids) <= budget:
-            print(f"[SCORER DEBUG] returning empty: len={len(block_ids)} <= budget={budget}", flush=True)
+            _dbg(f"[SCORER DEBUG] returning empty: len={len(block_ids)} <= budget={budget}")
             return []
         scores = self.scores(block_ids)
-        print(f"[SCORER DEBUG] scores={scores}", flush=True)
+        _dbg(f"[SCORER DEBUG] scores={scores}")
         count = len(block_ids) - budget
         order = torch.argsort(scores, stable=True)
-        print(f"[SCORER DEBUG] count={count}, order={order}", flush=True)
+        _dbg(f"[SCORER DEBUG] count={count}, order={order}")
         return [block_ids[i] for i in order[:count].tolist()]
         scores = self.scores(block_ids)
         count = len(block_ids) - budget

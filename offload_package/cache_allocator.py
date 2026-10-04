@@ -1,73 +1,67 @@
+"""Reserve the tail GPU KV pages for the offload staging pool.
+
+Approach: instead of extending the physical KV tensors (fragile against the
+fork's flat-buffer + strided-view allocator), the last ``num_staging_slots``
+blocks are permanently excluded from the scheduler's ``BlockPool`` so the
+allocator never hands them to a request. The pages remain physically present
+and addressable in the per-layer KV views, so the staging pool can read/write
+them at ``staging_base .. num_blocks-1`` without ever racing with request
+allocations.
+
+This works identically for the V1 and V2 runners and for both single- and
+multi-layer groups, with no changes to vLLM's allocation geometry.
+"""
+
 from __future__ import annotations
 
-"""Conservative tail-page allocator hook for the vLLM V2 KV cache."""
+import logging
 
-import torch
+logger = logging.getLogger(__name__)
 
-from .config import OffloadConfig
 
-_INSTALLED = False
-_ORIGINAL = None
+def reserve_staging_tail(block_pool, num_slots: int) -> list[int]:
+    """Remove the tail ``num_slots`` pages from the scheduler BlockPool.
+
+    Uses ``BlockPool.touch`` once at startup: a free block is removed from the
+    free queue and its ref_cnt pinned at 1, so the block can never be
+    allocated, evicted, or re-queued. Reserved pages stay addressable by the
+    staging pool (they are inside the per-layer KV views).
+
+    Returns the reserved block ids. Raises if the pool is too small.
+    """
+    if num_slots <= 0:
+        return []
+    n = block_pool.num_gpu_blocks
+    if num_slots >= n:
+        raise ValueError(
+            f"num_staging_slots ({num_slots}) must be < num_gpu_blocks ({n})"
+        )
+    reserved_ids = list(range(n - num_slots, n))
+    reserved_blocks = [block_pool.blocks[i] for i in reserved_ids]
+    for blk in reserved_blocks:
+        if blk.is_null:
+            raise ValueError("staging tail overlaps the pool null block")
+        if blk.ref_cnt != 0:
+            raise RuntimeError(
+                f"staging tail block {blk.block_id} is already in use "
+                "(reserve_staging_tail must run before any allocation)"
+            )
+    block_pool.touch(reserved_blocks)
+    logger.info(
+        "Reserved %d staging pages: block ids %d..%d (pool has %d allocatable left)",
+        num_slots, reserved_ids[0], reserved_ids[-1],
+        block_pool.get_num_free_blocks(),
+    )
+    return reserved_ids
 
 
 def install() -> None:
-    global _INSTALLED, _ORIGINAL
-    if _INSTALLED:
-        return
+    """Deprecated no-op.
 
-    cfg = OffloadConfig.from_env()
-    if not cfg.enabled:
-        return
-
-    import vllm.v1.worker.gpu.attn_utils as attn_utils
-    from vllm.v1.kv_cache_interface import AttentionSpec, UniformTypeKVCacheSpecs
-
-    original = attn_utils._allocate_kv_cache
-    _ORIGINAL = original
-
-    def allocate_with_tail(kv_cache_config, shared_layers, device):
-        raw = original(kv_cache_config, shared_layers, device)
-        for kv_tensor in kv_cache_config.kv_cache_tensors:
-            if len(kv_tensor.shared_by) != 1:
-                raise RuntimeError(
-                    "offload-package currently requires one layer per KV cache tensor; "
-                    f"got shared_by={kv_tensor.shared_by}"
-                )
-            layer_name = kv_tensor.shared_by[0]
-            matching = [
-                group
-                for group in kv_cache_config.kv_cache_groups
-                if layer_name in group.layer_names
-            ]
-            if len(matching) != 1:
-                raise RuntimeError(
-                    f"Could not determine a unique KV cache group for {layer_name}"
-                )
-            spec = matching[0].kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                spec = spec.kv_cache_specs[layer_name]
-            if not isinstance(spec, AttentionSpec):
-                raise RuntimeError(
-                    "offload-package staging is supported only for ordinary AttentionSpec caches"
-                )
-
-            old = raw[layer_name]
-            # The raw tensor is byte-addressed int8 storage.  For packed layouts,
-            # block_stride is the correct unit; otherwise page_size_bytes is.
-            bytes_per_physical_page = (
-                kv_tensor.block_stride if kv_tensor.block_stride > 0 else spec.page_size_bytes
-            )
-            extra = cfg.num_staging_slots * bytes_per_physical_page
-            if extra <= 0:
-                continue
-            expanded = torch.empty(
-                old.numel() + extra,
-                dtype=old.dtype,
-                device=old.device,
-            )
-            expanded[: old.numel()].copy_(old)
-            raw[layer_name] = expanded
-        return raw
-
-    attn_utils._allocate_kv_cache = allocate_with_tail
-    _INSTALLED = True
+    Older revisions extended the physical KV tensors via a hook on an
+    allocator symbol that no longer exists in this fork. Tail reservation via
+    :func:`reserve_staging_tail` (called from
+    ``OffloadPackageScheduler.bind_gpu_block_pool``) supersedes it.
+    """
+    logger.debug("cache_allocator.install() is a no-op (see reserve_staging_tail)")
+    return None

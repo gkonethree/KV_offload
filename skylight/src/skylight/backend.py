@@ -40,6 +40,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from skylight.config import SkylightSparseConfig
 
 logger = init_logger(__name__)
+import os as _os
+_DBG = _os.environ.get("OFFLOAD_PACKAGE_DEBUG", "0") == "1"
+def _dbg(msg: str) -> None:
+    if _DBG:
+        print(msg, flush=True)
 
 # Module-level cache for sparse pattern (shared across class instances)
 _sparse_pattern_cache = {
@@ -82,7 +87,7 @@ class _NoFastPlanDecodeWrapper:
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
         """Delegate to inner ``run`` then update the sparsity-fraction Gauge."""
-        print(f"[_NoFastPlanDecodeWrapper DEBUG] run() CALLED with args={len(args)}, kwargs={list(kwargs.keys())}", flush=True)
+        _dbg(f"[_NoFastPlanDecodeWrapper DEBUG] run() CALLED, inner type={type(self._inner).__name__}, has_run={hasattr(self._inner, 'run')}")
         import sys
         sys.stdout.flush()
         result = self._inner.run(*args, **kwargs)
@@ -118,6 +123,22 @@ def _import_sparse_wrapper_cls():
             from offload_package.integration.sparse_optimized_adapter import (
                 SparseOptimizedAdapterWrapper as cls,
             )
+        elif method == "offload":
+            from offload_package.integration.sparse_offload_adapter import (
+                SparseOffloadAdapterWrapper as cls,
+            )
+        elif method in ("pq", "pq_optimized"):
+            from pq_optimized import (
+                BatchDecodeWithPagedKVCacheWrapper as cls,
+            )
+        elif method in ("pqrs", "pqrs_optimized"):
+            from pqrs_optimized import (
+                BatchDecodeWithPagedKVCacheWrapper as cls,
+            )
+        elif method in ("pqis", "pqis_optimized"):
+            from pqis_optimized import (
+                BatchDecodeWithPagedKVCacheWrapper as cls,
+            )
         elif method in ("oracle", ""):
             from sparse_oracle_topk_sink_local_optimized import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
@@ -125,7 +146,8 @@ def _import_sparse_wrapper_cls():
         else:
             raise ValueError(
                 f"SKYLIGHT_SPARSE_METHOD={method!r} not recognized "
-                "(expected 'oracle', 'block_minmax', or 'sparse_optimized')."
+                "(expected 'oracle', 'block_minmax', 'sparse_optimized', "
+                "'pq', 'pqrs', or 'offload')."
             )
     except ImportError as exc:
         raise ImportError(
@@ -188,7 +210,7 @@ class SkylightSparseBackend(FlashInferBackend):
 
     @classmethod
     def is_sparse(cls) -> bool:
-        return True
+        return False  # Dense decoder interface with sparse kernels internally
 
     @classmethod
     def supports_sparse(cls) -> bool:
@@ -208,6 +230,8 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     _cached_sparse_idx: torch.Tensor | None = None
     _cached_sparse_len: torch.Tensor | None = None
     _cached_request_ids: list[str] | None = None
+    # Debug: last patched paged indices (set by _patch_indices_for_staging)
+    _last_patched_indices: torch.Tensor | None = None
     # Class-level reference to last decode wrapper created (for debugging)
     _last_decode_wrapper: object | None = None
 
@@ -289,6 +313,58 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             logger.info("SkylightSparseBackend: FULL-cudagraph slot path ON (max_bs=%d, P=%d)",
                         max_bs, self._sk_ptotal_fixed)
 
+        # --- PQ slot-codes hook (SKYLIGHT_SPARSE_METHOD=pq|pqrs). GPU-resident
+        # per-token K codes (per-request slot buffer) so selection can score
+        # pages WITHOUT reading the KV cache -- which is what keeps offloaded
+        # (CPU-resident) blocks selectable for fetch-back. Mirrors the
+        # block_minmax FULL-cudagraph hook; the maintainer exposes the same
+        # get_buf/init_layer call shape as SlotSummaryMaintainer.
+        self._sk_pq = (
+            not self._sk_fullcg
+            and os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
+            in ("pq", "pq_optimized", "pqrs", "pqrs_optimized", "pqis", "pqis_optimized")
+        )
+        if self._sk_pq:
+            from pq_optimized.slot_codes import SlotCodeMaintainer
+            max_bs = int(vllm_config.scheduler_config.max_num_seqs)
+            cap = getattr(vllm_config.compilation_config, "max_cudagraph_capture_size", None)
+            if cap:
+                max_bs = min(max_bs, int(cap))
+            # Codes buffer is [n_slots+1, H_kv, L_max, M] per layer; slot IS
+            # the batch position, so n_slots must cover the largest batch.
+            n_slots = max(int(os.environ.get("SKYLIGHT_PQ_SLOTS", "0")), max_bs)
+            self._sk_maint = SlotCodeMaintainer(
+                h_kv=int(self.kv_cache_spec.num_kv_heads),
+                m=int(os.environ.get("SKYLIGHT_PQ_SUBSPACES", "16")),
+                page=int(self.kv_cache_spec.block_size),
+                n_slots=n_slots,
+                l_max=self._sparse_max_seq_len,
+                max_batch=max_bs + 1,
+            )
+            # Selection channels must be fixed BEFORE get_buf() sizes the
+            # codebook; otherwise the combined K||V last dim (2*head_dim) would
+            # be mistaken for the key width.
+            self._sk_maint._ch = self._sparse_channel_num
+            self._sk_maxbs = max_bs
+            self._sk_owner = None     # GPU [max_bs] first-page id occupying each slot/position
+            self._sk_slots_d = torch.zeros(max_bs, dtype=torch.int32, device=device)
+            self._sk_seqlens_d = torch.zeros(max_bs, dtype=torch.int32, device=device)
+            self._sk_pos = torch.arange(max_bs, dtype=torch.int32, device=device)  # slot=position
+            self._sk_prev_sl = None
+            # For PQ the second get_buf arg is the token-level max length.
+            self._sk_ptotal_fixed = self._sparse_max_seq_len
+            logger.info(
+                "SkylightSparseBackend: PQ slot codes ON (n_slots=%d, L_max=%d, M=%d, ch=%d)",
+                n_slots, self._sparse_max_seq_len,
+                self._sk_maint.m, self._sk_maint._ch,
+            )
+
+        # Sync staging: if enabled, compute sparse pattern in build() and use for
+        # current step's staging (0 lag). Default is 1-step lag (prev step's pattern).
+        self._sk_sync_staging = os.environ.get("SKYLIGHT_SYNC_STAGING") == "1"
+        if self._sk_sync_staging:
+            logger.info("SkylightSparseBackend: SYNC staging enabled (0 lag)")
+
         logger.info(
             "SkylightSparseBackend: topk=%.4f sink=%d local=%d channel_num=%d max_seq_len=%d",
             self._sparse_topk,
@@ -307,8 +383,8 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     ) -> Any:
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = _import_sparse_wrapper_cls()
-        print(f"[SKYLIGHT DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}", flush=True)
-        return self._sparse_wrapper_cls(
+        _dbg(f"[SKYLIGHT DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}, sync_staging={self._sk_sync_staging}")
+        wrapper = self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),
             use_cuda_graph=use_cudagraph,
@@ -322,6 +398,15 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             local_size=self._sparse_local_size,
             max_seq_len=self._sparse_max_seq_len,
         )
+        # Pass orchestrator to adapter for sync staging
+        orchestrator = SkylightSparseMetadataBuilder._offload_orchestrator
+        if self._sk_sync_staging and orchestrator is not None:
+            if hasattr(wrapper, 'set_orchestrator'):
+                wrapper.set_orchestrator(orchestrator)
+                # Also cache request_ids for staging
+                if hasattr(self, '_cached_request_ids'):
+                    wrapper._cached_request_ids = self._cached_request_ids
+        return wrapper
 
     @staticmethod
     def _set_n_keys_on_decode(decode: FIDecode | None, n_keys: int) -> None:
@@ -349,18 +434,27 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
-        print(f"[SKYLIGHT DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}", flush=True)
+        _dbg(f"[SKYLIGHT DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build=fast_build,
         )
-        
-        # Prepare staging for sparse attention using cached pattern from previous step
-        if self._offload_orchestrator is not None and SkylightSparseMetadataBuilder._cached_sparse_idx is not None:
-            self._prepare_staging_for_sparse_attention(attn_metadata)
-        
-        if self._sk_fullcg:
+
+        # Hand the offload orchestrator + this step's decode request order to
+        # the sparse wrapper every step (wrapper instances are cached per batch
+        # size; class-level injection happens once in _build_orchestrator).
+        if self._sk_pq and attn_metadata.decode is not None:
+            inner = getattr(getattr(attn_metadata.decode, "wrapper", None), "_inner", None)
+            inner = inner if inner is not None else getattr(
+                attn_metadata.decode, "wrapper", None
+            )
+            cls = type(self)
+            if inner is not None and hasattr(inner, "set_offload_orchestrator"):
+                inner.set_offload_orchestrator(cls._offload_orchestrator)
+                inner.set_offload_request_ids(cls._cached_request_ids)
+
+        if (self._sk_fullcg or self._sk_pq) and not torch.cuda.is_current_stream_capturing():
             # Under FULL cudagraph the selected-set size (total_k) MUST be fixed across replays,
             # so do NOT push the dynamic per-batch length via set_n_keys (that would bake a
             # capture-time total_k into the graph). Leaving n_keys=None makes the wrapper size
@@ -375,43 +469,90 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             )
         return attn_metadata
 
-    def _prepare_staging_for_sparse_attention(self, attn_metadata):
-        """Prepare staging for sparse attention using cached sparse pattern."""
+    @override  # type: ignore[misc]
+    def _compute_flashinfer_kv_metadata(
+        self,
+        num_blocks_np,
+        seq_lens_np,
+        block_table_tensor,
+        num_reqs,
+        page_size,
+    ):
+        """Fill persistent FI buffers, then patch paged_kv_indices for staging.
+
+        Runs before the decode plan() inside super().build(), so the kernel sees
+        staging slots / null-page redirections for offloaded blocks. Copies for
+        the staging fetch are stream-ordered before the kernel launch.
+        """
+        paged_kv_indices = super()._compute_flashinfer_kv_metadata(
+            num_blocks_np, seq_lens_np, block_table_tensor, num_reqs, page_size
+        )
+        self._patch_indices_for_staging(paged_kv_indices, num_reqs)
+        return paged_kv_indices
+
+    def _patch_indices_for_staging(self, paged_kv_indices, num_reqs: int) -> None:
+        """Stage CPU blocks per cached sparse pattern and patch index content."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        cls = type(self)
+        orchestrator = cls._offload_orchestrator
+        if orchestrator is None:
+            return
+        request_ids = cls._cached_request_ids or []
+        if len(request_ids) == 0 or len(request_ids) > num_reqs:
+            return
         try:
-            if not SkylightSparseMetadataBuilder._cached_request_ids or SkylightSparseMetadataBuilder._cached_sparse_idx is None:
-                return
-            
-            # Prepare staging - this fetches CPU blocks to GPU staging slots
-            staging_map = self._offload_orchestrator.prepare_staging(
-                SkylightSparseMetadataBuilder._cached_request_ids,
-                SkylightSparseMetadataBuilder._cached_sparse_idx,
-                SkylightSparseMetadataBuilder._cached_sparse_len,
-            )
-            
-            # Patch the paged_kv_indices in the decode metadata
-            if attn_metadata.decode is not None:
-                from offload_package.selection.adapter import patch_paged_kv_indices_with_staging
-                
-                # Get the request IDs in the correct order for this batch
-                request_ids = self._cached_request_ids
-                
-                # Patch the indices
-                patched_indices = patch_paged_kv_indices_with_staging(
-                    attn_metadata.decode.paged_kv_indices,
-                    attn_metadata.decode.paged_kv_indptr,
-                    request_ids,
-                    self._cached_sparse_idx,
-                    self._cached_sparse_len,
-                    self.kv_cache_spec.block_size,
-                    self._offload_orchestrator.staging_base_page_idx,
-                    self._offload_orchestrator.residency,
-                    staging_map,
+            sparse_idx = cls._cached_sparse_idx
+            sparse_len = cls._cached_sparse_len
+
+            staging_map = {}
+            if sparse_idx is not None and sparse_len is not None:
+                # Pattern-cache batch must equal the current decode row count,
+                # else the cached pattern is frozen (graph replay) and staging
+                # it would misplace fetches.
+                if sparse_idx.shape[0] != len(request_ids):
+                    return
+                # Fetch CPU blocks needed by the previous step's top-k.
+                staging_map = orchestrator.prepare_staging(
+                    request_ids, sparse_idx, sparse_len
                 )
-                attn_metadata.decode.paged_kv_indices = patched_indices
-                
-                print(f"[SKYLIGHT DEBUG] Patched paged_kv_indices for staging: {len(staging_map)} blocks", flush=True)
+
+            # Defensive alignment check: per-row page counts in the current
+            # batch must equal the request's tracked block count, otherwise the
+            # cached request order does not match decode row order and we must
+            # not patch (row-b is ReqX's span, and patching assumes request_ids[b]).
+            indptr_gpu = self.paged_kv_indptr.gpu[: len(request_ids) + 1]
+            indptr_list = indptr_gpu.detach().cpu().tolist()
+            for b, rid in enumerate(request_ids):
+                row_pages = int(indptr_list[b + 1]) - int(indptr_list[b])
+                tracked = len(orchestrator.residency.refs_for_request(rid))
+                if tracked == 0 or row_pages != tracked:
+                    return
+
+            from offload_package.selection.adapter import (
+                patch_paged_kv_indices_with_staging,
+            )
+            null_id = 0 if getattr(orchestrator, "true_freeing", False) else None
+            patched = patch_paged_kv_indices_with_staging(
+                paged_kv_indices,
+                indptr_gpu,
+                request_ids,
+                sparse_idx,
+                sparse_len,
+                self.kv_cache_spec.block_size,
+                orchestrator.staging_base_page_idx,
+                orchestrator.residency,
+                staging_map,
+                null_block_id=null_id,
+            )
+            # In-place write into the persistent buffer: the decode wrapper's
+            # plan (later in build()) consumes this content.
+            paged_kv_indices.copy_(patched)
+            cls._last_patched_indices = patched
         except Exception as e:
-            print(f"[SKYLIGHT DEBUG] Failed to prepare staging: {e}", flush=True)
+            _dbg(f"[SKYLIGHT DEBUG] Failed to patch staging indices: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _sk_fill_slots(self, m, cm) -> None:
         """Eager, runs every build() (incl. the cudagraph-capture build): assign each DECODE
@@ -518,7 +659,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     def _get_decode_wrapper(
         self, batch_size: int, use_cudagraph: bool = False
     ) -> Any:
-        print(f"[SKYLIGHT DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}", flush=True)
+        _dbg(f"[SKYLIGHT DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}")
         # Mirror ``FlashInferMetadataBuilder._get_decode_wrapper`` but build
         # the sparse wrapper. When ``use_cudagraph`` is requested, slice the
         # persistent paged-KV buffers and cache one wrapper per captured
@@ -531,7 +672,9 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         if decode_wrapper is None:
             if use_cudagraph:
                 paged_kv_indptr = self.paged_kv_indptr.gpu[: batch_size + 1]
-                paged_kv_indices = self.paged_kv_indices.gpu
+                # paged_kv_indices is a plain GPU tensor in this fork (only
+                # indptr / last_page_len are CpuGpuBuffer).
+                paged_kv_indices = self.paged_kv_indices
                 paged_kv_last_page_len = self.paged_kv_last_page_len.gpu[:batch_size]
             else:
                 paged_kv_indptr = None
@@ -554,7 +697,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         # Store the wrapper in class attribute for debugging access
         SkylightSparseMetadataBuilder._last_decode_wrapper = decode_wrapper
 
-        print(f"[SKYLIGHT DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}", flush=True)
+        _dbg(f"[SKYLIGHT DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}")
         return decode_wrapper
 
     @override  # type: ignore[misc]
@@ -618,7 +761,7 @@ class SkylightSparseImpl(FlashInferImpl):
                               *args, **kwargs)
         
         # After forward, cache the sparse pattern for next step's staging
-        print(f"[IMPL DEBUG] Calling _cache_sparse_pattern", flush=True)
+        _dbg(f"[IMPL DEBUG] Calling _cache_sparse_pattern")
         self._cache_sparse_pattern(m)
         
         self._log_layer_sparsity(m, layer)
@@ -627,6 +770,11 @@ class SkylightSparseImpl(FlashInferImpl):
     def _cache_sparse_pattern(self, attn_metadata):
         """Cache sparse_idx and sparse_len from the kernel for next step's staging."""
         if attn_metadata is None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            # D2H syncs are illegal during graph capture; the pattern cache
+            # only feeds the *next* step's eager build()-time staging fetch, so
+            # skipping during capture is safe.
             return
         try:
             # Get the decode wrapper
@@ -656,11 +804,15 @@ class SkylightSparseImpl(FlashInferImpl):
             global _sparse_pattern_cache
             _sparse_pattern_cache['sparse_idx'] = sparse_idx.detach().cpu()
             _sparse_pattern_cache['sparse_len'] = sparse_len.detach().cpu()
-            # request_ids will be filled by worker connector from model runner
-            print(f"[SKYLIGHT DEBUG] SET _sparse_pattern_cache: sparse_idx id={id(_sparse_pattern_cache['sparse_idx'])}", flush=True)
-            print(f"[SKYLIGHT DEBUG] Cached sparse pattern: batch={batch_size}, k={sparse_idx.shape[2]}", flush=True)
+            # Also populate the class attrs read by build()'s staging-prep +
+            # index patching path (_prepare_staging_for_sparse_attention).
+            # request_ids will be filled by worker connector from model runner.
+            SkylightSparseMetadataBuilder._cached_sparse_idx = _sparse_pattern_cache['sparse_idx']
+            SkylightSparseMetadataBuilder._cached_sparse_len = _sparse_pattern_cache['sparse_len']
+            _dbg(f"[SKYLIGHT DEBUG] SET _sparse_pattern_cache: sparse_idx id={id(_sparse_pattern_cache['sparse_idx'])}")
+            _dbg(f"[SKYLIGHT DEBUG] Cached sparse pattern: batch={batch_size}, k={sparse_idx.shape[2]}")
         except Exception as e:
-            print(f"[SKYLIGHT DEBUG] Failed to cache sparse pattern: {e}", flush=True)
+            _dbg(f"[SKYLIGHT DEBUG] Failed to cache sparse pattern: {e}")
 
     def _log_layer_sparsity(self, attn_metadata, layer) -> None:
         """Sample per-layer sparsity into micro_metrics.jsonl when enabled."""

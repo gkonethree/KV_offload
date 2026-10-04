@@ -12,6 +12,7 @@ from ..shared.types import (
     build_orchestrator,
     normalize_runner_kv_caches,
 )
+from offload_package.debug import dbg as _dbg
 
 
 def initialize_for_runner(
@@ -27,12 +28,12 @@ def initialize_for_runner(
     normal_gpu_pages should be the actual number of GPU pages allocated for KV cache,
     after accounting for staging slots reserved by the cache allocator hook.
     """
-    print("[DEBUG] initialize_for_runner: START", file=sys.stderr, flush=True)
+    _dbg("[DEBUG] initialize_for_runner: START")
     if offload_config is None:
         cfg = OffloadConfig.from_env()
     else:
         cfg = offload_config
-    print(f"[DEBUG] Config loaded: enabled={cfg.enabled}", file=sys.stderr, flush=True)
+    _dbg(f"[DEBUG] Config loaded: enabled={cfg.enabled}")
     if not cfg.enabled:
         return None
     if not getattr(runner, "kv_caches", None):
@@ -40,7 +41,7 @@ def initialize_for_runner(
     if not getattr(runner, "kv_cache_config", None):
         raise RuntimeError("KV cache config not available on runner")
 
-    print("[DEBUG] Normalizing KV caches...", file=sys.stderr, flush=True)
+    _dbg("[DEBUG] Normalizing KV caches...")
     # The actual allocated GPU pages is normal_gpu_pages (already accounts for staging slots)
     # We need to pass the staging slots to normalize_runner_kv_caches so it can compute
     # the correct staging_base_page.
@@ -51,7 +52,7 @@ def initialize_for_runner(
     )
     dtype = kv_cache_view.dtype
     device = kv_cache_view.device
-    print(f"[DEBUG] KV cache view: dtype={dtype}, device={device}, num_layers={kv_cache_view.num_layers}", file=sys.stderr, flush=True)
+    _dbg(f"[DEBUG] KV cache view: dtype={dtype}, device={device}, num_layers={kv_cache_view.num_layers}")
 
     # normal_gpu_pages is the actual number of GPU pages allocated (after cache allocator
     # reserved space for staging slots). The cache allocator hook already reduced the
@@ -61,17 +62,17 @@ def initialize_for_runner(
     
     # If no room for staging, disable offloading
     if staging_slots == 0 or normal_gpu_pages <= gpu_budget_blocks:
-        print("[DEBUG] No room for staging slots, disabling offloading", file=sys.stderr, flush=True)
+        _dbg("[DEBUG] No room for staging slots, disabling offloading")
         return None
 
-    print(f"[DEBUG] Staging config: staging_slots={staging_slots}, gpu_budget_blocks={gpu_budget_blocks}, normal_gpu_pages={normal_gpu_pages}, offload_fraction={cfg.offload_fraction}", file=sys.stderr, flush=True)
+    _dbg(f"[DEBUG] Staging config: staging_slots={staging_slots}, gpu_budget_blocks={gpu_budget_blocks}, normal_gpu_pages={normal_gpu_pages}, offload_fraction={cfg.offload_fraction}")
     
     # If no room for staging, disable offloading
     if staging_slots == 0:
-        print("[DEBUG] No room for staging slots, disabling offloading", file=sys.stderr, flush=True)
+        _dbg("[DEBUG] No room for staging slots, disabling offloading")
         return None
 
-    print("[DEBUG] Building orchestrator...", file=sys.stderr, flush=True)
+    _dbg("[DEBUG] Building orchestrator...")
     orchestrator = build_orchestrator(
         OrchestratorConfig(
             offload_fraction=cfg.offload_fraction,
@@ -88,7 +89,7 @@ def initialize_for_runner(
         ),
         kv_cache_view=kv_cache_view,
     )
-    print("[DEBUG] Orchestrator created successfully!", file=sys.stderr, flush=True)
+    _dbg("[DEBUG] Orchestrator created successfully!")
     return orchestrator
 
 

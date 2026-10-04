@@ -116,38 +116,41 @@ class TestPagedEvictionScorer:
         assert len(to_evict) == 0
 
     def test_forget_removes_blocks(self):
-        """Test that forget() removes score records."""
+        """Test that forget() removes score records.
+
+        Current contract: an unknown (unscored) block reads as +inf so the
+        eviction sort never selects it -- "never evict what you have not
+        scored". Forget therefore makes the first block *kept*, not evicted.
+        """
         scorer = PagedEvictionScorer()
         block_ids = [BlockRef("req1", 0), BlockRef("req1", 1)]
-        
+
         v_norm = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
         k_norm = torch.ones(2, 1, dtype=torch.float32)
         stats = BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=block_ids)
         scorer.update(stats)
-        
+
         # Forget first block
         scorer.forget([block_ids[0]])
-        
-        # Score should be 0 (not found) after forget
+
         scores = scorer.scores(block_ids)
-        assert scores[0].item() == 0.0
-        assert scores[1].item() > 0.0
+        assert scores[0].item() == float("inf")   # unknown -> never evicted
+        assert scores[1].item() == pytest.approx(2.0)
 
     def test_reset_clears_all_scores(self):
-        """Test that reset() clears all stored scores."""
+        """Test that reset() clears all stored scores (all become +inf)."""
         scorer = PagedEvictionScorer()
         block_ids = [BlockRef("req1", 0), BlockRef("req1", 1)]
-        
+
         v_norm = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
         k_norm = torch.ones(2, 1, dtype=torch.float32)
         stats = BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=block_ids)
         scorer.update(stats)
-        
+
         scorer.reset()
-        
-        # All scores should be 0
+
         scores = scorer.scores(block_ids)
-        assert torch.all(scores == 0.0)
+        assert torch.isinf(scores).all()
 
 
 class TestComputeBlockKVNorms:

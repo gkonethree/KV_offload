@@ -2497,6 +2497,8 @@ class EngineArgs:
             attention_config.backend = AttentionConfig.validate_backend_before(
                 self.attention_backend
             )
+        # Apply the modified attention_config back to self
+        self.attention_config = attention_config
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.

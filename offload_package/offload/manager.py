@@ -7,6 +7,7 @@ import torch
 from ..scoring.base import BlockRef, BlockScorer, BlockKVStats
 from ..scoring.norm_kernel import compute_block_kv_norms
 from ..staging.residency import Residency, ResidencyTable
+from offload_package.debug import dbg as _dbg
 
 
 class CPUBlockPool:
@@ -71,24 +72,75 @@ class KVOffloadManager:
         # Skip warmup requests
         if str(ref.request_id).startswith("_warmup_"):
             return
-            
+
         all_v_norms = []
         all_k_norms = []
         for k_cache, v_cache in zip(self.gpu_k_caches, self.gpu_v_caches):
+            if k_cache is v_cache:
+                # Combined per-layer page [num_blocks, H, N, 2*head_dim]: K in
+                # [..., :head_dim], V in [..., head_dim:]. After the split the
+                # views are [B, H, N, C] which is HND ordering.
+                head_dim = k_cache.shape[-1] // 2
+                k_in = k_cache[..., :head_dim]
+                v_in = v_cache[..., head_dim:]
+                layout = "HND"
+            else:
+                k_in, v_in, layout = k_cache, v_cache, self.kv_layout
             stats = compute_block_kv_norms(
-                k_cache,
-                v_cache,
+                k_in,
+                v_in,
                 [gpu_block_id],
                 logical_block_ids=[ref],
-                layout=self.kv_layout,
+                layout=layout,
             )
             all_v_norms.append(stats.v_norm)
             all_k_norms.append(stats.k_norm)
         # Mean across layers
         v_norm = torch.stack(all_v_norms).mean(dim=0)
         k_norm = torch.stack(all_k_norms).mean(dim=0)
-        
+
         self.scorer.update(BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=[ref]))
+
+    def score_blocks(self, refs: list[BlockRef], gpu_block_ids: list[int]) -> None:
+        """Batch-score many complete blocks: ONE index_select per layer over
+        all blocks and ONE host sync total, instead of per-block*per-layer
+        syncs. Score values are identical per block to score_block (mean of
+        the same norms over the same layers is linear).
+        """
+        items = [
+            (ref, gid)
+            for ref, gid in zip(refs, gpu_block_ids)
+            if not str(ref.request_id).startswith("_warmup_")
+        ]
+        if not items:
+            return
+        refs = [r for r, _ in items]
+        gpu_ids = torch.tensor(
+            [g for _, g in items], dtype=torch.long,
+            device=self.gpu_k_caches[0].device,
+        )
+        all_v_norms = []
+        all_k_norms = []
+        for k_cache, v_cache in zip(self.gpu_k_caches, self.gpu_v_caches):
+            if k_cache is v_cache:
+                head_dim = k_cache.shape[-1] // 2
+                k_in = k_cache[..., :head_dim]
+                v_in = v_cache[..., head_dim:]
+                layout = "HND"
+            else:
+                k_in, v_in, layout = k_cache, v_cache, self.kv_layout
+            stats = compute_block_kv_norms(
+                k_in,
+                v_in,
+                gpu_ids.tolist(),
+                logical_block_ids=refs,
+                layout=layout,
+            )
+            all_v_norms.append(stats.v_norm)
+            all_k_norms.append(stats.k_norm)
+        v_norm = torch.stack(all_v_norms).mean(dim=0)
+        k_norm = torch.stack(all_k_norms).mean(dim=0)
+        self.scorer.update(BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=refs))
 
     def on_block_full(self, ref: BlockRef) -> None:
         loc = self.residency.get(ref)
@@ -108,7 +160,7 @@ class KVOffloadManager:
         scored_blocks: set[BlockRef] | None = None,
     ) -> list[BlockRef]:
         """Offload the lowest-scoring fraction of complete GPU blocks."""
-        print(f"[OFFLOAD MANAGER DEBUG] offload_fraction called: candidates={len(candidates)}, fraction={fraction}", flush=True)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] offload_fraction called: candidates={len(candidates)}, fraction={fraction}")
 
         if not 0.0 <= fraction < 1.0:
             raise ValueError("fraction must be in [0, 1)")
@@ -125,14 +177,14 @@ class KVOffloadManager:
             and loc.residency == Residency.GPU
             and loc.complete
         ]
-        print(f"[OFFLOAD MANAGER DEBUG] scored_candidates={len(scored_candidates)}, scored_blocks={len(scored_blocks)}, candidates={len(candidates)}", flush=True)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] scored_candidates={len(scored_candidates)}, scored_blocks={len(scored_blocks)}, candidates={len(candidates)}")
 
         # Use ceiling to ensure at least 1 block is offloaded when fraction > 0
         n_offload = max(1, int(len(scored_candidates) * fraction + 0.5))
-        print(f"[OFFLOAD MANAGER DEBUG] n_offload={n_offload}, scored_candidates={len(scored_candidates)}, fraction={fraction}", flush=True)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] n_offload={n_offload}, scored_candidates={len(scored_candidates)}, fraction={fraction}")
 
         if n_offload <= 0 or len(scored_candidates) == 0:
-            print(f"[OFFLOAD MANAGER DEBUG] returning empty: n_offload={n_offload}, scored_candidates={len(scored_candidates)}", flush=True)
+            _dbg(f"[OFFLOAD MANAGER DEBUG] returning empty: n_offload={n_offload}, scored_candidates={len(scored_candidates)}")
             return []
 
         # select_for_eviction() interprets budget as the number to KEEP.
@@ -142,23 +194,23 @@ class KVOffloadManager:
             scored_candidates,
             keep,
         )
-        print(f"[OFFLOAD MANAGER DEBUG] refs_to_evict={refs_to_evict}", flush=True)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] refs_to_evict={refs_to_evict}")
 
         offloaded = []
         events = []
 
         for ref in refs_to_evict:
             loc = self.residency.get(ref)
-            print(f"[OFFLOAD MANAGER DEBUG] Processing ref={ref}, loc={loc}", flush=True)
+            _dbg(f"[OFFLOAD MANAGER DEBUG] Processing ref={ref}, loc={loc}")
 
             if loc is None:
-                print(f"[OFFLOAD MANAGER DEBUG] Skipping: loc is None", flush=True)
+                _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: loc is None")
                 continue
             if loc.gpu_block_id is None:
-                print(f"[OFFLOAD MANAGER DEBUG] Skipping: gpu_block_id is None", flush=True)
+                _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: gpu_block_id is None")
                 continue
             if loc.residency != Residency.GPU:
-                print(f"[OFFLOAD MANAGER DEBUG] Skipping: residency={loc.residency}", flush=True)
+                _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: residency={loc.residency}")
                 continue
 
             try:
@@ -172,7 +224,7 @@ class KVOffloadManager:
 
                 offloaded.append(ref)
             except Exception as e:
-                print(f"[OFFLOAD MANAGER DEBUG] Exception during copy: {e}", flush=True)
+                _dbg(f"[OFFLOAD MANAGER DEBUG] Exception during copy: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -181,7 +233,7 @@ class KVOffloadManager:
         for event in events:
             event.synchronize()
 
-        print(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}", flush=True)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}")
         return offloaded
 
     def maybe_offload(self, candidates: Sequence[BlockRef]) -> list[BlockRef]:
@@ -210,7 +262,7 @@ class KVOffloadManager:
         # Wait for all async copies to complete
         for event in events:
             event.synchronize()
-        print(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}", flush=True)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}")
         return offloaded
 
     def _copy_gpu_to_cpu(self, gpu_block_id: int) -> tuple[int, torch.cuda.Event]:

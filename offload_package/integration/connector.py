@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Optional
 
 import sys
+import os as _os
 import torch
 
 from vllm.config import VllmConfig
@@ -23,10 +24,11 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from offload_package.config import OffloadConfig
-from offload_package.integration.scheduler_connector import OffloadPackageScheduler
-from offload_package.integration.worker_connector import OffloadPackageWorker
-from offload_package.integration.metadata import OffloadPackageMetadata
-from offload_package.integration.manager import OffloadOrchestrator
+from offload_package.debug import dbg as _dbg
+# Lazy imports for scheduler_connector/worker_connector/manager: importing
+# them at module level creates a cycle (vllm's kv_transfer v1 __init__
+# re-exports this module, which would re-enter offload_package.integration
+# while manager is still mid-import).
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -59,250 +61,64 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             interval_tokens=extra_config.get("interval_tokens", 32),
             scorer_decay=extra_config.get("scorer_decay", 1.0),
             scorer_head_reduction=extra_config.get("scorer_head_reduction", "mean"),
+            true_free=extra_config.get(
+                "true_free",
+                _os.getenv("OFFLOAD_PACKAGE_TRUE_FREE", "1").lower()
+                in {"1", "true", "yes", "on"},
+            ),
+            promote_per_step=int(extra_config.get(
+                "promote_per_step",
+                _os.getenv("OFFLOAD_PACKAGE_PROMOTE_PER_STEP", "4"),
+            )),
         )
         
         self.kv_cache_config = kv_cache_config
         self._orchestrator = None
+        self._model_runner = None
         self._worker_handler = None
         self._scheduler_manager = None
-        self._model_runner = None
         
-        logger.info("OffloadPackageConnector initialized")
+        # Create BOTH handlers for uni-process mode where scheduler and worker
+        # share the same connector instance. The worker initializes first (role=WORKER),
+        # then scheduler reuses the connector but needs scheduler_manager.
+        from offload_package.integration.worker_connector import OffloadPackageWorker
+        from offload_package.integration.scheduler_connector import OffloadPackageScheduler
+        
+        self._worker_handler = OffloadPackageWorker(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            kv_cache_config,
+            offload_config=self.offload_config,
+        )
+        
+        # Create scheduler manager - will be bound to GPU block pool later
+        self._scheduler_manager = OffloadPackageScheduler(
+            vllm_config,
+            kv_cache_config,
+            self.offload_config,
+            worker_handler=self._worker_handler,
+        )
+        
+        logger.info("OffloadPackageConnector initialized with both worker and scheduler handlers")
 
     def initialize_from_config(self, kv_cache_config: "KVCacheConfig") -> None:
         """Initialize worker handler with KV cache config."""
         if self._worker_handler is not None:
             self._worker_handler.initialize_from_config(kv_cache_config)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool", kv_cache_manager=None) -> None:
+        """Bind GPU BlockPool to scheduler manager."""
         if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
-
-    def _build_orchestrator(self) -> None:
-        """Build the offload orchestrator with all components."""
-        from offload_package.vllm_adapter import normalize_runner_kv_caches
-        
-        if self._model_runner is None:
-            return
-            
-        kv_cache_view = normalize_runner_kv_caches(
-            self._model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        from offload_package.shared.types import OrchestratorConfig, build_orchestrator
-        
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        from offload_package.shared.types import build_orchestrator
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def initialize_from_config(self, kv_cache_config) -> None:
-        if self._worker_handler is not None:
-            self._worker_handler.initialize_from_config(kv_cache_config)
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
-
-    def _build_orchestrator(self) -> None:
-        from offload_package.vllm_adapter import normalize_runner_kv_caches
-        
-        if self._model_runner is None:
-            return
-            
-        kv_cache_view = normalize_runner_kv_caches(
-            self._model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        from offload_package.shared.types import OrchestratorConfig, build_orchestrator
-        
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        from offload_package.shared.types import build_orchestrator
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def initialize_from_config(self, kv_cache_config) -> None:
-        if self._worker_handler is not None:
-            self._worker_handler.initialize_from_config(kv_cache_config)
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
-
-    def _build_orchestrator(self) -> None:
-        from offload_package.vllm_adapter import normalize_runner_kv_caches
-        
-        if self._model_runner is None:
-            return
-            
-        kv_cache_view = normalize_runner_kv_caches(
-            self._model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        from offload_package.shared.types import OrchestratorConfig, build_orchestrator
-        
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        from offload_package.shared.types import build_orchestrator
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def initialize_from_config(self, kv_cache_config) -> None:
-        if self._worker_handler is not None:
-            self._worker_handler.initialize_from_config(kv_cache_config)
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
-
-    def _build_orchestrator(self) -> None:
-        from offload_package.vllm_adapter import normalize_runner_kv_caches
-        
-        if self._model_runner is None:
-            return
-            
-        kv_cache_view = normalize_runner_kv_caches(
-            self._model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        from offload_package.shared.types import OrchestratorConfig, build_orchestrator
-        
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        from offload_package.shared.types import build_orchestrator
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def initialize_from_config(self, kv_cache_config) -> None:
-        if self._worker_handler is not None:
-            self._worker_handler.initialize_from_config(kv_cache_config)
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
-
-    def _build_orchestrator(self) -> None:
-        from offload_package.vllm_adapter import normalize_runner_kv_caches
-        
-        if self._model_runner is None:
-            return
-            
-        kv_cache_view = normalize_runner_kv_caches(
-            self._model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        from offload_package.shared.types import OrchestratorConfig, build_orchestrator
-        
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        from offload_package.shared.types import build_orchestrator
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def initialize_from_config(self, kv_cache_config) -> None:
-        if self._worker_handler is not None:
-            self._worker_handler.initialize_from_config(kv_cache_config)
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
-
-    def _build_orchestrator(self) -> None:
-        from offload_package.vllm_adapter import normalize_runner_kv_caches
-        
-        if self._model_runner is None:
-            return
-            
-        kv_cache_view = normalize_runner_kv_caches(
-            self._model_runner.kv_caches,
-            self.kv_cache_config,
-            staging_slots=self._staging_slots,
-        )
-
-        from offload_package.shared.types import OrchestratorConfig, build_orchestrator
-        
-        cfg = OrchestratorConfig(
-            offload_fraction=self.offload_config.offload_fraction,
-            num_cpu_slots=self.offload_config.num_cpu_slots,
-            num_staging_slots=self.offload_config.num_staging_slots,
-            W=self.offload_config.interval_tokens,
-            page_size=self.kv_cache_spec.block_size,
-            dtype=kv_cache_view.dtype,
-            device=kv_cache_view.device,
-            gpu_budget_blocks=kv_cache_view.staging_base_page,
-            kv_layout=kv_cache_view.kv_layout,
-            scorer_decay=self.offload_config.scorer_decay,
-            scorer_head_reduction=self.offload_config.scorer_head_reduction,
-        )
-
-        from offload_package.shared.types import build_orchestrator
-        self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
-
-    def initialize_from_config(self, kv_cache_config) -> None:
-        if self._worker_handler is not None:
-            self._worker_handler.initialize_from_config(kv_cache_config)
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(kv_cache_config)
+            self._scheduler_manager.bind_gpu_block_pool(
+                gpu_block_pool, kv_cache_manager=kv_cache_manager
+            )
 
     def set_runner(self, runner) -> None:
+        _dbg(f"[CONNECTOR DEBUG] set_runner called, runner={type(runner)}, worker_handler={id(self._worker_handler) if self._worker_handler else None}")
         self._model_runner = runner
-        if self._orchestrator is None:
-            self._build_orchestrator()
+        # Delegate to worker handler which builds the orchestrator
+        if self._worker_handler is not None:
+            self._worker_handler.set_runner(runner)
 
     # Abstract methods from KVConnectorBase_V1
     def get_num_new_matched_tokens(self, request, num_computed_tokens: int):
@@ -312,6 +128,8 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         pass
     
     def request_finished(self, request, block_ids):
+        if self._scheduler_manager is not None:
+            return self._scheduler_manager.request_finished(request, block_ids)
         return False, None
     
     def request_finished_all_groups(self, request, block_ids):
@@ -321,13 +139,25 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         pass
     
     def wait_for_save(self):
-        pass
+        # Delegate: the worker records store-event completion so
+        # get_finished() -> build_connector_worker_meta() reports it to the
+        # scheduler, which then frees the touched GPU blocks.
+        if self._worker_handler is not None:
+            self._worker_handler.wait_for_save()
+
+    def build_connector_worker_meta(self):
+        if self._worker_handler is not None:
+            return self._worker_handler.build_worker_meta()
+        return None
     
     def get_finished(self, finished_req_ids):
+        if self._worker_handler is not None:
+            return self._worker_handler.get_finished(finished_req_ids)
         return None, None
     
     def shutdown(self):
-        pass
+        if self._worker_handler is not None:
+            self._worker_handler.shutdown()
     
     def get_kv_connector_stats(self):
         return None
@@ -336,232 +166,44 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         return None
     
     def get_handshake_metadata(self):
+        if self._worker_handler is not None:
+            return self._worker_handler.get_handshake_metadata()
         return None
     
     def get_block_ids_with_load_errors(self):
         return set()
     
     def register_kv_caches(self, kv_caches):
-        pass
+        # Register KV caches with worker handler
+        if self._worker_handler is not None:
+            self._worker_handler.register_kv_caches(kv_caches)
     
     def bind_connector_metadata(self, connector_metadata):
-        pass
+        if self._worker_handler is not None:
+            self._worker_handler.bind_connector_metadata(connector_metadata)
     
     def clear_connector_metadata(self):
-        pass
+        if self._worker_handler is not None:
+            self._worker_handler.clear_connector_metadata()
     
     def handle_preemptions(self, kv_connector_metadata):
-        pass
+        if self._worker_handler is not None:
+            self._worker_handler.handle_preemptions(kv_connector_metadata)
     
     def start_load_kv(self, forward_context):
-        pass
+        if self._worker_handler is not None:
+            self._worker_handler.start_load_kv(forward_context)
     
     def wait_for_layer_load(self, layer_name):
-        pass
+        if self._worker_handler is not None:
+            self._worker_handler.wait_for_layer_load(layer_name)
     
     def build_connector_meta(self, scheduler_output):
+        if self._scheduler_manager is not None:
+            return self._scheduler_manager.build_connector_meta(scheduler_output)
         from offload_package.integration.metadata import OffloadPackageMetadata
         return OffloadPackageMetadata()
     
     def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-    
-    def register_kv_caches(self, kv_caches):
-        pass
-    
-    def bind_connector_metadata(self, connector_metadata):
-        pass
-    
-    def clear_connector_metadata(self):
-        pass
-    
-    def handle_preemptions(self, kv_connector_metadata):
-        pass
-    
-    def start_load_kv(self, forward_context):
-        pass
-    
-    def wait_for_layer_load(self, layer_name):
-        pass
-    
-    def build_connector_meta(self, scheduler_output):
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        return OffloadPackageMetadata()
-    
-    def update_connector_output(self, connector_output):
-        pass
-    
-    def get_handshake_metadata(self):
-        return None
-
+        if self._scheduler_manager is not None:
+            self._scheduler_manager.update_connector_output(connector_output)    

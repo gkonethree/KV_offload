@@ -104,9 +104,14 @@ class SparseAttentionScorer:
         
         # 3. Compute compact scores over middle range
         stride_page, stride_n, stride_h, v_offset = kv_strides
+        q_contig = q if q.is_contiguous() else q.contiguous()
+        # Ensure all tensors are on CUDA
+        indptr_cuda = indptr if indptr.is_cuda else indptr.cuda()
+        indices_cuda = indices if indices.is_cuda else indices.cuda()
+        last_page_len_cuda = last_page_len if last_page_len.is_cuda else last_page_len.cuda()
         scores = self._ops.oracle_topk_compute_scores_compact(
-            q, k_cache, stride_page, stride_n, stride_h,
-            indptr, indices, last_page_len,
+            q_contig, k_cache, stride_page, stride_n, stride_h,
+            indptr_cuda, indices_cuda, last_page_len_cuda,
             num_kv_heads, page_size,
             token_start, token_end, self.channel_num
         )  # [B, H_q, L_mid]
@@ -130,7 +135,7 @@ class SparseAttentionScorer:
             parts.append(sink_idx)
         parts.append(topk_idx)
         if self.local_size > 0:
-            local_start = (L_per - self.local_size).clamp(min=self.sink_size)
+            local_start = (L_per.to(q.device) - self.local_size).clamp(min=self.sink_size)
             local_offsets = torch.arange(self.local_size, device=q.device, dtype=torch.int64)
             local_idx = local_start.view(B, 1, 1) + local_offsets.view(1, 1, -1)
             local_idx = local_idx.expand(B, H_q, -1)
@@ -140,7 +145,7 @@ class SparseAttentionScorer:
         total_k = sparse_idx.shape[-1]
         
         # 7. sparse_len = clamp(L_per, total_k) per request
-        sparse_len = L_per.clamp(max=total_k).to(torch.int32).view(B, 1, 1).expand(B, H_q, 1)
+        sparse_len = L_per.to(q.device).clamp(max=total_k).to(torch.int32).view(B, 1, 1).expand(B, H_q, 1)
         
         # 8. sparse_weights = ones (uniform attention within selected)
         sparse_weights = torch.ones((B, H_q, total_k), dtype=torch.float32, device=q.device)

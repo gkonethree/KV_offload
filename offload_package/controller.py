@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from offload_package.debug import dbg as _dbg  # gated by OFFLOAD_PACKAGE_DEBUG=1
 
 
 class KVCompressionController:
@@ -16,7 +17,7 @@ class KVCompressionController:
         if page_size <= 0:
             raise ValueError("page_size must be > 0")
         if W % page_size:
-            raise ValueError("W must be a multiple of page_size")
+            raise ValueError("W must be a multiple of page_size W is {}, page_size is {}".format(W, page_size))
         self.W = int(W)
         self.page_size = int(page_size)
         self._started: set[str] = set()
@@ -33,7 +34,9 @@ class KVCompressionController:
             raise ValueError("num_tokens must be >= 0")
         self._decode_tokens[request_id] += int(num_tokens)
         n = self._decode_tokens[request_id]
-        return n > 0 and n % self.W == 0
+        should_trigger = n > 0 and n % self.W == 0
+        _dbg(f"[CONTROLLER DEBUG] on_decode req_id={request_id}, num_tokens={num_tokens}, total={n}, W={self.W}, should_trigger={should_trigger}")
+        return should_trigger
 
     def remove(self, request_id: str) -> None:
         self._started.discard(request_id)

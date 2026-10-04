@@ -27,9 +27,19 @@ class ResidencyTable:
 
     def __init__(self) -> None:
         self._blocks: dict[BlockRef, BlockLocation] = {}
+        # Number of blocks whose ONLY backing store is the CPU copy (i.e.
+        # needing a fetch before the kernel can read them). Used as a cheap
+        # short-circuit for per-step fetch probes.
+        self._num_cpu = 0
+
+    @property
+    def num_cpu_blocks(self) -> int:
+        return self._num_cpu
 
     def mark_gpu(self, ref: BlockRef, gpu_block_id: int, *, complete: bool = False) -> None:
         old = self._blocks.get(ref)
+        if old is not None and old.residency == Residency.CPU:
+            self._num_cpu -= 1
         self._blocks[ref] = BlockLocation(
             residency=Residency.GPU,
             gpu_block_id=int(gpu_block_id),
@@ -45,6 +55,8 @@ class ResidencyTable:
         old = self._blocks.get(ref)
         if old is None or old.gpu_block_id is None:
             raise KeyError(f"No GPU mapping recorded for {ref}")
+        if old.residency != Residency.CPU:
+            self._num_cpu += 1
         self._blocks[ref] = BlockLocation(
             residency=Residency.CPU,
             gpu_block_id=old.gpu_block_id,
@@ -56,6 +68,8 @@ class ResidencyTable:
         old = self._blocks[ref]
         if old.cpu_slot is None:
             raise KeyError(f"No CPU slot recorded for {ref}")
+        if old.residency == Residency.CPU:
+            self._num_cpu -= 1
         self._blocks[ref] = BlockLocation(
             residency=Residency.STAGING,
             gpu_block_id=old.gpu_block_id,
@@ -68,7 +82,10 @@ class ResidencyTable:
         return self._blocks.get(ref)
 
     def remove(self, ref: BlockRef) -> Optional[BlockLocation]:
-        return self._blocks.pop(ref, None)
+        old = self._blocks.pop(ref, None)
+        if old is not None and old.residency == Residency.CPU:
+            self._num_cpu -= 1
+        return old
 
     def all_gpu_blocks(self, *, complete_only: bool = True) -> list[BlockRef]:
         return [

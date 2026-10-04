@@ -4,12 +4,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from offload_package.vllm_adapter import (
-    KVCacheView,
+from offload_package.shared.types import (
     OrchestratorConfig,
     normalize_runner_kv_caches,
     build_orchestrator,
 )
+from offload_package.vllm_adapter import KVCacheView
 
 
 class TestKVCacheView:

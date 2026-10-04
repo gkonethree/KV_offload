@@ -93,9 +93,13 @@ class TestChunkedPrefill:
         for ref in orchestrator._request_blocks[req_id]:
             orchestrator.residency.mark_gpu(ref, ref.block_idx, complete=True)
         
-        # Now should offload when prefill completes
+        # on_prefill_complete marks blocks complete and scores them; the
+        # offload itself moved to the scheduler's _trigger_global_offload
+        # (tracked store-event path).
         offloaded = orchestrator.on_prefill_complete(req_id)
-        assert len(offloaded) > 0, "Should offload on final prefill chunk"
+        assert offloaded == [], "offload moved to _trigger_global_offload"
+        complete = orchestrator.residency.all_gpu_blocks(complete_only=True)
+        assert len(complete) == total_blocks, "prefill blocks must be marked complete"
 
     def test_chunked_prefill_sync_updates_blocks(self, setup_orchestrator):
         """Test that sync_request_blocks correctly updates block list."""

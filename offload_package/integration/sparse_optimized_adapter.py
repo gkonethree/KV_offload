@@ -1,8 +1,11 @@
-"""Adapter: Oracle sparse scorer + sparse_optimized kernel.
+"""Adapter: Offload controller's scores + sparse_optimized kernel.
 
 This adapter mimics the oracle kernel's API but uses:
-1. Oracle's score kernels for sparse pattern computation
+1. Offload controller's block scores for sparse pattern (fast!)
 2. sparse_optimized kernel for the actual sparse decode
+
+If offload orchestrator is available, uses its scored blocks.
+Otherwise falls back to Oracle scorer (slow).
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from typing import Any, Optional, Union
 import torch
 
 from offload_package.scoring.sparse_scorer import SparseAttentionScorer, SparsePattern
+from offload_package.integration.offload_sparse_adapter import OffloadSparseAdapter
 from original_optimized.batch_decode_with_paged_kv_cache_wrapper import (
     _unpack_paged_kv_cache,
 )
@@ -20,12 +24,13 @@ from original_optimized import BatchDecodeWithPagedKVCacheWrapper as DenseOptimi
 
 
 class SparseOptimizedAdapterWrapper:
-    """Adapter wrapper that combines Oracle scorer with sparse_optimized kernel.
+    """Adapter wrapper that combines Offload/Oracle scorer with sparse_optimized kernel.
     
     Constructor API matches oracle kernel:
         topk, sink_size, local_size, channel_num, max_seq_len
     
-    run() computes sparse pattern using Oracle scorer, then calls sparse_optimized.
+    run() computes sparse pattern using offload controller's scores (if available)
+    or Oracle scorer (fallback), then calls sparse_optimized kernel.
     """
     
     def __init__(
@@ -65,7 +70,10 @@ class SparseOptimizedAdapterWrapper:
         self._channel_num = channel_num if channel_num is not None else int(os.environ.get("SKYLIGHT_SPARSE_CHANNEL_NUM", "8"))
         self._max_seq_len = max_seq_len if max_seq_len is not None else int(os.environ.get("SKYLIGHT_SPARSE_MAX_SEQ_LEN", "8192"))
         
-        # Scorer instance
+        # Offload adapter (uses offload controller's scores)
+        self._offload_adapter = None
+        
+        # Fallback Oracle scorer (slow)
         self._scorer = SparseAttentionScorer(
             topk=self._topk,
             sink_size=self._sink_size,
@@ -84,6 +92,89 @@ class SparseOptimizedAdapterWrapper:
         # For offload system: cache last sparse pattern
         self._last_sparse_idx: Optional[torch.Tensor] = None
         self._last_sparse_len: Optional[torch.Tensor] = None
+        
+        # Sync staging (0 lag): compute pattern and stage in same step
+        self._sync_staging = os.environ.get("SKYLIGHT_SYNC_STAGING") == "1"
+        
+        # Offload orchestrator reference (set by backend)
+        self._orchestrator = None
+    
+    def set_orchestrator(self, orchestrator):
+        """Set offload orchestrator for sync staging."""
+        self._orchestrator = orchestrator
+        # Create offload adapter with orchestrator
+        self._offload_adapter = OffloadSparseAdapter(
+            orchestrator=orchestrator,
+            kv_layout=self._layout,
+            page_size=self._kv_cache_spec[2] if self._kv_cache_spec else 16,
+            num_kv_heads=self._kv_cache_spec[0] if self._kv_cache_spec else 4,
+            head_dim=self._kv_cache_spec[1] if self._kv_cache_spec else 64,
+            device="cuda",
+        )
+        # Store reference to this wrapper for offload adapter to use
+        self._offload_adapter.set_kernel_wrapper(self._inner)
+    
+    def _do_sync_staging(self, paged_kv_cache: Union[torch.Tensor, tuple], pattern):
+        """Perform synchronous staging: fetch blocks to GPU, patch indices."""
+        if self._orchestrator is None:
+            return None
+        
+        # Prepare staging using current pattern
+        request_ids = getattr(self, '_cached_request_ids', None)
+        if request_ids is None:
+            return None
+        
+        try:
+            staging_map = self._orchestrator.prepare_staging(
+                request_ids,
+                pattern.sparse_idx.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
+                pattern.sparse_len.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
+            )
+            
+            # Launch async copies for each block
+            for ref, staging_slot in staging_map.items():
+                loc = self._orchestrator.residency.get(ref)
+                if loc and loc.cpu_slot is not None:
+                    self._launch_cpu_to_staging_copy(loc.cpu_slot, staging_slot)
+            
+            # Wait for copies to complete
+            torch.cuda.synchronize()
+            
+            # Patch paged_kv_indices to point to staging slots
+            from offload_package.selection.adapter import patch_paged_kv_indices_with_staging
+            
+            patched_indices = patch_paged_kv_indices_with_staging(
+                self._indices,
+                self._indptr,
+                request_ids,
+                pattern.sparse_idx,
+                pattern.sparse_len,
+                self._kv_cache_spec[2],  # page_size
+                self._orchestrator.staging_base_page_idx,
+                self._orchestrator.residency,
+                staging_map,
+            )
+            
+            return patched_indices
+        except Exception as e:
+            _dbg(f"[SYNC STAGING] Failed: {e}")
+            return None
+    
+    def _launch_cpu_to_staging_copy(self, cpu_slot: int, staging_slot: int):
+        """Launch async copy from CPU cache to GPU staging slot."""
+        if self._orchestrator is None:
+            return
+        staging_pool = self._orchestrator.staging_pool
+        # Use default stream for sync staging
+        for layer, (k_cache, v_cache) in enumerate(zip(
+            staging_pool.gpu_k_caches, staging_pool.gpu_v_caches
+        )):
+            k_src = staging_pool.cpu_cache[layer, cpu_slot, 0]
+            v_src = staging_pool.cpu_cache[layer, cpu_slot, 1]
+            k_src = k_src.permute(1, 0, 2).contiguous()
+            v_src = v_src.permute(1, 0, 2).contiguous()
+            combined = torch.cat([k_src, v_src], dim=-1)
+            k_cache[staging_pool.base + staging_slot].copy_(combined, non_blocking=False)
     
     def plan(
         self,
@@ -171,7 +262,8 @@ class SparseOptimizedAdapterWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Compute sparse pattern, then call sparse_optimized kernel."""
+        """Compute sparse pattern using offload controller's scores (if available)
+        or Oracle scorer (fallback), then call sparse_optimized kernel."""
         # Ensure plan was called
         if self._indptr is None:
             raise RuntimeError("plan() must be called before run().")
@@ -181,7 +273,22 @@ class SparseOptimizedAdapterWrapper:
         if q_len_per_req != 1:
             raise NotImplementedError("Only q_len_per_req == 1 supported.")
         
-        # 1. Compute sparse pattern using Oracle scorer
+        # Try offload adapter first (uses offload controller's scores - FAST)
+        if self._offload_adapter is not None and self._orchestrator is not None:
+            try:
+                return self._offload_adapter.run(
+                    q, paged_kv_cache, *args,
+                    q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
+                    out=out, lse=lse, return_lse=return_lse,
+                    enable_pdl=enable_pdl, window_left=window_left,
+                    sinks=sinks, q_len_per_req=q_len_per_req,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    kv_cache_sf=kv_cache_sf,
+                )
+            except Exception as e:
+                _dbg(f"[ADAPTER] Offload adapter failed, falling back to Oracle: {e}")
+        
+        # Fallback: Oracle scorer (slow)
         k_cache, v_cache = self._unpack_paged_kv_cache(paged_kv_cache)
         
         pattern = self._scorer.compute_pattern(
@@ -209,7 +316,32 @@ class SparseOptimizedAdapterWrapper:
         except Exception:
             pass  # Silently ignore if skylight backend not available
         
-        # 3. Call sparse_optimized kernel with pattern
+        # 3. Sync staging (0 lag): fetch blocks and patch indices in current step
+        if self._sync_staging and self._orchestrator is not None:
+            patched_indices = self._do_sync_staging(paged_kv_cache, pattern)
+            if patched_indices is not None:
+                # Use patched indices for this step's kernel
+                return self._inner.run(
+                    q, paged_kv_cache,
+                    pattern.sparse_len,
+                    pattern.sparse_idx,
+                    pattern.sparse_weights,
+                    *args,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    out=out,
+                    lse=lse,
+                    return_lse=return_lse,
+                    enable_pdl=enable_pdl,
+                    window_left=window_left,
+                    sinks=sinks,
+                    q_len_per_req=q_len_per_req,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    kv_cache_sf=kv_cache_sf,
+                )
+        
+        # 4. Call sparse_optimized kernel with pattern (async staging uses cached pattern from prev step)
         return self._inner.run(
             q, paged_kv_cache,
             pattern.sparse_len,
