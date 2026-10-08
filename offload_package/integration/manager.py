@@ -4,6 +4,8 @@ from collections.abc import Sequence
 
 import torch
 
+from vllm.logger import init_logger
+
 from ..controller import KVCompressionController
 from ..offload.manager import KVOffloadManager
 from ..selection.adapter import (
@@ -14,6 +16,8 @@ from ..scoring.base import BlockRef
 from ..staging.pool import KVStagingPool
 from ..staging.residency import Residency, ResidencyTable
 from offload_package.debug import dbg as _dbg
+
+logger = init_logger(__name__)
 
 
 class OffloadOrchestrator:
@@ -103,8 +107,10 @@ class OffloadOrchestrator:
         self._request_blocks[request_id] = refs
         return refs
 
-    def on_prefill_complete(self, request_id: str) -> list[BlockRef]:
-        """Mark this request's blocks complete and score them.
+    def on_prefill_complete(
+        self, request_id: str, num_computed_tokens: int = 0
+    ) -> list[BlockRef]:
+        """Mark this request's FULL blocks complete and score them.
 
         Offloading itself is NOT done here: the scheduler-side
         _trigger_global_offload() runs right after prefill completion and is
@@ -121,19 +127,27 @@ class OffloadOrchestrator:
         if not self._sparse_mode:
             return []
 
-        # Mark all blocks for this request as complete (prefill is done)
+        # Completeness is per FILL STATE, not per phase: the tail block that
+        # prefill left partially filled is still being written by decode, so
+        # marking it complete would let the offloader snapshot it with
+        # unfilled rows and free the GPU page mid-write -- every later decode
+        # token in that block would attend to a stale/garbage CPU copy. Only
+        # blocks with (idx+1)*page <= num_computed_tokens graduate.
         refs = self._request_blocks.get(request_id, [])
         _score_refs, _score_gids = [], []
         for ref in refs:
             loc = self.residency.get(ref)
-            if loc is not None and not loc.complete:
-                self.residency.mark_complete(ref)
+            if loc is None:
+                continue
+            filled = (ref.block_idx + 1) * self.page_size <= int(num_computed_tokens)
+            if not filled or loc.complete:
+                continue
+            self.residency.mark_complete(ref)
             # Score blocks that became complete now
-            if loc is not None and loc.complete and ref not in self._scored:
-                if loc.residency == Residency.GPU:
-                    _score_refs.append(ref)
-                    _score_gids.append(loc.gpu_block_id)
-                    self._scored.add(ref)
+            if loc.residency == Residency.GPU and ref not in self._scored:
+                _score_refs.append(ref)
+                _score_gids.append(loc.gpu_block_id)
+                self._scored.add(ref)
         if _score_refs:
             self.offload_manager.score_blocks(_score_refs, _score_gids)
         return []
@@ -202,7 +216,15 @@ class OffloadOrchestrator:
             loc = self.residency.get(ref)
             if loc:
                 _dbg(f"[ORCHESTRATOR DEBUG]   Block {ref}: residency={loc.residency.name}, gpu_block={loc.gpu_block_id}, cpu_slot={loc.cpu_slot}, staging_slot={loc.staging_slot}")
-        result = self.staging_pool.ensure_resident(cpu_needed)
+        result, skipped = self.staging_pool.ensure_resident(cpu_needed)
+        if skipped:
+            logger.warning(
+                "prepare_staging (1-step-lag prefetch): %d/%d selected cold "
+                "blocks could not be staged (staging exhausted); they are "
+                "skipped for this prefetch pass -- the same-step in-run fetch "
+                "remains responsible for them",
+                len(skipped), len(cpu_needed),
+            )
         _dbg(f"[ORCHESTRATOR DEBUG] ensure_resident result: {result}")
         return result
 
@@ -256,7 +278,12 @@ class OffloadOrchestrator:
         scores = self.offload_manager.scorer.scores(refs)
         order = torch.argsort(scores, descending=True)
         picked = [refs[i] for i in order[:max_count].tolist()]
-        staged = self.staging_pool.ensure_resident(picked)
+        staged, skipped = self.staging_pool.ensure_resident(picked)
+        if skipped:
+            logger.warning(
+                "promote_hot_cpu_blocks: %d/%d candidates could not be staged "
+                "(staging exhausted)", len(skipped), len(picked),
+            )
         _dbg(
             f"[ORCH PROMOTE] req={request_id}: promoted {len(staged)}/{len(refs)} "
             f"cold blocks (cpu_blocks={self.residency.num_cpu_blocks})"

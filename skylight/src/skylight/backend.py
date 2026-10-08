@@ -34,7 +34,10 @@ from vllm.v1.attention.backends.flashinfer import (
     FlashInferMetadataBuilder,
 )
 
-from vllm.v1.attention.backends.utils import get_flashinfer_layout_string
+from vllm.v1.attention.backends.utils import (
+    get_flashinfer_layout_string,
+    split_decodes_and_prefills,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from skylight.config import SkylightSparseConfig
@@ -226,6 +229,14 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
 
     # Class-level reference to orchestrator (set by worker connector)
     _offload_orchestrator: object | None = None
+    # Class-level reference to the GPU model runner (set by worker connector).
+    # Used to derive the CURRENT step's decode request ids (post-reorder,
+    # decode rows first) at build time -- the scheduler-bound ids arrive one
+    # step late (bind runs after build) and their order can differ from the
+    # runner's row order in mixed batches.
+    _offload_runner: object | None = None
+    # Last bail reason recorded by _patch_indices_for_staging for this build.
+    _patch_bail_reason: str | None = None
     # Cached sparse pattern from previous step
     _cached_sparse_idx: torch.Tensor | None = None
     _cached_sparse_len: torch.Tensor | None = None
@@ -435,11 +446,67 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         fast_build: bool = False,
     ) -> FlashInferMetadata:
         _dbg(f"[SKYLIGHT DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
+        cls = type(self)
+        self._patch_bail_reason = None
+        num_decodes = 0
+
+        # Derive THIS step's decode request ids from the runner's input batch.
+        # reorder_batch_to_split_decodes_and_prefills has already run by now,
+        # so req_ids[:num_decodes] is the true decode row order -- including
+        # mixed batches (decode + prefill-continuation rows), where the
+        # scheduler-side id order is not guaranteed to match row order.
+        # num_decodes is computed whenever the offload machinery is present
+        # (the fail-loud guard below needs it); only the id STASH is subject
+        # to the SKYLIGHT_OFFLOAD_DISABLE_RUNNER_IDS fault-injection switch.
+        if (
+            cls._offload_runner is not None
+            and cls._offload_orchestrator is not None
+            and common_attn_metadata is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                num_decodes, _, _, _ = split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold,
+                )
+            except Exception as e:
+                logger.warning("split_decodes_and_prefills failed: %s", e)
+                num_decodes = 0
+            if num_decodes > 0 and os.environ.get(
+                "SKYLIGHT_OFFLOAD_DISABLE_RUNNER_IDS", "0"
+            ) != "1":
+                ib = getattr(cls._offload_runner, "input_batch", None)
+                all_ids = list(getattr(ib, "req_ids", []) or [])
+                ids = [str(r) for r in all_ids[:num_decodes]]
+                if ids and not ids[0].startswith(("_dummy", "_warmup")):
+                    cls._cached_request_ids = ids
+                    _sparse_pattern_cache["request_ids"] = list(ids)
+
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build=fast_build,
         )
+
+        # Fail-loud backstop: under true freeing, offloaded blocks' original
+        # GPU pages are freed, and the index patcher + in-run fetch are the
+        # only things standing between the kernel and those pages. A bail in
+        # either path on a step with decode rows means selected cold blocks
+        # would be read from stale/null pages with weight 1. Raise instead.
+        orch = cls._offload_orchestrator
+        if (
+            self._patch_bail_reason is not None
+            and num_decodes > 0
+            and orch is not None
+            and bool(getattr(orch, "true_freeing", False))
+            and getattr(orch.residency, "num_cpu_blocks", 0) > 0
+        ):
+            raise RuntimeError(
+                f"offload index patch bailed ({self._patch_bail_reason}) on a "
+                f"decode step with {orch.residency.num_cpu_blocks} "
+                "CPU-resident blocks under true freeing; refusing to let the "
+                "kernel read freed pages."
+            )
 
         # Hand the offload orchestrator + this step's decode request order to
         # the sparse wrapper every step (wrapper instances are cached per batch
@@ -491,54 +558,86 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         return paged_kv_indices
 
     def _patch_indices_for_staging(self, paged_kv_indices, num_reqs: int) -> None:
-        """Stage CPU blocks per cached sparse pattern and patch index content."""
+        """Stage CPU blocks per cached sparse pattern and patch index content.
+
+        Records ``self._patch_bail_reason`` for every early return that leaves
+        offloaded blocks' index entries pointing at their original (possibly
+        freed) GPU pages; ``build()`` turns hazardous bails into errors under
+        true freeing. A mismatch between the cached sparse pattern and the
+        current batch only skips the 1-step-lag prefetch -- the residency
+        remediation (null-fill / staging re-point) still runs, so the
+        in-run fetch path stays sound on composition changes.
+        """
         if torch.cuda.is_current_stream_capturing():
             return
         cls = type(self)
         orchestrator = cls._offload_orchestrator
         if orchestrator is None:
+            _dbg("[PATCH DEBUG] _patch_indices_for_staging: no orchestrator")
             return
         request_ids = cls._cached_request_ids or []
-        if len(request_ids) == 0 or len(request_ids) > num_reqs:
+        if len(request_ids) == 0:
+            self._patch_bail_reason = "ids_empty"
+            _dbg("[PATCH DEBUG] _patch_indices_for_staging: no request ids")
+            return
+        if len(request_ids) > num_reqs:
+            self._patch_bail_reason = "ids_gt_reqs"
+            _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: too many ids ({len(request_ids)}) for {num_reqs} rows")
             return
         try:
             sparse_idx = cls._cached_sparse_idx
             sparse_len = cls._cached_sparse_len
 
             staging_map = {}
+            patch_sparse_idx = sparse_idx
+            patch_sparse_len = sparse_len
             if sparse_idx is not None and sparse_len is not None:
                 # Pattern-cache batch must equal the current decode row count,
-                # else the cached pattern is frozen (graph replay) and staging
-                # it would misplace fetches.
+                # else the cached pattern belongs to a previous batch
+                # composition and staging it would fetch for the wrong rows.
+                # Skip ONLY the lag prefetch here; the remediation below still
+                # runs and the same-step in-run fetch covers this step's
+                # selection.
                 if sparse_idx.shape[0] != len(request_ids):
-                    return
-                # Fetch CPU blocks needed by the previous step's top-k.
-                staging_map = orchestrator.prepare_staging(
-                    request_ids, sparse_idx, sparse_len
-                )
+                    _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: lag pattern batch mismatch ({sparse_idx.shape[0]} vs {len(request_ids)}); skipping prefetch only")
+                    patch_sparse_idx = None
+                    patch_sparse_len = None
+                else:
+                    # Fetch CPU blocks needed by the previous step's top-k.
+                    _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: calling prepare_staging with sparse_idx.shape={sparse_idx.shape}")
+                    staging_map = orchestrator.prepare_staging(
+                        request_ids, sparse_idx, sparse_len
+                    )
+                    _dbg(f"[PATCH DEBUG] prepare_staging returned: {staging_map}")
 
             # Defensive alignment check: per-row page counts in the current
             # batch must equal the request's tracked block count, otherwise the
-            # cached request order does not match decode row order and we must
-            # not patch (row-b is ReqX's span, and patching assumes request_ids[b]).
+            # request order does not match decode row order and we must not
+            # patch (row-b is ReqX's span, and patching assumes request_ids[b]).
             indptr_gpu = self.paged_kv_indptr.gpu[: len(request_ids) + 1]
             indptr_list = indptr_gpu.detach().cpu().tolist()
             for b, rid in enumerate(request_ids):
                 row_pages = int(indptr_list[b + 1]) - int(indptr_list[b])
                 tracked = len(orchestrator.residency.refs_for_request(rid))
                 if tracked == 0 or row_pages != tracked:
+                    self._patch_bail_reason = (
+                        f"row_alignment b={b} rid={rid} "
+                        f"tracked={tracked} row_pages={row_pages}"
+                    )
+                    _dbg(f"[PATCH DEBUG] bail b={b} rid={rid} tracked={tracked} row_pages={row_pages}")
                     return
 
             from offload_package.selection.adapter import (
                 patch_paged_kv_indices_with_staging,
             )
             null_id = 0 if getattr(orchestrator, "true_freeing", False) else None
+            _dbg(f"[PATCH DEBUG] calling patch_paged_kv_indices_with_staging with staging_map={staging_map}")
             patched = patch_paged_kv_indices_with_staging(
                 paged_kv_indices,
                 indptr_gpu,
                 request_ids,
-                sparse_idx,
-                sparse_len,
+                patch_sparse_idx,
+                patch_sparse_len,
                 self.kv_cache_spec.block_size,
                 orchestrator.staging_base_page_idx,
                 orchestrator.residency,
@@ -553,6 +652,13 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             _dbg(f"[SKYLIGHT DEBUG] Failed to patch staging indices: {e}")
             import traceback
             traceback.print_exc()
+            if (
+                getattr(orchestrator, "true_freeing", False)
+                and getattr(orchestrator.residency, "num_cpu_blocks", 0) > 0
+            ):
+                # A swallowed exception here leaves offloaded blocks' entries
+                # pointing at freed pages; fail loudly under true freeing.
+                raise
 
     def _sk_fill_slots(self, m, cm) -> None:
         """Eager, runs every build() (incl. the cudagraph-capture build): assign each DECODE

@@ -154,13 +154,15 @@ class TestLayoutIntegrity:
         ref = BlockRef("req-x", 0)
         original_pages = [combined_layers[l][3].clone() for l in range(num_layers)]
         residency.mark_gpu(ref, 3, complete=True)
+        offload_manager.score_block(ref, 3)  # candidates must be scored pre-offload
 
         offloaded = offload_manager.offload_fraction([ref], 0.99, {ref})
         assert offloaded == [ref], "block should have been offloaded"
         loc = residency.get(ref)
         assert loc.residency == Residency.CPU and loc.cpu_slot is not None
 
-        staging_map = staging_pool.ensure_resident([ref])
+        staging_map, skipped = staging_pool.ensure_resident([ref])
+        assert not skipped
         assert ref in staging_map
         loc = residency.get(ref)
         assert loc.residency == Residency.STAGING
@@ -171,6 +173,81 @@ class TestLayoutIntegrity:
             assert torch.equal(staged, original_pages[l]), (
                 f"layer {l}: staged page content mismatch after offload+fetch"
             )
+
+    def test_offload_roundtrip_multi_block_batched(self):
+        """Batched store event: N blocks in one call; fetch-back content parity.
+
+        Guards the batched store path (_copy_gpu_to_cpu_batch): distinct CPU
+        slots, distinct staging slots, byte-exact content across all layers and
+        blocks.
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from offload_package.offload.manager import KVOffloadManager
+        from offload_package.scoring.paged_eviction import PagedEvictionScorer
+        from offload_package.scoring.base import BlockKVStats
+        from offload_package.staging.pool import KVStagingPool
+        from offload_package.staging.residency import Residency, ResidencyTable
+
+        num_layers, num_pages = 3, 64
+        H, N, C = 2, 16, 64
+        staging_slots = 16
+        staging_base = num_pages - staging_slots
+        n_blocks = 8
+
+        combined_layers = []
+        for l in range(num_layers):
+            t = torch.randn(num_pages, H, N, 2 * C, dtype=torch.float16, device="cuda")
+            combined_layers.append(t)
+
+        cpu_cache = torch.empty(
+            (num_layers, 64, 2, N, H, C), dtype=torch.float16, device="cpu", pin_memory=True
+        )
+        residency = ResidencyTable()
+        scorer = PagedEvictionScorer()
+        mgr = KVOffloadManager(
+            scorer=scorer, residency=residency,
+            gpu_k_caches=combined_layers, gpu_v_caches=combined_layers,
+            cpu_cache=cpu_cache, gpu_budget_blocks=staging_base, kv_layout="HND",
+        )
+        pool = KVStagingPool(
+            num_slots=staging_slots, staging_base_page=staging_base,
+            gpu_k_caches=combined_layers, gpu_v_caches=combined_layers,
+            cpu_cache=cpu_cache, residency=residency, offload_manager=mgr,
+        )
+
+        refs = [BlockRef("req0", i) for i in range(n_blocks)]
+        stats = BlockKVStats(
+            v_norm=torch.arange(1, n_blocks + 1, dtype=torch.float32).unsqueeze(1),
+            k_norm=torch.ones(n_blocks, 1, dtype=torch.float32),
+            block_ids=refs,
+        )
+        scorer.update(stats)
+        for ref in refs:
+            residency.mark_gpu(ref, gpu_block_id=ref.block_idx, complete=True)
+
+        originals = {
+            ref: [combined_layers[l][ref.block_idx].clone() for l in range(num_layers)]
+            for ref in refs
+        }
+
+        offloaded = mgr.offload_fraction(refs, 0.99, set(refs))
+        assert len(offloaded) == n_blocks
+        slots = {residency.get(r).cpu_slot for r in offloaded}
+        assert len(slots) == n_blocks, "CPU slots must be distinct per block"
+
+        staging_map, skipped = pool.ensure_resident(offloaded)
+        assert not skipped
+        assert len(staging_map) == n_blocks
+        stage_slots = set(staging_map.values())
+        assert len(stage_slots) == n_blocks, "staging slots must be distinct per block"
+
+        for ref, slot in staging_map.items():
+            for l in range(num_layers):
+                staged = combined_layers[l][staging_base + slot]
+                assert torch.equal(staged, originals[ref][l]), (
+                    f"{ref} layer {l}: content mismatch after batched store+fetch"
+                )
 
     def test_scorer_uses_true_kv_norms(self):
         """compute_block_kv_norms must produce per-head mean-over-token norms.
@@ -412,7 +489,70 @@ class TestPromotionWatch:
             )
 
 
-class TestLeakFreeLifecycle:
+class TestFusedScorer:
+    """K2: fused scorer parity vs the per-layer torch path (CUDA and Triton)."""
+
+    @staticmethod
+    def _parity_asserts(score_blocks_fused):
+        from offload_package.scoring.norm_kernel import compute_block_kv_norms
+
+        num_layers, num_pages, H, N, C2 = 2, 32, 4, 16, 128   # 128 == 2*64
+        torch.manual_seed(0)
+        caches = [torch.randn(num_pages, H, N, C2, dtype=torch.float16, device="cuda")
+                  for _ in range(num_layers)]
+        ids = [1, 3, 5, 17]
+
+        k_fused, v_fused = score_blocks_fused(caches, ids)
+
+        # Reference: per-layer split + compute_block_kv_norms (this fork's
+        # combined layout => split last dim into K/V halves, HND page order).
+        all_k, all_v = [], []
+        for c in caches:
+            k_in, v_in = c[..., : C2 // 2], c[..., C2 // 2 :]
+            st = compute_block_kv_norms(k_in, v_in, ids, layout="HND")
+            all_k.append(st.k_norm)
+            all_v.append(st.v_norm)
+        k_ref, v_ref = torch.stack(all_k), torch.stack(all_v)
+
+        assert k_fused.shape == k_ref.shape == (num_layers, len(ids), H)
+        assert torch.allclose(k_fused, k_ref, atol=1e-2), (k_fused - k_ref).abs().max()
+        assert torch.allclose(v_fused, v_ref, atol=1e-2), (v_fused - v_ref).abs().max()
+
+    def test_score_blocks_fused_parity_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from offload_package.scoring.cuda_norms import available, score_blocks_fused
+        if not available():
+            pytest.skip("cuda scorer unavailable")
+        self._parity_asserts(score_blocks_fused)
+
+    def test_score_blocks_fused_empty_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from offload_package.scoring.cuda_norms import available, score_blocks_fused
+        if not available():
+            pytest.skip("cuda scorer unavailable")
+        cache = [torch.randn(8, 4, 16, 128, dtype=torch.float16, device="cuda")]
+        k, v = score_blocks_fused(cache, [])
+        assert k.shape == (1, 0, 4) and v.shape == (1, 0, 4)
+
+    def test_score_blocks_fused_parity_triton(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from offload_package.offload.triton_score import score_blocks_fused, _HAS_TRITON
+        if not _HAS_TRITON:
+            pytest.skip("triton not available")
+        self._parity_asserts(score_blocks_fused)
+
+    def test_score_blocks_fused_empty_triton(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from offload_package.offload.triton_score import score_blocks_fused, _HAS_TRITON
+        if not _HAS_TRITON:
+            pytest.skip("triton not available")
+        cache = [torch.randn(8, 4, 16, 128, dtype=torch.float16, device="cuda")]
+        k, v = score_blocks_fused(cache, [])
+        assert k.shape == (1, 0, 4) and v.shape == (1, 0, 4)
     """Preemption and request finish must not leak CPU slots (Bug 6)."""
 
     def test_preemption_releases_cpu_slots(self):
@@ -426,6 +566,188 @@ class TestEndToEndGuard:
     def test_offload_integrated_output_equality(self):
         """Greedy output with offload must equal dense baseline (token-for-token)."""
         pytest.skip("End-to-end validation - run after all fixes")
+
+
+class TestStagingSizing:
+    """S2: auto staging-pool sizing must follow the documented formula and
+    respect the pool-fraction cap."""
+
+    @staticmethod
+    def _fake_configs(max_model_len: int, max_num_seqs: int,
+                      block_size: int, num_blocks: int):
+        from types import SimpleNamespace
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=max_model_len),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        )
+        kv_cache_config = SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_groups=[SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=block_size),
+            )],
+        )
+        return vllm_config, kv_cache_config
+
+    def test_staging_sizing_auto(self, monkeypatch):
+        from offload_package.integration.connector import _auto_staging_slots_for
+
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.1")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "512")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "512")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
+
+        max_len, max_seqs, page, num_blocks = 65536, 4, 16, 10_000_000
+        vc, kc = self._fake_configs(max_len, max_seqs, page, num_blocks)
+
+        # Expected: mid = 64512; pages_per_req = 64 + ceil(0.1*64512/16) = 468;
+        # est = int(4 * 468 * 1.10) = 2059; cap = 2.5M -> not binding.
+        mid = max_len - 512 - 512
+        pages_per_req = (512 + 512) // page + int(0.1 * mid / page + 0.999)
+        expected = int(max_seqs * pages_per_req * 1.10)
+        assert _auto_staging_slots_for(vc, kc) == expected
+
+    def test_staging_sizing_auto_capped(self, monkeypatch):
+        from offload_package.integration.connector import _auto_staging_slots_for
+
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.5")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "512")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "512")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
+
+        # Tiny pool: estimate >> cap; result must be capped at 25% of pool.
+        vc, kc = self._fake_configs(65536, 4, 16, 1000)
+        assert _auto_staging_slots_for(vc, kc) == 250
+
+    def test_staging_sizing_auto_floor(self, monkeypatch):
+        from offload_package.integration.connector import _auto_staging_slots_for
+
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "0")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
+
+        # Degenerate estimate (0 pages) on a big pool -> floor of 64 slots.
+        vc, kc = self._fake_configs(65536, 1, 16, 10_000_000)
+        assert _auto_staging_slots_for(vc, kc) == 64
+
+
+class TestChunkedDecode:
+    """S1: exact-attention fallback when the selected cold set exceeds staging
+    capacity. Two properties:
+
+    1. `_lse2_merge` is the exact online-softmax decomposition: merged output
+       over disjoint subsets == dense attention over the union.
+    2. `pool.release()` flips residency back to CPU so slots recycle.
+    """
+
+    def test_lse2_merge_parity(self):
+        torch.manual_seed(0)
+        from pq_optimized.batch_decode_with_paged_kv_cache_wrapper import (
+            BatchDecodeWithPagedKVCacheWrapper as W,
+        )
+
+        N, D = 128, 32
+        scores = torch.randn(1, 3, N, dtype=torch.float32)          # logits
+        vals = torch.randn(1, 3, N, D, dtype=torch.float32) * 0.5
+        high = torch.tensor(float("inf"))
+        cold = torch.zeros(1, 3, N, dtype=torch.bool)
+        cold[:, :, N // 2 :] = True  # second half is "cold" (goes in chunk pass)
+
+        def partial(x, v, keep):
+            m = x.masked_fill(~keep, -high)
+            mx = m.amax(dim=-1, keepdim=True)                      # log2 domain
+            e = torch.exp2(m - mx)
+            d = e.sum(dim=-1, keepdim=True)
+            # out[1,3,D] = sum_n (e/d)[1,3,n] * v[1,3,n,D]
+            w = (e / d).unsqueeze(-1)                              # [1,3,N,1]
+            out = (w * v).sum(dim=2)                               # [1,3,D]
+            lse = (mx + torch.log2(d)).squeeze(-1)                 # [1, 3]
+            return out, lse
+
+        out_a, lse_a = partial(scores, vals, ~cold)                # "base" pass
+        out_b, lse_b = partial(scores, vals, cold)                 # "chunk" pass
+        out_full, _lse_f = partial(scores, vals, torch.ones_like(cold))
+
+        merged, _ = W._lse2_merge(out_a, lse_a, out_b, lse_b)
+        assert torch.allclose(merged, out_full, atol=1e-5), (
+            merged - out_full
+        ).abs().max()
+
+    def test_chunked_capacity_overflow_keeps_residents(self):
+        """When cold set > num_slots, the wrapper chunks into capacity-sized
+        groups. Since the F6 change the chunked refs are NOT released per
+        layer: later groups stage by EVICTING earlier groups' residents
+        (score-aware), and the last group stays resident -- layers 2..N then
+        fetch only their delta instead of re-fetching everything."""
+        from offload_package.offload.manager import KVOffloadManager
+        from offload_package.scoring.paged_eviction import PagedEvictionScorer
+        from offload_package.staging.pool import KVStagingPool
+        from offload_package.staging.residency import Residency, ResidencyTable
+        from offload_package.tests.conftest import combined_caches
+
+        num_pages, N, H, C = 32, 8, 2, 32
+        staging_slots = 4
+        combined = combined_caches(
+            [torch.randn(num_pages, N, H, C, dtype=torch.float16, device="cuda")],
+            [torch.randn(num_pages, N, H, C, dtype=torch.float16, device="cuda")],
+        )
+        cpu_cache = torch.zeros(
+            (1, 32, 2, N, H, C), dtype=torch.float16, device="cpu", pin_memory=True
+        )
+        residency = ResidencyTable()
+        mgr = KVOffloadManager(
+            scorer=PagedEvictionScorer(), residency=residency,
+            gpu_k_caches=combined, gpu_v_caches=combined,
+            cpu_cache=cpu_cache, gpu_budget_blocks=0, kv_layout="HND",
+        )
+        pool = KVStagingPool(
+            num_slots=staging_slots, staging_base_page=num_pages - staging_slots,
+            gpu_k_caches=combined, gpu_v_caches=combined,
+            cpu_cache=cpu_cache, residency=residency, offload_manager=mgr,
+        )
+
+        refs = [BlockRef("r", i) for i in range(10)]  # 10 > 4 slots
+        for ref in refs:
+            residency.mark_gpu(ref, gpu_block_id=ref.block_idx, complete=True)
+        mgr.score_blocks(refs, [ref.block_idx for ref in refs])
+        offloaded = mgr.offload_fraction(refs, 0.99, set(refs))
+        assert len(offloaded) == 10
+        for ref in refs:
+            assert residency.get(ref).residency == Residency.CPU
+
+        # Chunk like the wrapper: capacity-size groups, NO per-chunk release.
+        groups = [refs[i:i + staging_slots] for i in range(0, 10, staging_slots)]
+        for grp in groups:
+            m, skipped = pool.ensure_resident(grp)
+            assert not skipped
+            assert len(m) == len(grp)
+            for ref in grp:
+                loc = residency.get(ref)
+                if loc.residency == Residency.STAGING:
+                    assert residency.get(ref).staging_slot == m[ref]
+
+        # After the cycle exactly `staging_slots` refs are still resident (no
+        # release): the last group plus the survivors of earlier groups that
+        # later groups did not need to evict. Everything else is back on CPU.
+        still_staged = [
+            r for r in refs
+            if residency.get(r).residency == Residency.STAGING
+        ]
+        assert len(still_staged) == staging_slots
+        assert len(pool._lru) == staging_slots
+        assert set(groups[-1]) <= set(still_staged)
+
+        # The request-cleanup path (explicit release) still works.
+        for ref in still_staged:
+            pool.release(ref)
+            loc = residency.get(ref)
+            assert loc.residency == Residency.CPU, (
+                f"after release, {ref} should be back on CPU, got {loc.residency}"
+            )
+        assert len(pool._lru) == 0
 
 
 if __name__ == "__main__":

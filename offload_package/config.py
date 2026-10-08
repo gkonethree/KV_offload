@@ -23,6 +23,13 @@ class OffloadConfig:
     # R2 promotion watch: how many highest-scored CPU-resident blocks to
     # pre-stage per active decode request per step; 0 disables promotion.
     promote_per_step: int = 4
+    # Staging pool sizing policy: "fixed" (use num_staging_slots as-is) or
+    # "auto" (size at startup to cover the hot sparse-selected set).
+    staging_policy: str = "fixed"
+    # Auto mode: cap staging at this fraction of the GPU KV pool.
+    staging_max_pool_frac: float = 0.25
+    # Auto mode: multiply the computed estimate by this headroom factor.
+    staging_safety_margin: float = 1.10
 
     @classmethod
     def from_env(cls) -> "OffloadConfig":
@@ -40,6 +47,9 @@ class OffloadConfig:
             scorer_type=os.getenv("OFFLOAD_PACKAGE_SCORER_TYPE", "paged_eviction"),
             true_free=flag("OFFLOAD_PACKAGE_TRUE_FREE", True),
             promote_per_step=int(os.getenv("OFFLOAD_PACKAGE_PROMOTE_PER_STEP", "4")),
+            staging_policy=os.getenv("OFFLOAD_PACKAGE_STAGING_POLICY", "fixed"),
+            staging_max_pool_frac=float(os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")),
+            staging_safety_margin=float(os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")),
         )
 
     def __post_init__(self):
@@ -49,3 +59,9 @@ class OffloadConfig:
             raise ValueError("scorer_type must be 'paged_eviction' or 'random'")
         if self.promote_per_step < 0:
             raise ValueError("promote_per_step must be >= 0")
+        if self.staging_policy not in ("fixed", "auto"):
+            raise ValueError("staging_policy must be 'fixed' or 'auto'")
+        if not 0.0 < self.staging_max_pool_frac <= 1.0:
+            raise ValueError("staging_max_pool_frac must be in (0, 1]")
+        if self.staging_safety_margin < 1.0:
+            raise ValueError("staging_safety_margin must be >= 1.0")

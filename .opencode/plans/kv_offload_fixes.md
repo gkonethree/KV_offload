@@ -157,6 +157,30 @@ Suites: 94 passed / 7 skipped / 0 failed after all edits; cycle fixes included.
 - New micro-bench: standalone script timing collect/patch/ensure_resident/score_blocks at 64k-shaped tensors (n=3.7k pages/req, 2 reqs) before vs after — target: fetch+patch python host time < 50ms/step.
 - Live rerun of bench_64k configs with the script's log evidence; compare TPOT vs recorded baselines.
 
+## Phase K — kernelize store copy + fuse scoring (user-locked decisions)
+
+**Decision (user):** K1 = per-layer batched store (no per-event workspace v2); K2 = Triton fused scorer.
+
+### K1.1 — batched `_copy_gpu_to_cpu` (in `offload/manager.py`)
+- Replace per-block loop with per-layer gather: `k_cache.index_select(0, gpu_ids_t)` → view-reshape to the CPU-target layout `[n, 2, N(page), H, C]` → ONE `cpu_cache[layer].index_copy_(0, slot_ids, slab.cpu(non_blocking=True))` D2H per layer (with a single contiguous host-pinned spool target).
+- Semantics preserved: pin_memory target pages keyed by CPU slot id before copies; `_store_events[slot] = event` bookkeeping per ref kept (single event for the batch is retained per layer, completion on last).
+- Hazard guarded: no partial event semantics change — full event.synchronize() before any residency flip, same as today.
+
+### K1.2 — scatter store API surface
+- `offload_fraction` gathers chosen refs/slot ids once per event, then calls the batched store; `maybe_offload` shares it. `CPUBlockPool.allocate` calls per block remain host ints (cheap).
+
+### K2 — Triton fused scorer (`offload/triton_score.py` [new file, tests-only import-path])
+- One kernel per W trigger over all candidate-complete GPU blocks: grid `(layer, block, head-batch)`; kernel reads `[N, C]` K half & V half per block per layer and writes per-(layer, block, head) norms `[L, N, H]` fp32; host then `mean(dim=(2, layer))` per head_reduction="mean" | "min", decays into scorer state through the existing `PagedEvictionScorer.update`.
+- Parity harness: compare vs `compute_block_kv_norms` on random combined tensors covering both layouts (combined HND `[B,H,N,2C]` and NHD `[B,N,H,D]`), exact equality gate.
+
+### Verification protocol
+1. Tests: entire suite green; extend `test_offload_fetch_roundtrip_parity` to multi-block batched store events; add `test_offload_invariants` parity test for the Triton scorer.
+2. Micro-bench extend `bench_p1_p3.py` with store-path: (500, 1800) blocks × 22 layers.
+3. Live sweep on the free card: `bench_64k.py oracle+offload` and `pq+offload` at 64k — compare to recorded 0-counts of stall windows from store events.
+
+### Explicitly out of scope
+- No change to candidate selection / ref-count filtering / surgery semantics. No per-event workspace variant (deferred — per-layer zero-waiting is safe first). No async/MP/graph mode changes.
+
 ## Phase C — remaining (scheduling-level, after user review)
 - Deterministic e2e output-equality guard, preempt-cleanup tests, async-mode freeing via deferred-free queue.
 - P4 (selection-aware offload targeting) — deferred per user.

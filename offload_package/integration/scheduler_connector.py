@@ -215,15 +215,17 @@ class OffloadPackageScheduler:
         # writes corrupt live KV data (and vice versa).
         if self.offload_config.enabled and self.offload_config.num_staging_slots > 0:
             from offload_package.cache_allocator import reserve_staging_tail
-            reserved = reserve_staging_tail(
-                gpu_block_pool, self.offload_config.num_staging_slots
-            )
+            num_slots = self.offload_config.num_staging_slots
+            reserved = reserve_staging_tail(gpu_block_pool, num_slots)
             # Cross-check against the worker-side staging base derived from the
-            # KV views: view.shape[0] - S. Both must point at the same pages.
-            expected_base = self.kv_cache_config.num_blocks - self.offload_config.num_staging_slots
+            # block pool's actual capacity. Use the pool's block count (which
+            # includes the staging tail) for both reservation and verification.
+            pool_blocks = gpu_block_pool.num_gpu_blocks
+            expected_base = pool_blocks - num_slots
             assert reserved[0] == expected_base, (
                 f"staging tail mismatch: reserved starts at {reserved[0]}, "
-                f"connector expects staging base {expected_base}"
+                f"connector expects staging base {expected_base} "
+                f"(num_slots={num_slots}, pool_blocks={pool_blocks})"
             )
             self._reserved_staging_ids = reserved
             logger.info(
@@ -244,20 +246,26 @@ class OffloadPackageScheduler:
         
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
         """Build metadata for this step's offload/staging operations."""
-        _dbg(f"[SCHEDULER DEBUG] build_connector_meta called, orchestrator={self._orchestrator is not None}, gpu_block_pool={self._gpu_block_pool is not None}")
-        # Get orchestrator from worker handler
-        if self._worker_handler is not None:
-            self._orchestrator = self._worker_handler._orchestrator
-        if self._orchestrator is not None:
-            # The Skylight builder null-fills CPU-resident paged indices only
-            # when their original pages may have been freed.
-            self._orchestrator.true_freeing = self._true_free_enabled
-        if self._orchestrator is None or self._gpu_block_pool is None:
+        try:
+            _dbg(f"[SCHEDULER DEBUG] build_connector_meta called, orchestrator={self._orchestrator is not None}, gpu_block_pool={self._gpu_block_pool is not None}")
+            # Get orchestrator from worker handler
+            if self._worker_handler is not None:
+                self._orchestrator = self._worker_handler._orchestrator
+            if self._orchestrator is not None:
+                # The Skylight builder null-fills CPU-resident paged indices only
+                # when their original pages may have been freed.
+                self._orchestrator.true_freeing = self._true_free_enabled
+            if self._orchestrator is None or self._gpu_block_pool is None:
+                from offload_package.integration.metadata import OffloadPackageMetadata
+                return OffloadPackageMetadata()
+            
+            from offload_package.integration.metadata import OffloadPackageMetadata
+            metadata = OffloadPackageMetadata()
+        except Exception as e:
+            import logging
+            logging.warning(f"build_connector_meta early setup failed: {e}")
             from offload_package.integration.metadata import OffloadPackageMetadata
             return OffloadPackageMetadata()
-        
-        from offload_package.integration.metadata import OffloadPackageMetadata
-        metadata = OffloadPackageMetadata()
 
         # 1. Track new requests and update block mappings
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -296,7 +304,7 @@ class OffloadPackageScheduler:
             prompt_len = self._prompt_lens.get(req_id, 0)
             if prompt_len > 0 and num_computed >= prompt_len and req_id not in self._prefill_completed:
                 self._prefill_completed.add(req_id)
-                self._orchestrator.on_prefill_complete(req_id)
+                self._orchestrator.on_prefill_complete(req_id, num_computed)
                 self._trigger_global_offload(metadata, scheduler_output)
         
             # Track decode tokens for interval-based scoring - ONLY for requests that completed prefill
@@ -316,7 +324,7 @@ class OffloadPackageScheduler:
             num_computed = new_req_data.num_computed_tokens
             if num_computed >= prompt_len and req_id not in self._prefill_completed:
                 self._prefill_completed.add(req_id)
-                self._orchestrator.on_prefill_complete(req_id)
+                self._orchestrator.on_prefill_complete(req_id, num_computed)
                 # Also trigger offload after prefill
                 self._trigger_global_offload(metadata, scheduler_output)
         
@@ -392,9 +400,11 @@ class OffloadPackageScheduler:
             return active
         
     def _trigger_global_offload(self, metadata, scheduler_output=None):
-        """Score all complete GPU blocks globally and offload fraction.
+        """Score all complete blocks globally and offload fraction.
         
         Re-scores ALL complete blocks every W steps to capture changing importance.
+        For PQ mode, scores ALL blocks (including CPU-resident) using PQ codes
+        which are permanently on GPU, so offload decisions match sparse attention.
         """
         _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload called, orchestrator={self._orchestrator is not None}")
         if self._orchestrator is None:
@@ -406,7 +416,6 @@ class OffloadPackageScheduler:
                 _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload: orchestrator is None")
                 return
         
-# Score all complete GPU blocks and offload fraction directly
         all_gpu_complete = self._orchestrator.residency.all_gpu_blocks(complete_only=True)
         _dbg(f"[SCHEDULER DEBUG] _trigger_global_offload: all_gpu_complete={len(all_gpu_complete)}, _scored={len(self._orchestrator._scored)}")
 
@@ -443,7 +452,7 @@ class OffloadPackageScheduler:
         offloaded = self._orchestrator.offload_manager.offload_fraction(
             allowed, self.offload_config.offload_fraction, self._orchestrator._scored
         )
-        
+    
         if not offloaded:
             return
         

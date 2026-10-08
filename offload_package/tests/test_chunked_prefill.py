@@ -96,7 +96,7 @@ class TestChunkedPrefill:
         # on_prefill_complete marks blocks complete and scores them; the
         # offload itself moved to the scheduler's _trigger_global_offload
         # (tracked store-event path).
-        offloaded = orchestrator.on_prefill_complete(req_id)
+        offloaded = orchestrator.on_prefill_complete(req_id, total_tokens)
         assert offloaded == [], "offload moved to _trigger_global_offload"
         complete = orchestrator.residency.all_gpu_blocks(complete_only=True)
         assert len(complete) == total_blocks, "prefill blocks must be marked complete"
@@ -300,7 +300,7 @@ class TestPreemptionHandling:
         gpu_refs = [r for r in orchestrator._request_blocks[req_id] 
                     if orchestrator.residency.get(r).residency == Residency.GPU]
         if gpu_refs:
-            staging_pool.ensure_resident(gpu_refs[:1])
+            staging_pool.ensure_resident(gpu_refs[:1])  # (staged, skipped) ignored here
         
         # Preempt the request
         orchestrator.on_request_preempted(req_id)

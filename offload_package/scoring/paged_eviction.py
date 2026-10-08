@@ -55,8 +55,12 @@ class PagedEvictionScorer(BlockScorer):
                 )
 
     def scores(self, block_ids: Sequence[Hashable]) -> torch.Tensor:
+        # Unknown refs score -inf: they are evicted first from staging (a ref
+        # we have no observation for must never block a scored one) and are
+        # never promoted. Never +inf -- that made unscored staging residents
+        # permanently un-evictable and promoted them first.
         return torch.tensor(
-            [self._scores.get(block_id, float('inf')) for block_id in block_ids],
+            [self._scores.get(block_id, float("-inf")) for block_id in block_ids],
             dtype=torch.float32,
         )
 
@@ -71,15 +75,15 @@ class PagedEvictionScorer(BlockScorer):
         if len(block_ids) <= budget:
             _dbg(f"[SCORER DEBUG] returning empty: len={len(block_ids)} <= budget={budget}")
             return []
+        unscored = [b for b in block_ids if b not in self._scores]
+        assert not unscored, (
+            f"eviction candidates must all be scored; unscored={unscored[:5]}"
+        )
         scores = self.scores(block_ids)
         _dbg(f"[SCORER DEBUG] scores={scores}")
         count = len(block_ids) - budget
         order = torch.argsort(scores, stable=True)
         _dbg(f"[SCORER DEBUG] count={count}, order={order}")
-        return [block_ids[i] for i in order[:count].tolist()]
-        scores = self.scores(block_ids)
-        count = len(block_ids) - budget
-        order = torch.argsort(scores, stable=True)
         return [block_ids[i] for i in order[:count].tolist()]
 
     def forget(self, block_ids: Sequence[Hashable]) -> None:

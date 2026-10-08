@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Single-request check: pq vs pq + 99% offload.
+
+Hypothesis under test: with offload_fraction=0.99 almost every KV block is
+moved to CPU each offload interval, and the PQ sparse decode must still be
+token-for-token identical to plain pq, because selected CPU-resident pages
+are fetched into the GPU staging pool (chunked exact decode when the cold
+set exceeds staging capacity). pq+offload is expected to be SLOWER: the
+fetch (and possibly multi-pass chunked decode) is on the critical path of
+every decode step for a single request.
+
+Configs:
+  pq            baseline, no offloading
+  pq+off99      99% offload, staging_policy='auto' (auto-sized to hot set)
+  pq+off99-tiny 99% offload, fixed tiny staging (64 slots) -> forced chunked
+                fallback (cold set ~160 blocks > 64 slots)
+
+Usage: .venv/bin/python bench_1req_off99.py [config,config,...]
+"""
+import os
+import gc
+import sys
+import time
+
+os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
+os.environ['VLLM_USE_V2_MODEL_RUNNER'] = '0'
+os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'
+os.environ['FLASHINFER_DISABLE_VERSION_CHECK'] = '1'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+
+import torch
+
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+register_backend(AttentionBackendEnum.CUSTOM, 'skylight.backend.SkylightSparseBackend')
+import vllm.platforms.cuda as cuda_module
+from vllm.v1.attention.backends.registry import _ATTN_OVERRIDES
+
+_orig = getattr(cuda_module, '_get_attn_backend_class', None)
+
+
+def _patched_get(backend, *a, **k):
+    if backend is AttentionBackendEnum.CUSTOM or (
+        backend is None and AttentionBackendEnum.CUSTOM in _ATTN_OVERRIDES
+    ):
+        backend = AttentionBackendEnum.CUSTOM
+    if _orig:
+        return _orig(backend, *a, **k)
+    return backend
+
+
+if _orig:
+    cuda_module._get_attn_backend_class = _patched_get
+
+from vllm import LLM, SamplingParams
+from vllm.config import KVTransferConfig
+
+MODEL = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
+MAX_MODEL_LEN = 8300            # ~8.1k input + 128 out headroom
+MAX_NEW_TOKENS = int(os.environ.get('BENCH_NEW_TOKENS', '128'))
+INTERVAL_TOKENS = 32
+
+# Single request: ~26 tokens per repetition -> 310 reps ~ 8.1k tokens.
+PROMPT = ('The history of artificial intelligence is a story of ambition, '
+          'setbacks, and breakthroughs across decades of research. ') * 40
+
+if os.environ.get('BENCH_PROMPT') == 'varied':
+    # Non-degenerate prompt: varied content per block, so greedy logits are
+    # not a tie-fest; ~15 tokens/sentence -> 540 sentences ~ 8.1k tokens.
+    PROMPT = ''.join(
+        f"Observation {i}: the calibrated reading was {(i * 37) % 997}, "
+        f"which the field team called noteworthy, and the reviewers of "
+        f"section {(i * 11) % 23} marked it pending further review. "
+        for i in range(170))
+
+SPARSE_ENV = {
+    'SKYLIGHT_SPARSE_TOPK': '0.3',
+    'SKYLIGHT_SPARSE_SINK': '64',
+    'SKYLIGHT_SPARSE_LOCAL': '64',
+    'SKYLIGHT_SPARSE_CHANNEL_NUM': '64',
+}
+
+CONFIGS = {
+    'pq': dict(method='pq', offload=False),
+    'pq2': dict(method='pq', offload=False),  # determinism control
+    'pq+off99': dict(method='pq', offload=True, fraction=0.99,
+                     staging_policy='auto', num_staging_slots=None),
+    'pq+off99-tiny': dict(method='pq', offload=True, fraction=0.99,
+                          staging_policy='fixed', num_staging_slots=64),
+}
+
+
+def run(name, method, offload, fraction=0.5, staging_policy='auto',
+        num_staging_slots=None):
+    print(f"\n{'=' * 70}\nCONFIG: {name}\n{'=' * 70}", flush=True)
+    for k, v in SPARSE_ENV.items():
+        os.environ[k] = v
+    os.environ['SKYLIGHT_SPARSE_METHOD'] = method
+
+    kv = None
+    if offload:
+        extra = {
+            'enabled': True,
+            'offload_fraction': fraction,
+            'num_cpu_slots': 4096,
+            'staging_policy': staging_policy,
+            'interval_tokens': INTERVAL_TOKENS,
+            'true_free': True,
+        }
+        if num_staging_slots is not None:
+            extra['num_staging_slots'] = num_staging_slots
+        kv = KVTransferConfig(
+            kv_connector='OffloadPackageConnector',
+            kv_connector_module_path='vllm.distributed.kv_transfer.kv_connector.v1.offload_package_connector',
+            kv_connector_extra_config=extra,
+            kv_role='kv_both',
+        )
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    kwargs = dict(
+        model=MODEL,
+        dtype='float16',
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=0.20,
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        max_num_seqs=1,
+        disable_log_stats=True,
+        attention_config={'backend': 'CUSTOM'},
+        async_scheduling=False,
+    )
+    if kv is not None:
+        kwargs['kv_transfer_config'] = kv
+
+    t_init0 = time.time()
+    llm = LLM(**kwargs)
+    t_init = time.time() - t_init0
+
+    sp = SamplingParams(temperature=0, top_p=1.0, max_tokens=MAX_NEW_TOKENS, ignore_eos=True)
+    torch.cuda.synchronize()
+    t0 = time.time()
+    outputs = llm.generate([PROMPT], sp)
+    torch.cuda.synchronize()
+    elapsed = time.time() - t0
+
+    in_tokens = len(outputs[0].prompt_token_ids)
+    out_tokens = len(outputs[0].outputs[0].token_ids)
+    tpot_ms = elapsed / max(out_tokens, 1) * 1000
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+
+    print(f"  init: {t_init:.1f}s")
+    print(f"  prompt tokens: {in_tokens}")
+    print(f"  new tokens: {out_tokens}")
+    print(f"  total time: {elapsed:.1f}s")
+    print(f"  decode TPOT: {tpot_ms:.2f} ms/token")
+    print(f"  throughput: {out_tokens / max(elapsed, 1e-9):.1f} tok/s")
+    print(f"  peak GPU allocated: {peak_gb:.2f} GB")
+    print(f"  out: {outputs[0].outputs[0].text[:110]!r}")
+    print(f"  token_ids[:32]: {list(outputs[0].outputs[0].token_ids)[:32]}")
+
+    result = {
+        'name': name, 'prompt_tokens': in_tokens, 'new_tokens': out_tokens,
+        'time_s': elapsed, 'tpot_ms': tpot_ms, 'tps': out_tokens / max(elapsed, 1e-9),
+        'peak_gb': peak_gb, 'init_s': t_init,
+        'text': outputs[0].outputs[0].text,
+        'tokens': list(outputs[0].outputs[0].token_ids),
+    }
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    time.sleep(2)
+    return result
+
+
+if __name__ == '__main__':
+    names = sys.argv[1].split(',') if len(sys.argv) > 1 else list(CONFIGS)
+    results = {}
+    for name in names:
+        results[name] = run(name, **CONFIGS[name])
+
+    rs = list(results.values())
+    print(f"\n{'=' * 92}")
+    print(f"SUMMARY single-request (input={rs[0]['prompt_tokens']}, +{MAX_NEW_TOKENS} out)")
+    print(f"{'=' * 92}")
+    print(f"{'config':<16} {'time(s)':>8} {'TPOT(ms)':>9} {'tok/s':>8} {'peak GPU(GB)':>13} {'init(s)':>8}")
+    for r in rs:
+        print(f"{r['name']:<16} {r['time_s']:>8.1f} {r['tpot_ms']:>9.2f} {r['tps']:>8.1f} "
+              f"{r['peak_gb']:>13.2f} {r['init_s']:>8.1f}")
+
+    # Correctness: every offload config must be token-for-token identical to pq.
+    print("\nCORRECTNESS (greedy token-for-token vs 'pq' baseline):")
+    base = results.get('pq')
+    if base is None:
+        print("  pq baseline not run; skipping comparison")
+    else:
+        for name, r in results.items():
+            if name == 'pq':
+                continue
+            match = r['tokens'] == base['tokens']
+            if not match:
+                for j, (ta, tb) in enumerate(zip(base['tokens'], r['tokens'])):
+                    if ta != tb:
+                        print(f"  {name}: diverges at token {j}: {base['text'][:200]!r}")
+                        print(f"  {' ' * len(name)}  vs off: {r['text'][:200]!r}")
+                        break
+            print(f"  {name}: {'PASS' if match else 'FAIL'}")

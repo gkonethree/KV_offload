@@ -119,28 +119,78 @@ class KVOffloadManager:
             [g for _, g in items], dtype=torch.long,
             device=self.gpu_k_caches[0].device,
         )
-        all_v_norms = []
-        all_k_norms = []
-        for k_cache, v_cache in zip(self.gpu_k_caches, self.gpu_v_caches):
-            if k_cache is v_cache:
-                head_dim = k_cache.shape[-1] // 2
-                k_in = k_cache[..., :head_dim]
-                v_in = v_cache[..., head_dim:]
-                layout = "HND"
-            else:
-                k_in, v_in, layout = k_cache, v_cache, self.kv_layout
-            stats = compute_block_kv_norms(
-                k_in,
-                v_in,
-                gpu_ids.tolist(),
-                logical_block_ids=refs,
-                layout=layout,
-            )
-            all_v_norms.append(stats.v_norm)
-            all_k_norms.append(stats.k_norm)
-        v_norm = torch.stack(all_v_norms).mean(dim=0)
-        k_norm = torch.stack(all_k_norms).mean(dim=0)
+
+        fused = None
+        if self._fused_scorer_ok():
+            fused = self._fused_block_norms([g for _, g in items])
+
+        if fused is not None:
+            # fused -> (k_norm, v_norm) [L, N, H]; mean over layers -> [N, H]
+            v_norm = fused[1].mean(dim=0)
+            k_norm = fused[0].mean(dim=0)
+        else:
+            all_v_norms = []
+            all_k_norms = []
+            for k_cache, v_cache in zip(self.gpu_k_caches, self.gpu_v_caches):
+                if k_cache is v_cache:
+                    head_dim = k_cache.shape[-1] // 2
+                    k_in = k_cache[..., :head_dim]
+                    v_in = v_cache[..., head_dim:]
+                    layout = "HND"
+                else:
+                    k_in, v_in, layout = k_cache, v_cache, self.kv_layout
+                stats = compute_block_kv_norms(
+                    k_in,
+                    v_in,
+                    gpu_ids.tolist(),
+                    logical_block_ids=refs,
+                    layout=layout,
+                )
+                all_v_norms.append(stats.v_norm)
+                all_k_norms.append(stats.k_norm)
+            v_norm = torch.stack(all_v_norms).mean(dim=0)
+            k_norm = torch.stack(all_k_norms).mean(dim=0)
+
         self.scorer.update(BlockKVStats(v_norm=v_norm, k_norm=k_norm, block_ids=refs))
+
+    def _fused_scorer_ok(self) -> bool:
+        """True when the current caches fit the fused scorer layout."""
+        import os as _os
+        if _os.environ.get("OFFLOAD_PACKAGE_FUSED_SCORER", "1") == "0":
+            return False
+        if not (self.gpu_k_caches and self.gpu_v_caches):
+            return False
+        impl = _os.environ.get("OFFLOAD_PACKAGE_SCORER_IMPL", "cuda")
+        if impl == "cuda":
+            try:
+                from offload_package.scoring.cuda_norms import available
+                if not available():
+                    return False
+            except Exception:
+                return False
+        else:
+            try:
+                from offload_package.offload.triton_score import _HAS_TRITON
+                if not _HAS_TRITON:
+                    return False
+            except Exception:
+                return False
+        first = self.gpu_k_caches[0]
+        return (
+            first.dim() == 4
+            and first.dtype in (torch.float16, torch.bfloat16)
+            and first.stride(3) == 1
+            and self.gpu_k_caches[0] is self.gpu_v_caches[0]
+        )
+
+    def _fused_block_norms(self, gpu_block_ids: list[int]):
+        import os as _os
+        impl = _os.environ.get("OFFLOAD_PACKAGE_SCORER_IMPL", "cuda")
+        if impl == "cuda":
+            from offload_package.scoring.cuda_norms import score_blocks_fused
+        else:
+            from offload_package.offload.triton_score import score_blocks_fused
+        return score_blocks_fused(self.gpu_k_caches, gpu_block_ids)
 
     def on_block_full(self, ref: BlockRef) -> None:
         loc = self.residency.get(ref)
@@ -197,7 +247,8 @@ class KVOffloadManager:
         _dbg(f"[OFFLOAD MANAGER DEBUG] refs_to_evict={refs_to_evict}")
 
         offloaded = []
-        events = []
+        refs_with_gpu: list[BlockRef] = []
+        gpu_ids: list[int] = []
 
         for ref in refs_to_evict:
             loc = self.residency.get(ref)
@@ -213,25 +264,21 @@ class KVOffloadManager:
                 _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: residency={loc.residency}")
                 continue
 
+            refs_with_gpu.append(ref)
+            gpu_ids.append(loc.gpu_block_id)
+
+        if refs_with_gpu:
             try:
-                cpu_slot, event = self._copy_gpu_to_cpu(loc.gpu_block_id)
-                events.append(event)
-
-                self.residency.mark_cpu(
-                    ref,
-                    cpu_slot,
-                )
-
-                offloaded.append(ref)
+                # One batched pass: per-layer index_select + one big D2H burst.
+                cpu_slots, event = self._copy_gpu_to_cpu_batch(gpu_ids)
+                event.synchronize()
+                for ref, slot in zip(refs_with_gpu, cpu_slots):
+                    self.residency.mark_cpu(ref, slot)
+                offloaded = refs_with_gpu
             except Exception as e:
                 _dbg(f"[OFFLOAD MANAGER DEBUG] Exception during copy: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
-
-        # Wait for all async copies to complete
-        for event in events:
-            event.synchronize()
 
         _dbg(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}")
         return offloaded
@@ -249,23 +296,86 @@ class KVOffloadManager:
         refs_to_evict = self.scorer.select_for_eviction(
             gpu_candidates, self.gpu_budget_blocks
         )
-        offloaded: list[BlockRef] = []
-        events = []
+        # Keep only blocks that still have a live GPU residency
+        refs_with_gpu: list[BlockRef] = []
+        gpu_ids: list[int] = []
         for ref in refs_to_evict:
             loc = self.residency.get(ref)
             if loc is None or loc.gpu_block_id is None or loc.residency != Residency.GPU:
                 continue
-            cpu_slot, event = self._copy_gpu_to_cpu(loc.gpu_block_id)
-            events.append(event)
-            self.residency.mark_cpu(ref, cpu_slot)
-            offloaded.append(ref)
-        # Wait for all async copies to complete
-        for event in events:
+            refs_with_gpu.append(ref)
+            gpu_ids.append(loc.gpu_block_id)
+
+        offloaded: list[BlockRef] = []
+        if refs_with_gpu:
+            cpu_slots, event = self._copy_gpu_to_cpu_batch(gpu_ids)
             event.synchronize()
+            for ref, cpu_slot in zip(refs_with_gpu, cpu_slots):
+                self.residency.mark_cpu(ref, cpu_slot)
+                offloaded.append(ref)
         _dbg(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}")
         return offloaded
 
+    def _copy_gpu_to_cpu_batch(
+        self, gpu_block_ids: list[int]
+    ) -> tuple[list[int], torch.cuda.Event]:
+        """Batched store: copy many pages GPU→CPU with per-layer giant IO.
+
+        Per layer: one index_select gather over shared pages, one contiguous
+        slab D2H (stream-ordered), then one host scatter into the pinned CPU
+        cache. Replaces the old per-block loop (~44 python ops + 44 tiny DMA
+        launches per block) with ~L kernels + 1 PCIe burst per event.
+        """
+        n = len(gpu_block_ids)
+        if n <= 0:
+            raise ValueError("empty batch")
+        if n > self._cpu_pool.num_free:
+            raise RuntimeError(
+                f"CPU offload pool exhausted: need {n}, free {self._cpu_pool.num_free}"
+            )
+
+        slots = [self._cpu_pool.allocate() for _ in range(n)]
+        dev = self.gpu_k_caches[0].device
+        gpu_ids_t = torch.tensor(gpu_block_ids, dtype=torch.long, device=dev)
+        slot_ids_t = torch.tensor(slots, dtype=torch.long)
+
+        # Run the whole batch on the CURRENT stream and keep every temporary
+        # referenced until the event sync: no side-stream UAF, no allocator
+        # recycling of in-flight reads.
+        gathered_hold: list[torch.Tensor] = []
+        slab_hold_gpu: list[torch.Tensor] = []
+        host_hold: list[torch.Tensor] = []
+        try:
+            for layer, (k_cache, _v_cache) in enumerate(
+                zip(self.gpu_k_caches, self.gpu_v_caches)
+            ):
+                gathered = k_cache.index_select(0, gpu_ids_t)       # [n, H, N, 2C]
+                head_dim = gathered.shape[-1] // 2
+                k_part = gathered[..., :head_dim].permute(0, 2, 1, 3)  # [n, N, H, C]
+                v_part = gathered[..., head_dim:].permute(0, 2, 1, 3)
+                slab = torch.stack([k_part, v_part], dim=1).contiguous()  # [n, 2, N, H, C]
+                slab_host = slab.to("cpu", non_blocking=True)
+                gathered_hold.append(gathered)
+                slab_hold_gpu.append(slab)
+                host_hold.append(slab_host)
+            event_order = torch.cuda.Event()
+            event_order.record()
+            event_order.synchronize()
+            for layer, slab_host in enumerate(host_hold):
+                self.cpu_cache[layer].index_copy_(0, slot_ids_t, slab_host)
+        except Exception:
+            for s in slots:
+                self._cpu_pool.free(s)
+            raise
+        finally:
+            del gathered_hold, slab_hold_gpu, host_hold
+
+        for slot in slots:
+            self._store_events[slot] = event_order
+        return slots, event_order
+
     def _copy_gpu_to_cpu(self, gpu_block_id: int) -> tuple[int, torch.cuda.Event]:
+        """Single-block store path (kept for small-batch callers)."""
         slot = self._cpu_pool.allocate()
         with torch.cuda.stream(self._copy_stream):
             # vLLM's K/V caches are separate per attention layer.
@@ -276,17 +386,17 @@ class KVOffloadManager:
             ):
                 k_block = k_cache[gpu_block_id]
                 v_block = v_cache[gpu_block_id]
-                
+
                 # GPU cache: [num_kv_heads, page_size, 2*head_dim] with K and V combined
                 # Split K and V from combined dimension
                 head_dim = k_block.shape[-1] // 2
                 k_block = k_block[..., :head_dim]  # [num_kv_heads, page_size, head_dim]
                 v_block = v_block[..., head_dim:]  # [num_kv_heads, page_size, head_dim]
-                
+
                 # Transpose from [num_kv_heads, page_size, head_dim] to [page_size, num_kv_heads, head_dim]
                 k_block = k_block.permute(1, 0, 2)
                 v_block = v_block.permute(1, 0, 2)
-                
+
                 # Copy to CPU cache
                 # cpu_cache: [layers, slots, 2, page_size, num_kv_heads, head_dim]
                 self.cpu_cache[layer, slot, 0].copy_(k_block, non_blocking=True)

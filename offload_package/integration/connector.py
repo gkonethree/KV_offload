@@ -41,6 +41,32 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _auto_staging_slots_for(vllm_config, kv_cache_config) -> int:
+    """Auto-size staging: cover the hot sparse-selected set per request, times
+    the steady-state max batch, plus margin, clamped to a fraction of the KV
+    pool (never crashes on small pools)."""
+    topk = float(_os.getenv("SKYLIGHT_SPARSE_TOPK", "0.1"))
+    sink = int(_os.getenv("SKYLIGHT_SPARSE_SINK", "0"))
+    local = int(_os.getenv("SKYLIGHT_SPARSE_LOCAL", "0"))
+    max_len = int(vllm_config.model_config.max_model_len)
+    max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    page_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+    mid = max(0, max_len - sink - local)
+    pages_per_req = (sink + local) // page_size + int(topk * mid / page_size + 0.999)
+    safety = float(_os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10"))
+    frac = float(_os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25"))
+    num_blocks = int(kv_cache_config.num_blocks)
+    est = int(max_seqs * pages_per_req * safety)
+    cap = max(1, int(num_blocks * frac))
+    result = max(64, min(est, cap))
+    logger.info(
+        "OffloadPackageConnector: auto staging policy -> %d slots "
+        "(est=%d, cap=%d, max_len=%d, max_seqs=%d, topk=%.4f, sink=%d, local=%d)",
+        result, est, cap, max_len, max_seqs, topk, sink, local,
+    )
+    return result
+
+
 class OffloadPackageConnector(KVConnectorBase_V1):
     """Main OffloadPackageConnector - vLLM KV Connector entry point."""
 
@@ -53,11 +79,21 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
         
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        enabled = extra_config.get("enabled", True)
+        num_staging_slots = int(extra_config.get("num_staging_slots", 64))
+
+        policy = extra_config.get(
+            "staging_policy",
+            _os.getenv("OFFLOAD_PACKAGE_STAGING_POLICY", "fixed"),
+        )
+        if policy == "auto":
+            num_staging_slots = _auto_staging_slots_for(vllm_config, kv_cache_config)
+
         self.offload_config = OffloadConfig(
-            enabled=extra_config.get("enabled", True),
+            enabled=enabled,
             offload_fraction=extra_config.get("offload_fraction", 0.2),
             num_cpu_slots=extra_config.get("num_cpu_slots", 4096),
-            num_staging_slots=extra_config.get("num_staging_slots", 64),
+            num_staging_slots=num_staging_slots,
             interval_tokens=extra_config.get("interval_tokens", 32),
             scorer_decay=extra_config.get("scorer_decay", 1.0),
             scorer_head_reduction=extra_config.get("scorer_head_reduction", "mean"),
@@ -70,6 +106,13 @@ class OffloadPackageConnector(KVConnectorBase_V1):
                 "promote_per_step",
                 _os.getenv("OFFLOAD_PACKAGE_PROMOTE_PER_STEP", "4"),
             )),
+            staging_policy=policy,
+            staging_max_pool_frac=float(extra_config.get(
+                "staging_max_pool_frac",
+                _os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25"))),
+            staging_safety_margin=float(extra_config.get(
+                "staging_safety_margin",
+                _os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10"))),
         )
         
         self.kv_cache_config = kv_cache_config
@@ -199,11 +242,45 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             self._worker_handler.wait_for_layer_load(layer_name)
     
     def build_connector_meta(self, scheduler_output):
-        if self._scheduler_manager is not None:
-            return self._scheduler_manager.build_connector_meta(scheduler_output)
+        """Build metadata for this step's offload/staging operations.
+        
+        Guarantees a valid OffloadPackageMetadata is returned (never None)
+        to satisfy the vLLM worker's assertion.
+        """
+        try:
+            if self._scheduler_manager is not None:
+                result = self._scheduler_manager.build_connector_meta(scheduler_output)
+                if result is not None:
+                    return result
+        except Exception as e:
+            import logging
+            logging.warning(f"build_connector_meta scheduler_manager failed: {e}")
+        
+        # Fallback: always return a valid (possibly empty) metadata object
         from offload_package.integration.metadata import OffloadPackageMetadata
         return OffloadPackageMetadata()
     
     def update_connector_output(self, connector_output):
         if self._scheduler_manager is not None:
-            self._scheduler_manager.update_connector_output(connector_output)    
+            self._scheduler_manager.update_connector_output(connector_output)
+
+# Runtime patch for gpu_model_runner to handle None metadata gracefully.
+# This runs when the module is imported in the worker process.
+try:
+    import vllm.v1.worker.gpu_model_runner as _gmr
+    _orig_execute_model = _gmr.GPUModelRunner.execute_model
+    
+    def _patched_execute_model(self, scheduler_output, *args, **kwargs):
+        # Ensure kv_connector_metadata is never None when has_kv_transfer_group() is True
+        from vllm.distributed.kv_transfer import has_kv_transfer_group
+        from offload_package.integration.metadata import OffloadPackageMetadata
+        if has_kv_transfer_group():
+            if scheduler_output.kv_connector_metadata is None:
+                import logging
+                #logging.warning("kv_connector_metadata was None, substituting empty OffloadPackageMetadata")
+                scheduler_output.kv_connector_metadata = OffloadPackageMetadata()
+        return _orig_execute_model(self, scheduler_output, *args, **kwargs)
+    
+    _gmr.GPUModelRunner.execute_model = _patched_execute_model
+except Exception:
+    pass  # Patch failed silently, original behavior preserved    

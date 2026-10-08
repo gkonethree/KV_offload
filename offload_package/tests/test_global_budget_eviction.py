@@ -232,7 +232,7 @@ class TestOnPrefillCompleteReturnsList:
         for ref in orchestrator._request_blocks[req_id]:
             orchestrator.residency.mark_gpu(ref, ref.block_idx, complete=True)
         
-        offloaded = orchestrator.on_prefill_complete(req_id)
+        offloaded = orchestrator.on_prefill_complete(req_id, 160)
         
         assert isinstance(offloaded, list)
         for ref in offloaded:
@@ -305,11 +305,14 @@ class TestScoreAwareStagingEviction:
         offload_manager.maybe_offload(refs)
         offload_manager.gpu_budget_blocks = original_budget
         
-        # Manually bring to staging (simulate what ensure_resident does)
+        # Manually bring to staging (simulate what ensure_resident does):
+        # _allocate_slot only RESERVES the slot; the caller publishes it into
+        # the occupancy LRU after the copy succeeds.
         for i, ref in enumerate(refs):
             loc = residency.get(ref)
             assert loc.residency == Residency.CPU, f"Expected CPU, got {loc.residency}"
             slot = staging_pool._allocate_slot(ref)
+            staging_pool._lru[ref] = slot
             staging_pool.residency.mark_staging(ref, slot)
         
         assert len(staging_pool._lru) == 4
@@ -326,6 +329,7 @@ class TestScoreAwareStagingEviction:
         loc = residency.get(new_ref)
         assert loc.residency == Residency.CPU
         slot = staging_pool._allocate_slot(new_ref)
+        staging_pool._lru[new_ref] = slot
         staging_pool.residency.mark_staging(new_ref, slot)
         
         # Staging should still have 4 slots
@@ -405,6 +409,7 @@ class TestAsyncCopySync:
         refs = [BlockRef("req1", i) for i in range(5)]
         for ref in refs:
             manager.residency.mark_gpu(ref, ref.block_idx, complete=True)
+        manager.score_blocks(refs, [ref.block_idx for ref in refs])
         
         # Set budget low to trigger eviction
         manager.gpu_budget_blocks = 2

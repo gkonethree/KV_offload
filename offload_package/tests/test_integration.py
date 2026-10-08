@@ -94,6 +94,34 @@ class TestOffloadOrchestrator:
             assert loc is not None
             assert loc.residency == Residency.GPU
 
+    def test_on_prefill_complete_leaves_partial_tail_incomplete(self, orchestrator_setup):
+        """Regression: prefill completion must NOT mark the partially-filled
+        tail block complete -- offloading it would snapshot garbage rows and
+        free the page while decode is still writing into it."""
+        orchestrator, _ = orchestrator_setup
+
+        req_id = "req1"
+        page = orchestrator.page_size
+        n_full = 4                      # 4 full blocks...
+        tail_rows = 6                   # ...and a 6/16-filled tail
+        total_tokens = n_full * page + tail_rows
+        block_ids = list(range(n_full + 1))
+        orchestrator.sync_request_blocks(
+            req_id, block_ids, num_computed_tokens=total_tokens)
+        for i, ref in enumerate(orchestrator._request_blocks[req_id]):
+            orchestrator.residency.mark_gpu(ref, gpu_block_id=i, complete=False)
+
+        orchestrator.on_prefill_complete(req_id, total_tokens)
+
+        locs = {r.block_idx: orchestrator.residency.get(r)
+                for r in orchestrator._request_blocks[req_id]}
+        for idx in range(n_full):
+            assert locs[idx].complete, f"full block {idx} must be complete"
+        assert not locs[n_full].complete, (
+            "partially-filled tail block must stay incomplete so the "
+            "offloader never snapshots it mid-write"
+        )
+
     def test_on_prefill_complete_offloads(self, orchestrator_setup):
         """Prefill complete marks+scores; offload_fraction then moves blocks."""
         orchestrator, _ = orchestrator_setup
@@ -112,7 +140,7 @@ class TestOffloadOrchestrator:
 
         # Prefill-complete: blocks get scored and marked complete; the offload
         # call itself is the scheduler's (offload_fraction) responsibility.
-        orchestrator.on_prefill_complete(req_id)
+        orchestrator.on_prefill_complete(req_id, num_computed)
         assert all(orchestrator.residency.get(r).complete for r in orchestrator._request_blocks[req_id])
         assert all(r in orchestrator._scored for r in orchestrator._request_blocks[req_id])
 
@@ -214,8 +242,8 @@ class TestOffloadOrchestrator:
         
         # Prefill-complete marks + scores; the offload call lives in the
         # scheduler (offload_fraction over the global candidate pool).
-        orchestrator.on_prefill_complete(req_ids[0])
-        orchestrator.on_prefill_complete(req_ids[1])
+        orchestrator.on_prefill_complete(req_ids[0], 800)
+        orchestrator.on_prefill_complete(req_ids[1], 800)
 
         offloaded = orchestrator.offload_manager.offload_fraction(
             orchestrator._request_blocks[req_ids[0]] + orchestrator._request_blocks[req_ids[1]],

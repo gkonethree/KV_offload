@@ -153,8 +153,56 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             scorer_head_reduction=self.offload_config.scorer_head_reduction,
         )
 
+        # Get the PQ wrapper from the model runner's attention groups
+        pq_wrapper = None
+        if self._model_runner is not None:
+            for attn_groups in getattr(self._model_runner, 'attn_groups', []) or []:
+                for attn_group in attn_groups:
+                    try:
+                        builder = attn_group.get_metadata_builder()
+                    except Exception:
+                        continue
+                    if builder is not None and hasattr(builder, '_maintainer'):
+                        pq_wrapper = builder
+                        break
+                if pq_wrapper is not None:
+                    break
+
         # Build orchestrator using the factory function
         self._orchestrator = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
+
+        # Hand the runner to the skylight builder so build() can derive the
+        # CURRENT step's decode request ids from the (post-reorder) input
+        # batch. The scheduler-bound ids arrive one step late and their order
+        # is not guaranteed to match decode row order in mixed batches.
+        if self._model_runner is not None:
+            try:
+                import skylight.backend as skylight_backend
+                skylight_backend.SkylightSparseMetadataBuilder._offload_runner = (
+                    self._model_runner
+                )
+                logger.info("Injected model runner into SkylightSparseMetadataBuilder")
+            except ImportError:
+                logger.info("skylight not importable; runner id derivation disabled")
+
+        # Config sanity: with true freeing the original GPU pages of offloaded
+        # blocks are freed, so the same-step in-run fetch is the only correct
+        # read path for selected cold blocks. Running without it means silent
+        # reads of freed pages.
+        if (
+            self.offload_config.enabled
+            and self.offload_config.true_free
+            and os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
+            in ("pq", "pq_optimized", "pqrs", "pqrs_optimized", "pqis", "pqis_optimized")
+            and os.environ.get("SKYLIGHT_PQ_INRUN_FETCH", "1") != "1"
+        ):
+            logger.warning(
+                "OffloadPackageWorker: true_free is enabled but "
+                "SKYLIGHT_PQ_INRUN_FETCH is disabled -- selected offloaded "
+                "blocks will be read from freed/null pages. This "
+                "configuration is unsound; the in-run fetch will raise "
+                "instead of corrupting silently."
+            )
 
         # Inject orchestrator into attention metadata builders. The Skylight
         # sparse builder reads the class-level _offload_orchestrator in build()
@@ -532,37 +580,13 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             # Get block IDs for this request
             block_ids = group_0_table.gpu[req_idx, :num_blocks].tolist()
             _dbg(f"[SYNC DEBUG] block_ids={block_ids}")
-            
-            # Sync with orchestrator
+
+            # Sync with orchestrator. Completeness is NOT blanket-marked
+            # here: sync_request_blocks derives it from num_computed, and the
+            # partially-filled tail block must stay incomplete until it is
+            # actually full (offloading it mid-write snapshots garbage rows
+            # and frees the page while decode is still writing into it).
             self._orchestrator.sync_request_blocks(req_id, block_ids, 0)
-            # Mark as complete since we're in decode phase
-            for block_idx, gpu_block_id in enumerate(block_ids):
-                ref = BlockRef(str(req_id), block_idx)
-                loc = self._orchestrator.residency.get(ref)
-                if loc and not loc.complete:
-                    self._orchestrator.residency.mark_complete(ref)
-        
-        req_ids = input_batch.req_ids
-        _dbg(f"[SYNC DEBUG] req_ids={req_ids}")
-        for req_idx, req_id in enumerate(req_ids):
-            # Get number of blocks for this request in group 0
-            num_blocks = int(num_blocks_tensor.np[0, req_idx]) if num_blocks_tensor.np.ndim == 2 else 0
-            _dbg(f"[SYNC DEBUG] req_idx={req_idx}, req_id={req_id}, num_blocks={num_blocks}")
-            if num_blocks == 0:
-                continue
-            
-            # Get block IDs for this request
-            block_ids = group_0_table.gpu[req_idx, :num_blocks].tolist()
-            _dbg(f"[SYNC DEBUG] block_ids={block_ids}")
-            
-            # Sync with orchestrator
-            self._orchestrator.sync_request_blocks(req_id, block_ids, 0)
-            # Mark as complete since we're in decode phase
-            for block_idx, gpu_block_id in enumerate(block_ids):
-                ref = BlockRef(str(req_id), block_idx)
-                loc = self._orchestrator.residency.get(ref)
-                if loc and not loc.complete:
-                    self._orchestrator.residency.mark_complete(ref)
 
     def _try_sync_blocks(self) -> None:
         """Try to sync blocks, retrying if model_runner not ready."""
@@ -586,13 +610,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             # execute_model_state not ready yet (e.g., during warmup), skip this sync
             _dbg(f"[TRY SYNC DEBUG] execute_model_state not ready, skipping sync")
             return
-        # All checks passed, do the sync
-        self._sync_blocks_from_runner()
-        input_batch = runner.execute_model_state.input_batch
-        if not hasattr(input_batch, 'req_ids') or not input_batch.req_ids:
-            _dbg(f"[TRY SYNC DEBUG] no req_ids")
-            return
-        # All checks passed, do the sync
+        # All checks passed, do the sync (once)
         _dbg(f"[TRY SYNC DEBUG] All checks passed, calling _sync_blocks_from_runner")
         self._sync_blocks_from_runner()
 
