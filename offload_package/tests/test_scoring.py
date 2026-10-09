@@ -243,3 +243,66 @@ class TestComputeBlockKVNorms:
                 [0, 1],
                 logical_block_ids=[BlockRef("req1", 0)]  # Only 1, not 2
             )
+
+
+class TestLRUScorer:
+    """Tests for the selection-recency scorer (LRUScorer)."""
+
+    def _make(self):
+        from offload_package.scoring.lru_scorer import LRUScorer
+        return LRUScorer()
+
+    def test_recency_ordering_drives_eviction(self):
+        """Blocks selected more recently must be evicted last."""
+        scorer = self._make()
+        a, b, c = BlockRef("r", 0), BlockRef("r", 1), BlockRef("r", 2)
+        scorer.update(BlockKVStats(torch.ones(3, 1), torch.ones(3, 1), [a, b, c]))
+        assert scorer.select_for_eviction([a, b, c], budget=3) == []
+
+        scorer.note_usage("r", [0])      # tick 1
+        scorer.note_usage("r", [1])      # tick 2 -> most recent
+        # c never selected (tick 0); a older than b. budget=2 keeps the two
+        # most recent -> evicts only c.
+        to_evict = scorer.select_for_eviction([a, b, c], budget=2)
+        assert to_evict == [c]           # never-selected evicted first
+
+        to_evict = scorer.select_for_eviction([a, b, c], budget=0)
+        assert to_evict == [c, a, b]     # coldest -> newest
+
+    def test_unknown_scores_as_never_used(self):
+        scorer = self._make()
+        known = BlockRef("r", 0)
+        scorer.update(BlockKVStats(torch.ones(1, 1), torch.ones(1, 1), [known]))
+        scorer.note_usage("r", [0])
+        unknown = BlockRef("r", 99)
+        assert scorer.scores([known, unknown]).tolist() == [1.0, 0.0]
+
+    def test_update_registers_but_never_selected_is_coldest(self):
+        scorer = self._make()
+        a, b = BlockRef("r", 0), BlockRef("r", 1)
+        scorer.update(BlockKVStats(torch.ones(2, 1), torch.ones(2, 1), [a, b]))
+        scorer.note_usage("r", [1])
+        # a registered but never selected: colder than any real usage.
+        assert scorer.select_for_eviction([a, b], budget=0) == [a, b]
+
+    def test_eviction_rejects_unscored(self):
+        scorer = self._make()
+        scored = [BlockRef("r", 0)]
+        scorer.update(BlockKVStats(torch.ones(1, 1), torch.ones(1, 1), scored))
+        with pytest.raises(AssertionError):
+            scorer.select_for_eviction(scored + [BlockRef("r", 42)], budget=0)
+
+    def test_forget_removes_ticks(self):
+        scorer = self._make()
+        a = BlockRef("r", 0)
+        scorer.update(BlockKVStats(torch.ones(1, 1), torch.ones(1, 1), [a]))
+        scorer.note_usage("r", [0])
+        scorer.forget([a])
+        assert scorer.scores([a]).tolist() == [0.0]
+
+    def test_multi_request_ticks_independent(self):
+        scorer = self._make()
+        scorer.note_usage("r1", [0])     # tick 1
+        scorer.note_usage("r2", [0])     # tick 2
+        a, b = BlockRef("r1", 0), BlockRef("r2", 0)
+        assert scorer.scores([a, b]).tolist() == [1.0, 2.0]

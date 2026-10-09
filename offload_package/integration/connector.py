@@ -113,6 +113,9 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             staging_safety_margin=float(extra_config.get(
                 "staging_safety_margin",
                 _os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10"))),
+            scorer_type=extra_config.get(
+                "scorer_type",
+                _os.getenv("OFFLOAD_PACKAGE_SCORER_TYPE", "paged_eviction")),
         )
         
         self.kv_cache_config = kv_cache_config

@@ -16,6 +16,7 @@ from ..scoring.base import BlockRef
 from ..staging.pool import KVStagingPool
 from ..staging.residency import Residency, ResidencyTable
 from offload_package.debug import dbg as _dbg
+from offload_package import timing as _timing
 
 logger = init_logger(__name__)
 
@@ -49,6 +50,8 @@ class OffloadOrchestrator:
         # Set by the scheduler: with true freeing, offloaded pages are
         # recycled, so CPU-resident unstaged indices must be null-filled.
         self.true_freeing = False
+        # Last residency CPU-version seen by the lag prefetch (gate state).
+        self._lag_seen_cpu_version = 0
 
     def _enable_sparse_mode(self) -> None:
         """Enable sparse attention offloading mode."""
@@ -202,9 +205,25 @@ class OffloadOrchestrator:
         sparse_len: torch.Tensor,
     ) -> dict[BlockRef, int]:
         _dbg(f"[ORCHESTRATOR DEBUG] prepare_staging called: request_ids={request_ids}, sparse_idx.shape={sparse_idx.shape}")
+        # Lag-prefetch gate: skip the (host-sync + per-token loop) discovery
+        # pass when no block transitioned into or out of CPU-only residency
+        # since the last prefetch. With no transitions the previously staged
+        # set is still valid; any newly-selected cold block is fetched by the
+        # same-step in-run path, which is the correctness path anyway. The
+        # gate re-arms on every transition (offload triggers, fetches,
+        # evictions), so a freshly offloaded block is prefetched on the next
+        # build after its transition.
+        version = self.residency.cpu_version
+        if version == self._lag_seen_cpu_version:
+            _dbg("[ORCHESTRATOR DEBUG] prepare_staging: skipped (no residency transitions)")
+            return {}
+        self._lag_seen_cpu_version = version
+
+        _timing.start("lag.collect")
         needed = collect_needed_block_refs(
             request_ids, sparse_idx, sparse_len, self.page_size
         )
+        _timing.end("lag.collect")
         _dbg(f"[ORCHESTRATOR DEBUG] needed blocks: {[(ref.request_id, ref.block_idx) for ref in needed]}")
         cpu_needed = [
             ref for ref in needed
@@ -216,7 +235,9 @@ class OffloadOrchestrator:
             loc = self.residency.get(ref)
             if loc:
                 _dbg(f"[ORCHESTRATOR DEBUG]   Block {ref}: residency={loc.residency.name}, gpu_block={loc.gpu_block_id}, cpu_slot={loc.cpu_slot}, staging_slot={loc.staging_slot}")
+        _timing.start("lag.stage")
         result, skipped = self.staging_pool.ensure_resident(cpu_needed)
+        _timing.end("lag.stage")
         if skipped:
             logger.warning(
                 "prepare_staging (1-step-lag prefetch): %d/%d selected cold "
@@ -227,6 +248,33 @@ class OffloadOrchestrator:
             )
         _dbg(f"[ORCHESTRATOR DEBUG] ensure_resident result: {result}")
         return result
+
+    def note_selection(
+        self,
+        request_ids: Sequence[str],
+        sparse_idx: torch.Tensor,
+        page_size: int,
+    ) -> None:
+        """Record last-use ticks for the blocks this step's top-k selected.
+
+        Consumes the per-step selection pattern (layer 0's, union over
+        heads). The div+unique run on the pattern's device (a ~50us kernel
+        over [B, Hq, S]); only the ~tens-of-blocks unique result is read
+        back, so this adds no meaningful sync cost. Scorers without a
+        ``note_usage`` hook (paged_eviction, random) make this a no-op.
+        """
+        note = getattr(self.offload_manager.scorer, "note_usage", None)
+        if not callable(note):
+            return
+        if sparse_idx.numel() == 0 or page_size <= 0:
+            return
+        if len(request_ids) < sparse_idx.shape[0]:
+            return  # row/request mapping would be wrong
+        _timing.start("lru.note")
+        blocks_all = torch.div(sparse_idx, page_size, rounding_mode="floor")
+        for b in range(sparse_idx.shape[0]):
+            note(str(request_ids[b]), blocks_all[b].unique().tolist())
+        _timing.end("lru.note")
 
     def patch_paged_kv_indices(
         self,

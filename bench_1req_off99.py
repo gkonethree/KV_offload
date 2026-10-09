@@ -55,13 +55,15 @@ from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 
 MODEL = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
-MAX_MODEL_LEN = 8300            # ~8.1k input + 128 out headroom
-MAX_NEW_TOKENS = int(os.environ.get('BENCH_NEW_TOKENS', '128'))
-INTERVAL_TOKENS = 32
+MAX_MODEL_LEN = 18000            # ~8.1k input + 128 out headroom
+MAX_NEW_TOKENS = int(os.environ.get('BENCH_NEW_TOKENS', '8192'))
+INTERVAL_TOKENS = 128
 
-# Single request: ~26 tokens per repetition -> 310 reps ~ 8.1k tokens.
+# Single request: ~26 tokens per repetition. BENCH_PROMPT_REPS sets the
+# length (40 -> ~1k tokens).
 PROMPT = ('The history of artificial intelligence is a story of ambition, '
-          'setbacks, and breakthroughs across decades of research. ') * 40
+          'setbacks, and breakthroughs across decades of research. ') * \
+    int(os.environ.get('BENCH_PROMPT_REPS', '40'))
 
 if os.environ.get('BENCH_PROMPT') == 'varied':
     # Non-degenerate prompt: varied content per block, so greedy logits are
@@ -73,7 +75,7 @@ if os.environ.get('BENCH_PROMPT') == 'varied':
         for i in range(170))
 
 SPARSE_ENV = {
-    'SKYLIGHT_SPARSE_TOPK': '0.3',
+    'SKYLIGHT_SPARSE_TOPK': '0.1',
     'SKYLIGHT_SPARSE_SINK': '64',
     'SKYLIGHT_SPARSE_LOCAL': '64',
     'SKYLIGHT_SPARSE_CHANNEL_NUM': '64',
@@ -83,14 +85,45 @@ CONFIGS = {
     'pq': dict(method='pq', offload=False),
     'pq2': dict(method='pq', offload=False),  # determinism control
     'pq+off99': dict(method='pq', offload=True, fraction=0.99,
-                     staging_policy='auto', num_staging_slots=None),
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction'),
+    'pq+off99-rand': dict(method='pq', offload=True, fraction=0.99,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='random'),
     'pq+off99-tiny': dict(method='pq', offload=True, fraction=0.99,
                           staging_policy='fixed', num_staging_slots=64),
+    'pq+off99-t16': dict(method='pq', offload=True, fraction=0.99,
+                         staging_policy='fixed', num_staging_slots=16,
+                         scorer_type='paged_eviction'),
+    'pq+off99-t16-rand': dict(method='pq', offload=True, fraction=0.99,
+                              staging_policy='fixed', num_staging_slots=16,
+                              scorer_type='random'),
+    'pq+off50': dict(method='pq', offload=True, fraction=0.5,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction'),
+    'pq+off50-rand': dict(method='pq', offload=True, fraction=0.5,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='random'),
+    'pq+off25': dict(method='pq', offload=True, fraction=0.25,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction'),
+    'pq+off25-rand': dict(method='pq', offload=True, fraction=0.25,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='random'),
+    'pq+off99-lru': dict(method='pq', offload=True, fraction=0.99,
+                        staging_policy='auto', num_staging_slots=None,
+                        scorer_type='lru'),
+    'pq+off50-lru': dict(method='pq', offload=True, fraction=0.5,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='lru'),
+    'pq+off25-lru': dict(method='pq', offload=True, fraction=0.25,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='lru'),
 }
 
 
 def run(name, method, offload, fraction=0.5, staging_policy='auto',
-        num_staging_slots=None):
+        num_staging_slots=None, scorer_type='paged_eviction'):
     print(f"\n{'=' * 70}\nCONFIG: {name}\n{'=' * 70}", flush=True)
     for k, v in SPARSE_ENV.items():
         os.environ[k] = v
@@ -105,6 +138,7 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
             'staging_policy': staging_policy,
             'interval_tokens': INTERVAL_TOKENS,
             'true_free': True,
+            'scorer_type': scorer_type,
         }
         if num_staging_slots is not None:
             extra['num_staging_slots'] = num_staging_slots
@@ -166,6 +200,9 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
         'text': outputs[0].outputs[0].text,
         'tokens': list(outputs[0].outputs[0].token_ids),
     }
+    import json
+    with open(f"/tmp/opencode/tokens_{name.replace('+', '_')}.json", "w") as f:
+        json.dump(result['tokens'], f)
     del llm
     gc.collect()
     torch.cuda.empty_cache()

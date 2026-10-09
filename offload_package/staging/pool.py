@@ -10,6 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 
+from offload_package import timing as _timing
 from offload_package.offload.manager import KVOffloadManager
 from offload_package.scoring.base import BlockRef
 from offload_package.staging.residency import Residency, ResidencyTable
@@ -154,20 +155,28 @@ class KVStagingPool:
                 ):
                     # cpu_cache layer: [S, 2, P, H, C] -> gather slots -> split KV ->
                     # transpose to [n, H, P, C] each -> cat -> [n, H, P, 2C]
+                    _timing.start("pool.cpu_gather")
                     g = self.cpu_cache[layer].index_select(0, cpu_slots_t)
+                    _timing.end("pool.cpu_gather")
+                    _timing.start("pool.transform")
                     k = g[:, 0].permute(0, 2, 1, 3)
                     v = g[:, 1].permute(0, 2, 1, 3)
                     combined = torch.cat([k, v], dim=-1).contiguous()
+                    _timing.end("pool.transform")
+                    _timing.start("pool.h2d")
                     combined_gpu = combined.to(device, non_blocking=True)
                     k_cache.index_copy_(0, base_ids, combined_gpu)
+                    _timing.end("pool.h2d")
                     host_slabs.append(combined)
                     gpu_slabs.append(combined_gpu)
                 event = torch.cuda.Event()
                 event.record(self.copy_stream)
             # One ordering point for the batch: attention reads staged pages only
             # after this. The temporaries above are now safe to drop.
+            _timing.start("pool.h2d_sync")
             torch.cuda.current_stream(device=device).wait_stream(self.copy_stream)
             event.synchronize()
+            _timing.end("pool.h2d_sync")
         except Exception:
             # Copies failed: hand the reserved slots back so nothing leaks, and
             # leave the occupancy LRU untouched (entries are only inserted on

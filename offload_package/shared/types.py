@@ -83,6 +83,9 @@ def build_orchestrator(
     # Select scorer based on config
     if cfg.scorer_type == "random":
         scorer = RandomScorer()
+    elif cfg.scorer_type == "lru":
+        from offload_package.scoring.lru_scorer import LRUScorer
+        scorer = LRUScorer()
     else:
         scorer = PagedEvictionScorer(
             decay=cfg.scorer_decay,

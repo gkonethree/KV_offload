@@ -57,6 +57,8 @@ def patch_paged_kv_indices_with_staging(
     residency: ResidencyTable,
     staging_map: dict[BlockRef, int],
     null_block_id: int | None = None,
+    indptr_host: Sequence[int] | None = None,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """Patch the flat vLLM page-index array so sparse attention reads the right pages.
 
@@ -71,7 +73,12 @@ def patch_paged_kv_indices_with_staging(
       still-valid original page ids.)
 
     ``sparse_idx``/``sparse_len`` may be None: then no staging slots are
-    referenced, only the residency-based null fill runs.
+      referenced, only the residency-based null fill runs.
+
+    ``indptr_host`` is a pre-read host copy of ``paged_kv_indptr`` to avoid a
+    second device sync (the caller already reads it for its alignment
+    checks). ``inplace=True`` patches ``original_indices`` directly instead
+    of cloning -- use when it is the persistent metadata buffer.
 
     This fixes a key bug in the original implementation: searching for an old
     physical block ID in the flattened array is incorrect because physical IDs
@@ -80,12 +87,17 @@ def patch_paged_kv_indices_with_staging(
     req_id_to_batch_idx = {rid: i for i, rid in enumerate(request_ids)}
     if paged_kv_indptr.ndim != 1 or paged_kv_indptr.numel() < len(request_ids) + 1:
         raise ValueError("paged_kv_indptr must have B+1 entries")
+    if indptr_host is not None:
+        indptr = [int(x) for x in indptr_host]
+    else:
+        indptr = paged_kv_indptr.detach().cpu().tolist()
+    patched = original_indices if inplace else original_indices.clone()
 
-    patched = original_indices.clone()
-    indptr = paged_kv_indptr.detach().cpu().tolist()
-
-    # 1) Newly staged blocks (this step's fetch) -> staging slots.
-    if sparse_idx is not None:
+    # 1) Newly staged blocks (this step's fetch) -> staging slots. The
+    #    discovery pass is only needed when something was actually staged;
+    #    with an empty staging_map (the common case) skip it entirely -- it
+    #    costs a host sync plus a per-token loop and would find nothing to do.
+    if sparse_idx is not None and staging_map:
         needed = collect_needed_block_refs(
             request_ids, sparse_idx, sparse_len, page_size
         )

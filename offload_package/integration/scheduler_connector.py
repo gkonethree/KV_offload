@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
 )
 from offload_package.integration.metadata import INVALID_JOB_ID
+from offload_package import timing as _timing
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -347,10 +348,12 @@ class OffloadPackageScheduler:
             and self._orchestrator is not None
             and self._orchestrator.residency.num_cpu_blocks > 0
         ):
+            _timing.start("sched.promote")
             for rid in active_req_ids:
                 self._orchestrator.promote_hot_cpu_blocks(
                     rid, self.offload_config.promote_per_step
                 )
+            _timing.end("sched.promote")
 
         # 5. Flush ALL of this step's offload triggers into a single store
         # event so the worker (and the completion free) sees every batch.
@@ -381,6 +384,7 @@ class OffloadPackageScheduler:
                  f"reqs={metadata.store_event_to_reqs[event_idx]}")
 
         _dbg(f"[SCHEDULER DEBUG] build_connector_meta returning: load_event={metadata.load_event}, store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}")
+        _timing.step()
         return metadata
         
     def _get_active_decode_requests(self, scheduler_output: Optional[SchedulerOutput] = None) -> list[str]:
@@ -443,15 +447,19 @@ class OffloadPackageScheduler:
                 _score_refs.append(ref)
                 _score_gids.append(loc.gpu_block_id)
         if _score_refs:
+            _timing.start("sched.score")
             for ref in _score_refs:
                 self._orchestrator.residency.mark_complete(ref)
             self._orchestrator.offload_manager.score_blocks(_score_refs, _score_gids)
             self._orchestrator._scored.update(_score_refs)
+            _timing.end("sched.score")
 
         # Offload fraction of scored blocks
+        _timing.start("sched.offload")
         offloaded = self._orchestrator.offload_manager.offload_fraction(
             allowed, self.offload_config.offload_fraction, self._orchestrator._scored
         )
+        _timing.end("sched.offload")
     
         if not offloaded:
             return
@@ -540,6 +548,7 @@ class OffloadPackageScheduler:
         """
         if event_idx not in self._pending_store_events:
             return
+        _timing.start("sched.surgery")
 
         refs, gpu_block_ids, cpu_block_ids, req_ids = self._pending_store_events.pop(event_idx)
         _dbg(f"[SCHED DEBUG] _process_store_completion event={event_idx}, gpu_blocks={len(gpu_block_ids)}, cpu_blocks={len(cpu_block_ids)}")
@@ -600,7 +609,8 @@ class OffloadPackageScheduler:
             self._gpu_block_pool.free_blocks(freed)
             _dbg(f"[SCHED DEBUG] True-freed {len(freed)} GPU blocks: free_gpu_blocks={self._gpu_block_pool.get_num_free_blocks()}")
             logger.debug("True-freed %d GPU blocks to pool after offload", len(freed))
-        
+        _timing.end("sched.surgery")
+
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int):
         # Not used for our offload pattern
         return 0, False

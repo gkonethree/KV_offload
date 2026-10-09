@@ -15,7 +15,7 @@ class OffloadConfig:
     interval_tokens: int = 32
     scorer_decay: float = 1.0
     scorer_head_reduction: str = "mean"
-    scorer_type: str = "paged_eviction"  # "paged_eviction" or "random"
+    scorer_type: str = "paged_eviction"  # "paged_eviction", "random" or "lru"
     # Intent knob: whether to recycle GPU pages after offload (table surgery +
     # free). The runtime gate still refuses true freeing under async
     # scheduling / multiprocess / world_size>1 regardless of this flag.
@@ -55,8 +55,8 @@ class OffloadConfig:
     def __post_init__(self):
         if not 0.0 <= self.offload_fraction < 1.0:
             raise ValueError("offload_fraction must be in [0, 1)")
-        if self.scorer_type not in ("paged_eviction", "random"):
-            raise ValueError("scorer_type must be 'paged_eviction' or 'random'")
+        if self.scorer_type not in ("paged_eviction", "random", "lru"):
+            raise ValueError("scorer_type must be 'paged_eviction', 'random' or 'lru'")
         if self.promote_per_step < 0:
             raise ValueError("promote_per_step must be >= 0")
         if self.staging_policy not in ("fixed", "auto"):

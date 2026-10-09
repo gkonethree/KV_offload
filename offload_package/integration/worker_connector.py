@@ -151,6 +151,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             kv_layout=kv_cache_view.kv_layout,
             scorer_decay=self.offload_config.scorer_decay,
             scorer_head_reduction=self.offload_config.scorer_head_reduction,
+            scorer_type=self.offload_config.scorer_type,
         )
 
         # Get the PQ wrapper from the model runner's attention groups

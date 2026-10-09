@@ -206,3 +206,75 @@ class TestResidencyTable:
         # STAGING -> CPU (back to CPU if not used)
         table.mark_cpu(ref, cpu_slot=10)
         assert table.get(ref).residency == Residency.CPU
+
+
+class TestResidencyVersionAndIndex:
+    """CPU-version counter (lag-prefetch gate) and per-request index."""
+
+    def test_cpu_version_bumps_on_transitions(self):
+        """Every CPU-set membership change must bump the version; no change
+        leaves it stable. The lag prefetch skips its discovery pass when the
+        version is unchanged, so a missed bump means a stale prefetch and a
+        spurious bump means wasted work."""
+        table = ResidencyTable()
+        assert table.cpu_version == 0
+
+        a, b = BlockRef("req1", 0), BlockRef("req1", 1)
+        table.mark_gpu(a, 0, complete=True)
+        table.mark_gpu(b, 1, complete=True)
+        assert table.cpu_version == 0  # GPU marks don't touch the CPU set
+
+        table.mark_cpu(a, 0)
+        v1 = table.cpu_version
+        assert v1 == 1
+
+        table.mark_cpu(b, 1)
+        assert table.cpu_version == 2
+
+        table.mark_staging(a, 3)      # CPU -> STAGING
+        assert table.cpu_version == 3
+        assert table.num_cpu_blocks == 1
+
+        table.mark_cpu(a, 0)          # STAGING evicted back to CPU
+        assert table.cpu_version == 4
+        assert table.num_cpu_blocks == 2
+
+        table.mark_gpu(a, 7)          # CPU -> GPU
+        assert table.cpu_version == 5
+        assert table.num_cpu_blocks == 1
+
+        table.remove(b)               # CPU entry removed
+        assert table.cpu_version == 6
+        assert table.num_cpu_blocks == 0
+
+    def test_cpu_version_stable_when_no_transitions(self):
+        table = ResidencyTable()
+        ref = BlockRef("req1", 0)
+        table.mark_gpu(ref, 0, complete=True)
+        v = table.cpu_version
+        table.mark_complete(ref)
+        loc = table.get(ref)
+        assert table.cpu_version == v  # mark_complete is not a transition
+
+    def test_refs_for_request_uses_index_consistently(self):
+        """The per-request index must return exactly the same result as the
+        old whole-table scan: all of the request's blocks, sorted by index,
+        and nothing else; and stay consistent after removes."""
+        table = ResidencyTable()
+        for rid, n in (("req1", 5), ("req2", 3)):
+            for i in range(n):
+                table.mark_gpu(BlockRef(rid, i), i, complete=True)
+
+        assert [r.block_idx for r in table.refs_for_request("req1")] == [0, 1, 2, 3, 4]
+        assert [r.block_idx for r in table.refs_for_request("req2")] == [0, 1, 2]
+        assert table.refs_for_request("req-missing") == []
+
+        mid = BlockRef("req1", 2)
+        table.mark_cpu(mid, 9)
+        table.mark_staging(mid, 4)
+        assert [r.block_idx for r in table.refs_for_request("req1")] == [0, 1, 2, 3, 4]
+
+        table.remove(BlockRef("req1", 0))
+        table.remove(BlockRef("req2", 1))
+        assert [r.block_idx for r in table.refs_for_request("req1")] == [1, 2, 3, 4]
+        assert [r.block_idx for r in table.refs_for_request("req2")] == [0, 2]

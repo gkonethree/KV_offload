@@ -44,6 +44,7 @@ from skylight.config import SkylightSparseConfig
 
 logger = init_logger(__name__)
 import os as _os
+from offload_package import timing as _timing
 _DBG = _os.environ.get("OFFLOAD_PACKAGE_DEBUG", "0") == "1"
 def _dbg(msg: str) -> None:
     if _DBG:
@@ -237,6 +238,10 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     _offload_runner: object | None = None
     # Last bail reason recorded by _patch_indices_for_staging for this build.
     _patch_bail_reason: str | None = None
+    # Engine-step serial (bumped per build) and the step whose pattern was
+    # last D2H-cached; together they limit pattern caching to once per step.
+    _step_serial: int = 0
+    _pattern_cached_serial: int = -1
     # Cached sparse pattern from previous step
     _cached_sparse_idx: torch.Tensor | None = None
     _cached_sparse_len: torch.Tensor | None = None
@@ -449,6 +454,11 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         cls = type(self)
         self._patch_bail_reason = None
         num_decodes = 0
+        # One pattern cache per engine step: _cache_sparse_pattern (called
+        # after EVERY layer's forward) uses this serial to cache only the
+        # first layer's pattern per step instead of 22 near-identical D2H
+        # copies of which only the last was ever consumed.
+        cls._step_serial = getattr(cls, "_step_serial", 0) + 1
 
         # Derive THIS step's decode request ids from the runner's input batch.
         # reorder_batch_to_split_decodes_and_prefills has already run by now,
@@ -632,7 +642,8 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             )
             null_id = 0 if getattr(orchestrator, "true_freeing", False) else None
             _dbg(f"[PATCH DEBUG] calling patch_paged_kv_indices_with_staging with staging_map={staging_map}")
-            patched = patch_paged_kv_indices_with_staging(
+            _timing.start("build.patch")
+            patch_paged_kv_indices_with_staging(
                 paged_kv_indices,
                 indptr_gpu,
                 request_ids,
@@ -643,11 +654,11 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                 orchestrator.residency,
                 staging_map,
                 null_block_id=null_id,
+                indptr_host=indptr_list,
+                inplace=True,
             )
-            # In-place write into the persistent buffer: the decode wrapper's
-            # plan (later in build()) consumes this content.
-            paged_kv_indices.copy_(patched)
-            cls._last_patched_indices = patched
+            _timing.end("build.patch")
+            cls._last_patched_indices = paged_kv_indices
         except Exception as e:
             _dbg(f"[SKYLIGHT DEBUG] Failed to patch staging indices: {e}")
             import traceback
@@ -868,13 +879,21 @@ class SkylightSparseImpl(FlashInferImpl):
         
         # After forward, cache the sparse pattern for next step's staging
         _dbg(f"[IMPL DEBUG] Calling _cache_sparse_pattern")
-        self._cache_sparse_pattern(m)
-        
+        self._cache_sparse_pattern(m, layer)
+
         self._log_layer_sparsity(m, layer)
         return out
 
-    def _cache_sparse_pattern(self, attn_metadata):
-        """Cache sparse_idx and sparse_len from the kernel for next step's staging."""
+    def _cache_sparse_pattern(self, attn_metadata, layer=None):
+        """Cache sparse_idx and sparse_len from the kernel for next step's staging.
+
+        Only the FIRST layer of each step caches: the lag prefetch consumes
+        one pattern per step (the last writer wins), so caching per layer did
+        22 D2H copies/step of which 21 were immediately overwritten. Layer-0's
+        pattern is an equally good one-step predictor. The gate is the build
+        serial (models don't reliably expose layer indices on the attention
+        module).
+        """
         if attn_metadata is None:
             return
         if torch.cuda.is_current_stream_capturing():
@@ -882,6 +901,11 @@ class SkylightSparseImpl(FlashInferImpl):
             # only feeds the *next* step's eager build()-time staging fetch, so
             # skipping during capture is safe.
             return
+        builder_cls = SkylightSparseMetadataBuilder
+        if getattr(builder_cls, "_pattern_cached_serial", -1) == getattr(
+            builder_cls, "_step_serial", -1
+        ):
+            return  # already cached this step
         try:
             # Get the decode wrapper
             w = getattr(attn_metadata, "decode", None)
@@ -893,28 +917,42 @@ class SkylightSparseImpl(FlashInferImpl):
             inner = getattr(w, "_inner", w)
             if inner is None:
                 return
-            
+
             # Get the sparse indices from the kernel (stored in _last_topk_idx)
             sparse_idx = getattr(inner, "_last_topk_idx", None)
             if sparse_idx is None:
                 return
-            
+
             # Cache sparse pattern (request_ids will be filled by worker connector from model runner)
             batch_size = sparse_idx.shape[0]
             sparse_len = torch.full(
                 (batch_size, sparse_idx.shape[1], 1),
                 sparse_idx.shape[2], dtype=torch.int32, device=sparse_idx.device,
             )
-            
+
             # Cache for next step (move to CPU to avoid GPU memory pressure)
+            _timing.start("build.pattern_d2h")
             global _sparse_pattern_cache
             _sparse_pattern_cache['sparse_idx'] = sparse_idx.detach().cpu()
             _sparse_pattern_cache['sparse_len'] = sparse_len.detach().cpu()
+            _timing.end("build.pattern_d2h")
+            # Feed the same host-side pattern to the LRU scorer (no-op for
+            # scorers without a note_usage hook): recency by top-k selection.
+            orch = builder_cls._offload_orchestrator
+            if orch is not None:
+                ids = builder_cls._cached_request_ids or []
+                if ids:
+                    orch.note_selection(
+                        ids, sparse_idx, int(getattr(orch, "page_size", 16)),
+                    )
             # Also populate the class attrs read by build()'s staging-prep +
             # index patching path (_prepare_staging_for_sparse_attention).
             # request_ids will be filled by worker connector from model runner.
-            SkylightSparseMetadataBuilder._cached_sparse_idx = _sparse_pattern_cache['sparse_idx']
-            SkylightSparseMetadataBuilder._cached_sparse_len = _sparse_pattern_cache['sparse_len']
+            builder_cls._cached_sparse_idx = _sparse_pattern_cache['sparse_idx']
+            builder_cls._cached_sparse_len = _sparse_pattern_cache['sparse_len']
+            builder_cls._pattern_cached_serial = getattr(
+                builder_cls, "_step_serial", -1
+            )
             _dbg(f"[SKYLIGHT DEBUG] SET _sparse_pattern_cache: sparse_idx id={id(_sparse_pattern_cache['sparse_idx'])}")
             _dbg(f"[SKYLIGHT DEBUG] Cached sparse pattern: batch={batch_size}, k={sparse_idx.shape[2]}")
         except Exception as e:
