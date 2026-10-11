@@ -152,6 +152,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             scorer_decay=self.offload_config.scorer_decay,
             scorer_head_reduction=self.offload_config.scorer_head_reduction,
             scorer_type=self.offload_config.scorer_type,
+            staging_eviction=self.offload_config.staging_eviction,
         )
 
         # Get the PQ wrapper from the model runner's attention groups
@@ -241,22 +242,16 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         self._worker = worker
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        """Set the connector metadata from the scheduler."""
+        """Set the connector metadata from the scheduler.
+
+        Request ids are NOT stashed here: the skylight builder derives the
+        CURRENT step's decode order from the runner's input batch at build
+        time (F1-A), which runs before this bind. Stashing here would only
+        write a one-step-stale list that build() immediately overwrites.
+        """
         assert isinstance(connector_metadata, OffloadPackageMetadata)
         self._metadata = connector_metadata
-
-        # Populate the class attr read by the backend's build()-time
-        # staging-prep / index patching path (_prepare_staging_for_sparse_attention).
-        # metadata.request_ids contains the active decode request IDs for this step
-        # in scheduled order (set by scheduler's build_connector_meta section 4).
-        if connector_metadata.request_ids:
-            import skylight.backend as skylight_backend
-            builder_cls = getattr(skylight_backend, 'SkylightSparseMetadataBuilder', None)
-            if builder_cls is not None:
-                builder_cls._cached_request_ids = list(connector_metadata.request_ids)
-                # Also keep module cache in sync
-                skylight_backend._sparse_pattern_cache['request_ids'] = list(connector_metadata.request_ids)
-        _dbg(f"[WORKER DEBUG] bind_connector_metadata: load_event={connector_metadata.load_event}, store_event={connector_metadata.store_event}, request_ids={connector_metadata.request_ids}, store_gpu_blocks={connector_metadata.store_gpu_blocks}")
+        _dbg(f"[WORKER DEBUG] bind_connector_metadata: load_event={connector_metadata.load_event}, store_event={connector_metadata.store_event}, n_request_ids={len(connector_metadata.request_ids)}, n_store_gpu_blocks={len(connector_metadata.store_gpu_blocks)}")
 
     def clear_connector_metadata(self) -> None:
         """Clear the connector metadata."""
@@ -268,123 +263,13 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         pass
 
     def start_load_kv(self, forward_context: ForwardContext) -> None:
-        """Launch async CPU→GPU copies for staging (sparse attention fetch)."""
-        # Single fetch owner: when the Skylight builder is armed, its
-        # _compute_flashinfer_kv_metadata override does staging + index
-        # patching pre-plan; fetching here too would double every copy.
-        try:
-            import skylight.backend as skylight_backend
-            if (skylight_backend.SkylightSparseMetadataBuilder
-                    ._offload_orchestrator is not None):
-                return
-        except ImportError:
-            pass
+        """No-op: the fetch is owned by the attention path.
 
-        # Try to sync blocks before staging
-        self._try_sync_blocks()
-        _dbg(f"[WORKER DEBUG] start_load_kv called: metadata={self._metadata is not None}")
-        if self._metadata is None:
-            _dbg(f"[WORKER DEBUG] start_load_kv: early return - no metadata")
-            return
-        # Use a dummy load_event if not set by scheduler
-        load_event = self._metadata.load_event if self._metadata.load_event != -1 else 0
-
-        if self._orchestrator is None:
-            _dbg(f"[WORKER DEBUG] start_load_kv: no orchestrator")
-            return
-
-        # Get cached sparse pattern from Skylight backend (from previous step)
-        sparse_idx, sparse_len, request_ids = self._get_cached_sparse_pattern()
-        # Fallback to metadata's request_ids if not in cache
-        if (request_ids is None or len(request_ids) == 0) and self._metadata is not None:
-            request_ids = self._metadata.request_ids
-        _dbg(f"[WORKER DEBUG] cached pattern: sparse_idx={sparse_idx is not None}, sparse_len={sparse_len is not None}, request_ids={request_ids}")
-        if sparse_idx is None or sparse_len is None or request_ids is None or len(request_ids) == 0:
-            # No cached pattern yet (first step) - skip staging for this step
-            _dbg(f"[WORKER DEBUG] start_load_kv: no cached pattern, skipping")
-            return
-
-        _dbg(f"[WORKER DEBUG] sparse_idx shape={sparse_idx.shape}, sparse_len shape={sparse_len.shape}")
-
-        # Use orchestrator's staging pool to fetch blocks
-        _dbg(f"[WORKER DEBUG] prepare_staging: request_ids={request_ids}, sparse_idx.shape={sparse_idx.shape}, sparse_len.shape={sparse_len.shape}")
-        staging_map = self._orchestrator.prepare_staging(
-            request_ids,
-            sparse_idx.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
-            sparse_len.to(self._orchestrator.staging_pool.gpu_k_caches[0].device),
-        )
-        _dbg(f"[WORKER DEBUG] staging_map: {staging_map}")
-
-        # Launch async copies for each block
-        for ref, staging_slot in staging_map.items():
-            loc = self._orchestrator.residency.get(ref)
-            if loc and loc.cpu_slot is not None:
-                _dbg(f"[WORKER DEBUG] Fetching block {ref} (cpu_slot={loc.cpu_slot}) to staging_slot={staging_slot}")
-                self._launch_cpu_to_staging_copy(loc.cpu_slot, staging_slot)
-            else:
-                _dbg(f"[WORKER DEBUG] Block {ref} not on CPU or no cpu_slot: loc={loc}")
-
-        # Record completion event
-        event = torch.cuda.Event()
-        event.record(self._load_stream)
-        self._load_events.append((load_event, event))
-
-    def _get_cached_sparse_pattern(self):
-        """Get cached sparse pattern from Skylight backend."""
-        import os
-        try:
-            # Import the module to access module-level cached pattern
-            import skylight.backend as skylight_backend
-            sparse_idx = skylight_backend._sparse_pattern_cache.get('sparse_idx', None)
-            sparse_len = skylight_backend._sparse_pattern_cache.get('sparse_len', None)
-            request_ids = skylight_backend._sparse_pattern_cache.get('request_ids', None)
-
-            _dbg(f"[WORKER DEBUG] pid={os.getpid()}, _get_cached_sparse_pattern: skylight_backend id={id(skylight_backend)}, sparse_idx id={id(sparse_idx)}")
-            _dbg(f"[WORKER DEBUG] _cached_sparse_idx={sparse_idx is not None}, _cached_sparse_len={sparse_len is not None}, _cached_request_ids={request_ids}")
-
-            # If cached request_ids not available, try to get from model runner
-            if request_ids is None and self._worker is not None:
-                if hasattr(self._worker, 'model_runner') and self._model_runner is not None:
-                    runner = self._model_runner
-                    if hasattr(runner, 'execute_model_state') and runner.execute_model_state is not None:
-                        input_batch = runner.execute_model_state.input_batch
-                        if input_batch is not None and hasattr(input_batch, 'req_ids'):
-                            request_ids = input_batch.req_ids
-                            _dbg(f"[WORKER DEBUG] Got request_ids from model runner: {request_ids}")
-                            # Store in cache for next time
-                            skylight_backend._sparse_pattern_cache['request_ids'] = request_ids
-
-            return sparse_idx, sparse_len, request_ids
-        except Exception as e:
-            logger.warning(f"Could not get cached sparse pattern: {e}")
-            return None, None, None
-
-    def _launch_cpu_to_staging_copy(self, cpu_slot: int, staging_slot: int):
-        """Launch async copy from CPU cache to GPU staging slot."""
-        if self._orchestrator is None:
-            return
-        # Access staging pool and copy
-        staging_pool = self._orchestrator.staging_pool
-        with torch.cuda.stream(self._load_stream):
-            for layer, (k_cache, v_cache) in enumerate(zip(
-                staging_pool.gpu_k_caches, staging_pool.gpu_v_caches
-            )):
-                # CPU cache: [page_size, num_kv_heads, head_dim] -> GPU: [num_kv_heads, page_size, 2*head_dim]
-                k_src = staging_pool.cpu_cache[layer, cpu_slot, 0]  # [page_size, num_kv_heads, head_dim]
-                v_src = staging_pool.cpu_cache[layer, cpu_slot, 1]  # [page_size, num_kv_heads, head_dim]
-                
-                # Transpose from [page_size, num_kv_heads, head_dim] to [num_kv_heads, page_size, head_dim]
-                k_src = k_src.permute(1, 0, 2).contiguous()
-                v_src = v_src.permute(1, 0, 2).contiguous()
-                
-                # Combine K and V in last dimension: [num_kv_heads, page_size, 2*head_dim]
-                combined = torch.cat([k_src, v_src], dim=-1)
-                
-                # Copy to GPU staging (K and V are combined in the same tensor)
-                k_cache[staging_pool.base + staging_slot].copy_(combined, non_blocking=True)
-                # v_cache is not used since K and V are combined
-        # Ensure visibility to default stream
-        torch.cuda.current_stream().wait_stream(self._load_stream)
+        PQ fetches at selection time (in-run, 0-lag) inside the decode
+        wrapper; the oracle family prefetches at build time via the skylight
+        builder's index patcher. There is no remaining worker-side fetch.
+        """
+        pass
 
     def wait_for_save(self) -> None:
         """Record store-event completion for the scheduler.
@@ -539,89 +424,12 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         """Build worker metadata for the scheduler."""
         return self.build_worker_meta()
 
-    def _sync_blocks_from_runner(self) -> None:
-        """Sync block IDs from model runner's block table to orchestrator."""
-        _dbg(f"[SYNC DEBUG] _sync_blocks_from_runner called, id={id(self)}")
-        if self._model_runner is None or self._orchestrator is None:
-            _dbg(f"[SYNC DEBUG] model_runner or orchestrator is None")
-            return
-        runner = self._model_runner
-        # runner IS the model_runner
-        if not hasattr(runner, 'block_tables') or not runner.block_tables:
-            _dbg(f"[SYNC DEBUG] no block_tables")
-            return
-        
-        block_tables = runner.block_tables
-        if not hasattr(block_tables, 'block_tables') or not block_tables.block_tables:
-            _dbg(f"[SYNC DEBUG] no block_tables.block_tables")
-            return
-        
-        # Get block tables for the first KV cache group (group 0)
-        group_0_table = block_tables.block_tables[0]
-        num_blocks_tensor = block_tables.num_blocks
-        
-        # Get request IDs from the model runner's execute_model_state
-        if not hasattr(runner, 'execute_model_state') or runner.execute_model_state is None:
-            _dbg(f"[SYNC DEBUG] no execute_model_state")
-            return
-        input_batch = runner.execute_model_state.input_batch
-        if not hasattr(input_batch, 'req_ids'):
-            _dbg(f"[SYNC DEBUG] no req_ids")
-            return
-        
-        req_ids = input_batch.req_ids
-        _dbg(f"[SYNC DEBUG] req_ids={req_ids}")
-        for req_idx, req_id in enumerate(req_ids):
-            # Get number of blocks for this request in group 0
-            num_blocks = int(num_blocks_tensor.np[0, req_idx]) if num_blocks_tensor.np.ndim == 2 else 0
-            _dbg(f"[SYNC DEBUG] req_idx={req_idx}, req_id={req_id}, num_blocks={num_blocks}")
-            if num_blocks == 0:
-                continue
-            
-            # Get block IDs for this request
-            block_ids = group_0_table.gpu[req_idx, :num_blocks].tolist()
-            _dbg(f"[SYNC DEBUG] block_ids={block_ids}")
-
-            # Sync with orchestrator. Completeness is NOT blanket-marked
-            # here: sync_request_blocks derives it from num_computed, and the
-            # partially-filled tail block must stay incomplete until it is
-            # actually full (offloading it mid-write snapshots garbage rows
-            # and frees the page while decode is still writing into it).
-            self._orchestrator.sync_request_blocks(req_id, block_ids, 0)
-
-    def _try_sync_blocks(self) -> None:
-        """Try to sync blocks, retrying if model_runner not ready."""
-        _dbg(f"[TRY SYNC DEBUG] _try_sync_blocks called, id={id(self)}, _model_runner={id(self._model_runner) if self._model_runner else None}")
-        if self._model_runner is None or self._orchestrator is None:
-            _dbg(f"[TRY SYNC DEBUG] model_runner or orchestrator is None")
-            return
-        runner = self._model_runner
-        # runner IS the model_runner, no need to check for model_runner attribute
-        if not hasattr(runner, 'block_tables') or not runner.block_tables:
-            _dbg(f"[TRY SYNC DEBUG] no block_tables")
-            return
-        block_tables = runner.block_tables
-        _dbg(f"[TRY SYNC DEBUG] block_tables={block_tables}, block_tables.block_tables={block_tables.block_tables}")
-        if not hasattr(block_tables, 'block_tables') or not block_tables.block_tables:
-            _dbg(f"[TRY SYNC DEBUG] no block_tables.block_tables")
-            return
-        ems = getattr(runner, 'execute_model_state', None)
-        _dbg(f"[TRY SYNC DEBUG] execute_model_state={ems}")
-        if not hasattr(runner, 'execute_model_state') or runner.execute_model_state is None:
-            # execute_model_state not ready yet (e.g., during warmup), skip this sync
-            _dbg(f"[TRY SYNC DEBUG] execute_model_state not ready, skipping sync")
-            return
-        # All checks passed, do the sync (once)
-        _dbg(f"[TRY SYNC DEBUG] All checks passed, calling _sync_blocks_from_runner")
-        self._sync_blocks_from_runner()
-
     def set_runner(self, runner) -> None:
-        """Bind the GPU model runner for accessing request IDs and block tables."""
+        """Bind the GPU model runner: the skylight builder reads it at build
+        time to derive the current step's decode ids (F1-A); the orchestrator
+        is built here once. Block syncing is scheduler-side (sync_request_blocks
+        per step with num_computed); the worker-side sync path was dead."""
         _dbg(f"[SET RUNNER DEBUG] set_runner called, id={id(self)}, runner={type(runner)}")
-        # vLLM calls this with the model_runner (self), not the worker
         self._model_runner = runner
-        _dbg(f"[SET RUNNER DEBUG] _model_runner set to {type(self._model_runner)}, id={id(self._model_runner)}")
         if self._orchestrator is None:
             self._build_orchestrator()
-        # Try to sync blocks (will succeed when model_runner is ready)
-        self._try_sync_blocks()

@@ -595,30 +595,35 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: too many ids ({len(request_ids)}) for {num_reqs} rows")
             return
         try:
-            sparse_idx = cls._cached_sparse_idx
-            sparse_len = cls._cached_sparse_len
-
             staging_map = {}
-            patch_sparse_idx = sparse_idx
-            patch_sparse_len = sparse_len
-            if sparse_idx is not None and sparse_len is not None:
-                # Pattern-cache batch must equal the current decode row count,
-                # else the cached pattern belongs to a previous batch
-                # composition and staging it would fetch for the wrong rows.
-                # Skip ONLY the lag prefetch here; the remediation below still
-                # runs and the same-step in-run fetch covers this step's
-                # selection.
-                if sparse_idx.shape[0] != len(request_ids):
-                    _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: lag pattern batch mismatch ({sparse_idx.shape[0]} vs {len(request_ids)}); skipping prefetch only")
-                    patch_sparse_idx = None
-                    patch_sparse_len = None
-                else:
-                    # Fetch CPU blocks needed by the previous step's top-k.
-                    _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: calling prepare_staging with sparse_idx.shape={sparse_idx.shape}")
-                    staging_map = orchestrator.prepare_staging(
-                        request_ids, sparse_idx, sparse_len
-                    )
-                    _dbg(f"[PATCH DEBUG] prepare_staging returned: {staging_map}")
+            patch_sparse_idx = None
+            patch_sparse_len = None
+            # The 1-step-lag prefetch is only for methods WITHOUT a same-step
+            # in-run fetch (oracle family): they stage the previous step's
+            # picks at build time because their wrapper has no fetch of its
+            # own. PQ fetches at selection time (0-lag) inside the decode
+            # wrapper; prefetching here would only duplicate that work.
+            _method = _os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
+            if _method in ("oracle", "", "block_minmax", "sparse_optimized", "offload"):
+                sparse_idx = cls._cached_sparse_idx
+                sparse_len = cls._cached_sparse_len
+                if sparse_idx is not None and sparse_len is not None:
+                    # Pattern-cache batch must equal the current decode row
+                    # count, else the cached pattern belongs to a previous
+                    # batch composition and staging it would fetch for the
+                    # wrong rows. Skip ONLY the prefetch; the remediation
+                    # below still runs.
+                    if sparse_idx.shape[0] != len(request_ids):
+                        _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: lag pattern batch mismatch ({sparse_idx.shape[0]} vs {len(request_ids)}); skipping prefetch only")
+                    else:
+                        # Fetch CPU blocks needed by the previous step's top-k.
+                        _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: calling prepare_staging with sparse_idx.shape={sparse_idx.shape}")
+                        staging_map = orchestrator.prepare_staging(
+                            request_ids, sparse_idx, sparse_len
+                        )
+                        _dbg(f"[PATCH DEBUG] prepare_staging returned {len(staging_map)} slots")
+                        patch_sparse_idx = sparse_idx
+                        patch_sparse_len = sparse_len
 
             # Defensive alignment check: per-row page counts in the current
             # batch must equal the request's tracked block count, otherwise the
@@ -641,7 +646,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                 patch_paged_kv_indices_with_staging,
             )
             null_id = 0 if getattr(orchestrator, "true_freeing", False) else None
-            _dbg(f"[PATCH DEBUG] calling patch_paged_kv_indices_with_staging with staging_map={staging_map}")
+            _dbg(f"[PATCH DEBUG] calling patch_paged_kv_indices_with_staging with {len(staging_map)} staged slots")
             _timing.start("build.patch")
             patch_paged_kv_indices_with_staging(
                 paged_kv_indices,
@@ -705,6 +710,11 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         _seq_discont = (_cur_sl != _prev_sl + 1) & (_cur_sl != _prev_sl)
         self._sk_prev_sl[:nd] = _cur_sl
         changed = _page_changed | _seq_discont
+        if _os.environ.get("SKYLIGHT_DEBUG_SLOTS") == "1":
+            print(f"[SK SLOTS] nd={nd} cur={_cur_sl[:2].tolist()} "
+                  f"prev={_prev_sl[:2].tolist()} page_changed={_page_changed[:2].tolist()} "
+                  f"discont={_seq_discont[:2].tolist()} changed_any={bool(changed.any())}",
+                  flush=True)
         # The ONLY potential sync: detect a position whose occupant changed (needs (re)init).
         # Fires on batch-composition change; steady decode -> all False -> no host work.
         if bool(changed.any()):
@@ -930,31 +940,34 @@ class SkylightSparseImpl(FlashInferImpl):
                 sparse_idx.shape[2], dtype=torch.int32, device=sparse_idx.device,
             )
 
-            # Cache for next step (move to CPU to avoid GPU memory pressure)
-            _timing.start("build.pattern_d2h")
-            global _sparse_pattern_cache
-            _sparse_pattern_cache['sparse_idx'] = sparse_idx.detach().cpu()
-            _sparse_pattern_cache['sparse_len'] = sparse_len.detach().cpu()
-            _timing.end("build.pattern_d2h")
-            # Feed the same host-side pattern to the LRU scorer (no-op for
+            # Feed this step's selection to the LRU scorer first (no-op for
             # scorers without a note_usage hook): recency by top-k selection.
+            # Consumes the GPU tensor directly -- no D2H needed.
             orch = builder_cls._offload_orchestrator
-            if orch is not None:
-                ids = builder_cls._cached_request_ids or []
-                if ids:
-                    orch.note_selection(
-                        ids, sparse_idx, int(getattr(orch, "page_size", 16)),
-                    )
-            # Also populate the class attrs read by build()'s staging-prep +
-            # index patching path (_prepare_staging_for_sparse_attention).
-            # request_ids will be filled by worker connector from model runner.
-            builder_cls._cached_sparse_idx = _sparse_pattern_cache['sparse_idx']
-            builder_cls._cached_sparse_len = _sparse_pattern_cache['sparse_len']
+            ids = builder_cls._cached_request_ids or []
+            if orch is not None and ids:
+                orch.note_selection(
+                    ids, sparse_idx, int(getattr(orch, "page_size", 16)),
+                )
+
+            # The host-side pattern cache (D2H) only feeds the 1-step-lag
+            # prefetch used by methods WITHOUT an in-run fetch (oracle
+            # family). PQ fetches at selection time and skips the D2H.
+            _method = _os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
+            if _method in ("oracle", "", "block_minmax", "sparse_optimized", "offload"):
+                _timing.start("build.pattern_d2h")
+                global _sparse_pattern_cache
+                _sparse_pattern_cache['sparse_idx'] = sparse_idx.detach().cpu()
+                _sparse_pattern_cache['sparse_len'] = sparse_len.detach().cpu()
+                _timing.end("build.pattern_d2h")
+                # Also populate the class attrs read by the build()-time
+                # lag prefetch in _patch_indices_for_staging.
+                builder_cls._cached_sparse_idx = _sparse_pattern_cache['sparse_idx']
+                builder_cls._cached_sparse_len = _sparse_pattern_cache['sparse_len']
+            _dbg(f"[SKYLIGHT DEBUG] Cached sparse pattern: batch={batch_size}, k={sparse_idx.shape[2]}")
             builder_cls._pattern_cached_serial = getattr(
                 builder_cls, "_step_serial", -1
             )
-            _dbg(f"[SKYLIGHT DEBUG] SET _sparse_pattern_cache: sparse_idx id={id(_sparse_pattern_cache['sparse_idx'])}")
-            _dbg(f"[SKYLIGHT DEBUG] Cached sparse pattern: batch={batch_size}, k={sparse_idx.shape[2]}")
         except Exception as e:
             _dbg(f"[SKYLIGHT DEBUG] Failed to cache sparse pattern: {e}")
 

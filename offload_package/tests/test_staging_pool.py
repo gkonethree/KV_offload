@@ -153,6 +153,10 @@ class TestCopyFailureIsLeakFree:
         pool, mgr, res = _make_pool(num_slots=4)
 
         class _Boom:
+            # Production cpu_cache layer shape [S, 2, P, H, C] so the pinned
+            # slab allocation succeeds and the failure fires at the gather.
+            shape = (32, 2, 8, 2, 32)
+
             def __getitem__(self, layer):
                 return self
 
@@ -177,3 +181,129 @@ class TestCopyFailureIsLeakFree:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestEvictionProtection:
+    """protect= refs (this step's already-staged selections) must never be
+    eviction victims: their index entries are patched at their slots, and a
+    clobbered slot feeds the kernel the wrong block's bytes at weight 1."""
+
+    def test_protected_ref_survives_full_pool_fetch(self):
+        pool, mgr, res = _make_pool(num_slots=2)
+        holders = [BlockRef("r", i) for i in range(2)]
+        assert len(_offload_blocks(mgr, res, holders)) == 2
+        staged, skipped = pool.ensure_resident(holders)
+        assert not skipped and len(staged) == 2
+        protected_ref = holders[0]
+
+        # Two NEW cold blocks arrive; only the UNPROTECTED holder is
+        # evictable, so exactly one newcomer fits and the other is skipped
+        # (the caller's cue to fall back to the chunked path).
+        newcomers = [BlockRef("q", i) for i in range(2)]
+        assert len(_offload_blocks(mgr, res, newcomers)) == 2
+        staged, skipped = pool.ensure_resident(newcomers, protect=[protected_ref])
+        assert len(staged) == 1 and len(skipped) == 1
+        assert res.get(protected_ref).residency == Residency.STAGING
+        assert res.get(holders[1]).residency == Residency.CPU
+
+    def test_full_protection_skips_instead_of_evicting(self):
+        """When every resident is protected and the pool is full, the fetch
+        must skip (caller falls back to chunked) rather than clobber a
+        protected slot."""
+        pool, mgr, res = _make_pool(num_slots=2)
+        holders = [BlockRef("r", i) for i in range(2)]
+        assert len(_offload_blocks(mgr, res, holders)) == 2
+        staged, skipped = pool.ensure_resident(holders)
+        assert not skipped and len(staged) == 2
+
+        newcomer = BlockRef("q", 0)
+        assert _offload_blocks(mgr, res, [newcomer]) == [newcomer]
+        staged, skipped = pool.ensure_resident(
+            [newcomer], protect=list(holders)
+        )
+        assert skipped == [newcomer]
+        for ref in holders:  # both protected slots intact
+            assert res.get(ref).residency == Residency.STAGING
+
+    def test_no_protect_still_evicts(self):
+        """Backward compatibility: without protect, eviction behaves as
+        before (lowest-scored resident goes)."""
+        pool, mgr, res = _make_pool(num_slots=2)
+        holders = [BlockRef("r", i) for i in range(2)]
+        assert len(_offload_blocks(mgr, res, holders)) == 2
+        staged, _ = pool.ensure_resident(holders)
+
+        newcomer = BlockRef("q", 0)
+        assert _offload_blocks(mgr, res, [newcomer]) == [newcomer]
+        staged, skipped = pool.ensure_resident([newcomer])
+        assert not skipped
+        # one of the holders was evicted back to CPU
+        assert sorted(
+            str(res.get(h).residency) for h in holders
+        ) == ["Residency.CPU", "Residency.STAGING"]
+
+
+class TestEvictionScorerSplit:
+    """staging_eviction is independent of the offload scorer: eviction
+    quality must follow recency (the pool's own LRUScorer), while the
+    offload scorer keeps its own semantics for which blocks get moved."""
+
+    def test_pool_eviction_scorer_independent_of_offload(self):
+        from offload_package.scoring.lru_scorer import LRUScorer
+
+        pool, mgr, res = _make_pool(num_slots=2)
+        eviction = LRUScorer()
+        pool._eviction_scorer = eviction  # simulate the split wiring
+
+        holders = [BlockRef("r", i) for i in range(2)]
+        assert len(_offload_blocks(mgr, res, holders)) == 2
+        staged, skipped = pool.ensure_resident(holders)
+        assert not skipped and len(staged) == 2
+
+        # Recency: holders[0] used recently, holders[1] long ago.
+        eviction.note_usage("r", [0])
+
+        newcomer = BlockRef("q", 0)
+        assert _offload_blocks(mgr, res, [newcomer]) == [newcomer]
+        staged, skipped = pool.ensure_resident([newcomer], protect=[])
+        assert not skipped
+        # Eviction followed the POOL's recency: holders[1] (stale) evicted,
+        # holders[0] (recent) kept -- even though the offload scorer's
+        # paged scores would have ranked them however their norms rank.
+        assert res.get(holders[0]).residency == Residency.STAGING
+        assert res.get(holders[1]).residency == Residency.CPU
+
+    def test_default_eviction_inherits_offload_scorer(self):
+        pool, mgr, res = _make_pool(num_slots=2)
+        assert pool._eviction_scorer is mgr.scorer
+
+    def test_split_wiring_via_build_orchestrator(self):
+        """build_orchestrator(staging_eviction='lru') gives the pool its own
+        LRUScorer while scorer_type='paged_eviction' keeps the offload
+        scorer as PagedEvictionScorer."""
+        from types import SimpleNamespace
+        import torch
+        from offload_package.shared.types import (
+            OrchestratorConfig, build_orchestrator,
+        )
+        from offload_package.scoring.paged_eviction import PagedEvictionScorer
+        from offload_package.scoring.lru_scorer import LRUScorer
+
+        L, P, H, C = 2, 8, 2, 32
+        combined = torch.randn(16, H, P, 2 * C, dtype=torch.float16, device="cuda")
+        kv_cache_view = SimpleNamespace(
+            k_caches=[combined], v_caches=[combined],
+            block_size=P, num_kv_heads=H, head_dim=C, kv_layout="HND",
+            staging_base_page=8, num_layers=1, dtype=torch.float16,
+            device=combined.device,
+        )
+        cfg = OrchestratorConfig(
+            offload_fraction=0.5, num_cpu_slots=32, num_staging_slots=4,
+            W=16, page_size=P, dtype=torch.float16,
+            device=combined.device, gpu_budget_blocks=4,
+            scorer_type="paged_eviction", staging_eviction="lru",
+        )
+        orch = build_orchestrator(cfg, kv_cache_view=kv_cache_view)
+        assert isinstance(orch.offload_manager.scorer, PagedEvictionScorer)
+        assert isinstance(orch.staging_pool._eviction_scorer, LRUScorer)
+        assert orch.staging_pool._eviction_scorer is not orch.offload_manager.scorer

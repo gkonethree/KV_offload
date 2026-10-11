@@ -7,12 +7,9 @@ lazy exports, importing ``offload_package.integration`` never touches vLLM.
 """
 
 from .manager import OffloadOrchestrator  # lightweight: no vllm imports
-from .vllm_bridge import initialize_for_runner, prepare_sparse_pages
 
 __all__ = [
     "OffloadOrchestrator",
-    "initialize_for_runner",
-    "prepare_sparse_pages",
     "OffloadPackageConnector",
     "OffloadPackageScheduler",
     "OffloadPackageWorker",

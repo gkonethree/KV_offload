@@ -41,10 +41,51 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _auto_staging_slots_for(vllm_config, kv_cache_config) -> int:
-    """Auto-size staging: cover the hot sparse-selected set per request, times
-    the steady-state max batch, plus margin, clamped to a fraction of the KV
-    pool (never crashes on small pools)."""
+_PQ_METHODS = ("pq", "pq_optimized", "pqrs", "pqrs_optimized", "pqis", "pqis_optimized")
+
+
+def _union_selector_count(vllm_config, kv_cache_config, share: bool) -> int:
+    """Number of independently-selecting heads (G_eff) for staging sizing.
+
+    The fetch path stages the UNION of every scoring head's selection, so the
+    pool must cover the union, not one head's picks: a mid-range block is
+    picked by >=1 of G_eff selectors each choosing a topk fraction ->
+    covered fraction 1-(1-topk)^G_eff. With GQA-share the selectors are the
+    TP-local kv-heads (H_kv); without, every q-head picks independently
+    (H_q). H_kv comes from the AttentionSpec (already TP-local); H_q from
+    hf_config (divided by TP), falling back to H_kv + a warning when the
+    model config does not expose attention-head counts.
+    """
+    spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    h_kv = int(getattr(spec, "num_kv_heads", 0) or 0)
+    if share:
+        return max(h_kv, 1)
+    h_q = 0
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    if hf_config is not None:
+        h_q = int(getattr(hf_config, "num_attention_heads", 0) or 0)
+        tp = int(getattr(
+            getattr(vllm_config, "parallel_config", None),
+            "tensor_parallel_size", 1) or 1)
+        h_q = max(h_q // tp, 0)
+    if h_q <= 0:
+        logger.warning(
+            "staging sizing: q-head count unavailable; falling back to "
+            "H_kv=%d (underestimates the union without GQA-share)", h_kv,
+        )
+        return max(h_kv, 1)
+    return h_q
+
+
+def _auto_staging_slots_for(vllm_config, kv_cache_config, extra_config=None) -> int:
+    """Auto-size staging: cover the UNION of all scoring heads' selections per
+    request, times the steady-state max batch, plus margin, clamped to a
+    fraction of the KV pool (never crashes on small pools).
+
+    Knobs come from kv_connector_extra_config first (staging_safety_margin,
+    staging_max_pool_frac), then the OFFLOAD_PACKAGE_* env vars.
+    """
+    extra_config = dict(extra_config or {})
     topk = float(_os.getenv("SKYLIGHT_SPARSE_TOPK", "0.1"))
     sink = int(_os.getenv("SKYLIGHT_SPARSE_SINK", "0"))
     local = int(_os.getenv("SKYLIGHT_SPARSE_LOCAL", "0"))
@@ -52,17 +93,32 @@ def _auto_staging_slots_for(vllm_config, kv_cache_config) -> int:
     max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     page_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
     mid = max(0, max_len - sink - local)
-    pages_per_req = (sink + local) // page_size + int(topk * mid / page_size + 0.999)
-    safety = float(_os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10"))
-    frac = float(_os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25"))
+
+    method = _os.getenv("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
+    share = (
+        method in _PQ_METHODS
+        and _os.getenv("SKYLIGHT_PQ_GQA_SHARE", "0") == "1"
+    )
+    g_eff = _union_selector_count(vllm_config, kv_cache_config, share)
+    union_factor = 1.0 - (1.0 - min(topk, 1.0)) ** g_eff
+    pages_per_req = ((sink + local) // page_size
+                     + int(union_factor * mid / page_size + 0.999))
+    safety = float(extra_config.get(
+        "staging_safety_margin",
+        _os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")))
+    frac = float(extra_config.get(
+        "staging_max_pool_frac",
+        _os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")))
     num_blocks = int(kv_cache_config.num_blocks)
     est = int(max_seqs * pages_per_req * safety)
     cap = max(1, int(num_blocks * frac))
     result = max(64, min(est, cap))
     logger.info(
         "OffloadPackageConnector: auto staging policy -> %d slots "
-        "(est=%d, cap=%d, max_len=%d, max_seqs=%d, topk=%.4f, sink=%d, local=%d)",
-        result, est, cap, max_len, max_seqs, topk, sink, local,
+        "(est=%d, cap=%d, max_len=%d, max_seqs=%d, topk=%.4f, G_eff=%d, "
+        "share=%s, union=%.3f, sink=%d, local=%d)",
+        result, est, cap, max_len, max_seqs, topk, g_eff, share,
+        union_factor, sink, local,
     )
     return result
 
@@ -87,7 +143,9 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             _os.getenv("OFFLOAD_PACKAGE_STAGING_POLICY", "fixed"),
         )
         if policy == "auto":
-            num_staging_slots = _auto_staging_slots_for(vllm_config, kv_cache_config)
+            num_staging_slots = _auto_staging_slots_for(
+                vllm_config, kv_cache_config, extra_config,
+            )
 
         self.offload_config = OffloadConfig(
             enabled=enabled,
@@ -102,10 +160,6 @@ class OffloadPackageConnector(KVConnectorBase_V1):
                 _os.getenv("OFFLOAD_PACKAGE_TRUE_FREE", "1").lower()
                 in {"1", "true", "yes", "on"},
             ),
-            promote_per_step=int(extra_config.get(
-                "promote_per_step",
-                _os.getenv("OFFLOAD_PACKAGE_PROMOTE_PER_STEP", "4"),
-            )),
             staging_policy=policy,
             staging_max_pool_frac=float(extra_config.get(
                 "staging_max_pool_frac",
@@ -116,6 +170,9 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             scorer_type=extra_config.get(
                 "scorer_type",
                 _os.getenv("OFFLOAD_PACKAGE_SCORER_TYPE", "paged_eviction")),
+            staging_eviction=extra_config.get(
+                "staging_eviction",
+                _os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru")),
         )
         
         self.kv_cache_config = kv_cache_config

@@ -32,7 +32,6 @@ from offload_package.config import OffloadConfig
 from offload_package.debug import dbg as _dbg
 from offload_package.controller import KVCompressionController
 from offload_package.integration.manager import OffloadOrchestrator
-from offload_package.integration.vllm_bridge import initialize_for_runner
 from offload_package.offload.manager import KVOffloadManager
 from offload_package.selection.adapter import (
     collect_needed_block_refs,
@@ -234,17 +233,7 @@ class OffloadPackageScheduler:
                 "(%d allocatable blocks remain)",
                 reserved[0], reserved[-1], gpu_block_pool.get_num_free_blocks(),
             )
-        
-    def initialize_orchestrator(self, runner) -> None:
-        """Called from worker after KV caches initialized to set up orchestrator."""
-        self._orchestrator = initialize_for_runner(
-            runner,
-            normal_gpu_pages=self.kv_cache_config.num_blocks - self.offload_config.num_staging_slots,
-            block_size=self._get_page_size(self.kv_cache_config),
-            offload_config=self.offload_config,
-        )
-        logger.info("OffloadPackageScheduler: Orchestrator initialized")
-        
+
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
         """Build metadata for this step's offload/staging operations."""
         try:
@@ -336,25 +325,6 @@ class OffloadPackageScheduler:
             metadata.request_ids = active_req_ids
             _dbg(f"[SCHEDULER DEBUG] Set metadata.request_ids = {active_req_ids}")
 
-        # 4b. Promotion watch (R2): pre-stage the highest-scored CPU-resident
-        # blocks of active decode requests so cold pages remain selectable.
-        # Without this, an offloaded page's null-remapped indices entry scores
-        # ~0 in the oracle pass and can never re-enter the top-k. Promotion
-        # runs at schedule time so this step's forward already sees them.
-        if (
-            self._true_free_enabled
-            and self.offload_config.promote_per_step > 0
-            and active_req_ids
-            and self._orchestrator is not None
-            and self._orchestrator.residency.num_cpu_blocks > 0
-        ):
-            _timing.start("sched.promote")
-            for rid in active_req_ids:
-                self._orchestrator.promote_hot_cpu_blocks(
-                    rid, self.offload_config.promote_per_step
-                )
-            _timing.end("sched.promote")
-
         # 5. Flush ALL of this step's offload triggers into a single store
         # event so the worker (and the completion free) sees every batch.
         if self._step_store_acc:
@@ -383,7 +353,7 @@ class OffloadPackageScheduler:
                  f"{len(gpu_ids)} gpu blocks, {len(cpu_ids)} cpu blocks, "
                  f"reqs={metadata.store_event_to_reqs[event_idx]}")
 
-        _dbg(f"[SCHEDULER DEBUG] build_connector_meta returning: load_event={metadata.load_event}, store_event={metadata.store_event}, store_gpu_blocks={metadata.store_gpu_blocks}")
+        _dbg(f"[SCHEDULER DEBUG] build_connector_meta returning: load_event={metadata.load_event}, store_event={metadata.store_event}, n_store_gpu_blocks={len(metadata.store_gpu_blocks)}")
         _timing.step()
         return metadata
         

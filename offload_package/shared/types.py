@@ -30,6 +30,7 @@ class OrchestratorConfig:
     scorer_decay: float = 1.0
     scorer_head_reduction: str = "mean"
     scorer_type: str = "paged_eviction"  # "paged_eviction" or "random"
+    staging_eviction: str = "lru"  # "scorer", "lru" or "random"
 
 
 def build_orchestrator(
@@ -102,6 +103,17 @@ def build_orchestrator(
         gpu_budget_blocks=cfg.gpu_budget_blocks,
         kv_layout=kv_cache_view.kv_layout,
     )
+    # Staging eviction is an INDEPENDENT knob from the offload scorer:
+    # eviction quality decides re-fetch volume under pool pressure (recency
+    # is the measured winner), while scorer_type decides which blocks get
+    # offloaded at all. "scorer" keeps the legacy shared-scorer behavior.
+    if cfg.staging_eviction == "lru":
+        from offload_package.scoring.lru_scorer import LRUScorer
+        eviction_scorer = LRUScorer()
+    elif cfg.staging_eviction == "random":
+        eviction_scorer = RandomScorer()
+    else:
+        eviction_scorer = scorer  # inherit the offload scorer
     staging_pool = KVStagingPool(
         num_slots=cfg.num_staging_slots,
         staging_base_page=staging_base,
@@ -110,6 +122,7 @@ def build_orchestrator(
         cpu_cache=cpu_cache,
         residency=residency,
         offload_manager=offload_manager,
+        eviction_scorer=eviction_scorer,
     )
     controller = KVCompressionController(cfg.W, cfg.page_size)
     return OffloadOrchestrator(

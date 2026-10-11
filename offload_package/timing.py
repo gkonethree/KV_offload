@@ -10,25 +10,26 @@ once at exit):
   sched.*        scheduler-side, per engine step:
                    score        re-scoring pass of offload candidates
                    offload      eviction pick + GPU->CPU copy (D2H + sync)
-                   promote      promotion watch staging
                    surgery      store-completion processing (true freeing)
-  lag.*          build-time 1-step-lag prefetch:
-                   collect      needed-block discovery (incl. host sync)
-                   stage        ensure_resident staging call
   build.*        worker-side, per step / per layer:
                    patch        index remediation + staging re-point
-                   pattern_d2h  sparse-pattern D2H cache (per layer)
+                   pattern_d2h  sparse-pattern D2H cache (oracle family only)
+  pq.*           PQ codebook machinery (once per layer per process):
+                   fit          k-means++ + Lloyd fit (one-time init cost)
   wrap.*         decode wrapper, per layer:
                    discover     cold-ref discovery (incl. indptr host sync)
                    fetch        staging fetch + index patch
+                   patch        pos/val build + index_copy_ inside fetch
                    decode       sparse decode kernel passes
   lru.*           LRU scorer signal:
                    note         per-step top-k selection -> recency ticks
-  pool.*         ensure_resident phase 2 (per layer during fetch):
+  pool.*         ensure_resident:
+                   alloc        phase-1 slot allocation + eviction scoring
+                   (phase-2 sub-stages below, per layer during fetch):
                    cpu_gather   pinned-cache slot gather on CPU
                    transform    permute/cat layout transform on CPU
                    h2d          H2D copy launch (pageable today -> sync here)
-                   h2d_sync     stream wait + event synchronize
+                   h2d_sync   deferred ring-buffer event sync
 """
 from __future__ import annotations
 

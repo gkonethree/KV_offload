@@ -40,6 +40,7 @@ class KVStagingPool:
         cpu_cache: torch.Tensor,
         residency: ResidencyTable,
         offload_manager: KVOffloadManager,
+        eviction_scorer=None,
     ) -> None:
         if num_slots <= 0:
             raise ValueError("num_slots must be > 0")
@@ -57,7 +58,25 @@ class KVStagingPool:
         self.cpu_cache = cpu_cache
         self.residency = residency
         self.offload_manager = offload_manager
+        # Eviction policy is independent of the offload scorer: which staged
+        # block to drop under pool pressure decides re-fetch volume, while
+        # the offload scorer decides which blocks get offloaded at all.
+        # Default: inherit the offload scorer (legacy behavior, and what the
+        # unit tests that assert score-aware eviction rely on).
+        self._eviction_scorer = eviction_scorer or offload_manager.scorer
         self._copy_stream: torch.cuda.Stream | None = None
+        # Ring of pinned staging slabs [layers, num_slots, H, P, 2C]:
+        # per-layer H2Ds are issued from PINNED slices (pageable sources
+        # stall each copy, ~2.4ms/16KB measured at 16k), and the ring lets a
+        # batch return WITHOUT syncing its own copies -- the next-but-one
+        # batch syncs this buffer's event, by which time the transfers have
+        # overlapped with a full batch of CPU work. Measured: the per-batch
+        # host event sync was 68% of fetch time.
+        self._pinned_slabs: list[torch.Tensor] = []
+        self._slab_events: list[object | None] = []
+        self._slab_pending: list[list[torch.Tensor]] = []
+        self._slab_turn = 0
+        self._SLAB_RING = 2
         self._lru: OrderedDict[BlockRef, int] = OrderedDict()
         self._free = list(range(num_slots - 1, -1, -1))
 
@@ -68,16 +87,73 @@ class KVStagingPool:
             self._copy_stream = torch.cuda.Stream(device=self.gpu_k_caches[0].device)
         return self._copy_stream
 
-    def ensure_resident(self, refs: Sequence[BlockRef]) -> tuple[dict[BlockRef, int], list[BlockRef]]:
+    def _acquire_slab(self, n: int) -> torch.Tensor:
+        """Next pinned slab from the ring, deferring the host sync.
+
+        Allocates the ring lazily from the GPU cache layout (the one layout
+        every post-transform consumer uses: [layers, num_slots, H, P, 2C]).
+        Before handing out buffer i, syncs the event recorded on it RING
+        batches ago -- by then its transfers have overlapped with a full
+        batch of CPU work, so the wait is ~free instead of the 22 ms/batch
+        measured for syncing THIS batch's copies under load. Returns the
+        buffer and stashes the index on ``self._slab_cur`` for the launch
+        side, which records a fresh event per batch.
+        """
+        if not self._pinned_slabs:
+            src = self.gpu_k_caches[0]      # [num_blocks, H, P, 2C]
+            H, P, C2 = int(src.shape[1]), int(src.shape[2]), int(src.shape[3])
+            layers = len(self.gpu_k_caches)
+            for _ in range(self._SLAB_RING):
+                self._pinned_slabs.append(torch.empty(
+                    (layers, self.num_slots, H, P, C2),
+                    dtype=src.dtype, device="cpu", pin_memory=True,
+                ))
+                self._slab_events.append(None)
+                self._slab_pending.append([])
+        assert n <= self.num_slots
+        idx = self._slab_turn
+        self._slab_turn = (self._slab_turn + 1) % len(self._pinned_slabs)
+        self._slab_cur = idx
+        ev = self._slab_events[idx]
+        if ev is not None:
+            _timing.start("pool.h2d_sync")
+            ev.synchronize()
+            _timing.end("pool.h2d_sync")
+            self._slab_events[idx] = None
+            self._slab_pending[idx].clear()
+        return self._pinned_slabs[idx]
+
+    def _reset_slab_ring(self) -> None:
+        """Drain all in-flight slab transfers and clear ring state (error path)."""
+        if self._pinned_slabs:
+            self.copy_stream.synchronize()
+        self._slab_events = [None] * len(self._pinned_slabs)
+        for pending in self._slab_pending:
+            pending.clear()
+
+    def ensure_resident(
+        self,
+        refs: Sequence[BlockRef],
+        protect: Sequence[BlockRef] | None = None,
+    ) -> tuple[dict[BlockRef, int], list[BlockRef]]:
         """Stage `refs` into GPU staging pages.
+
+        ``protect`` lists refs that are ALREADY staged and needed by the
+        caller's current gather (this step's selection). They are never
+        eviction victims: the caller's patched indices point at their slots
+        and clobbering one would feed the kernel the wrong block's bytes at
+        a weight-1 position. When protection leaves no evictable candidate,
+        refs are skipped (reported in `skipped`) and the caller falls back
+        to the chunked path.
 
         Returns ``(staged, skipped)``: `staged` maps every ref that is
         GPU- or staging-resident afterwards to its staging slot; `skipped`
-        lists refs that could not be allocated (staging exhausted with no
-        evictable candidate). Callers must treat a non-empty `skipped` as a
-        partial failure: with true freeing the un-staged refs' index entries
-        point at null pages that the kernel reads with weight 1.
+        lists refs that could not be allocated. Callers must treat a
+        non-empty `skipped` as a partial failure: with true freeing the
+        un-staged refs' index entries point at null pages that the kernel
+        reads with weight 1.
         """
+        protect_set = set(protect) if protect else frozenset()
         result: dict[BlockRef, int] = {}
         to_fetch: list[tuple[BlockRef, int]] = []
         for ref in dict.fromkeys(refs):
@@ -107,44 +183,97 @@ class KVStagingPool:
         # failing the request.
         allocs: list[tuple[BlockRef, int, int]] = []
         skipped: list[BlockRef] = []
-        protected: set[int] = set()
+        _timing.start("pool.alloc")
+        # Eviction order computed AT MOST ONCE per call: score all evictable
+        # candidates once, argsort ascending, pop victims in order as slots
+        # are needed. The per-call protect set is fixed, and blocks staged by
+        # THIS batch are not in the occupancy LRU until phase 3 publishes
+        # them, so the once-computed order is valid for every allocation in
+        # the batch. (The old per-slot _allocate_slot rescanned the full LRU
+        # and rebuilt the score tensor per allocated slot: 4.3 ms/batch
+        # measured at 16k.)
+        victims: list[BlockRef] = []
+        victim_pos = 0
+        victims_built = False
         for ref, cpu_slot in to_fetch:
-            try:
-                slot = self._allocate_slot(ref, exclude=protected)
-            except RuntimeError as exc:
-                try:
-                    from offload_package.debug import dbg as _dbg_pool
-                    _dbg_pool(f"[POOL DEBUG] skip {ref}: {exc}")
-                except Exception:
-                    pass
+            slot = None
+            if self._free:
+                slot = self._free.pop()
+            else:
+                if not victims_built:
+                    victims_built = True
+                    candidates: list[BlockRef] = []
+                    desynced: list[BlockRef] = []
+                    for r, _sl in self._lru.items():
+                        if r in protect_set:
+                            continue
+                        loc = self.residency.get(r)
+                        if loc is not None and loc.residency == Residency.STAGING:
+                            candidates.append(r)
+                        else:
+                            desynced.append(r)
+                    if desynced and not _DESYNC_WARNED:
+                        _DESYNC_WARNED["done"] = True
+                        logger.warning(
+                            "KVStagingPool: %d occupancy-LRU entries have non-STAGING "
+                            "residency (desync); they are ignored as eviction "
+                            "candidates. First offenders: %s",
+                            len(desynced), desynced[:3],
+                        )
+                    if candidates:
+                        order = torch.argsort(
+                            self._eviction_scorer.scores(candidates))
+                        victims = [candidates[i] for i in order.tolist()]
+                        victim_pos = 0
+                while victim_pos < len(victims):
+                    evicted = victims[victim_pos]
+                    victim_pos += 1
+                    old = self.residency.get(evicted)
+                    if old is None or old.cpu_slot is None:
+                        continue  # desynced away between build and use
+                    self.residency.mark_cpu(evicted, old.cpu_slot)
+                    slot = self._lru.pop(evicted)
+                    break
+            if slot is None:
                 skipped.append(ref)
                 continue
-            protected.add(slot)
             allocs.append((ref, cpu_slot, slot))
+        _timing.end("pool.alloc")
 
-        # Phase 2: batched copies — per layer, ONE gather on CPU, one H2D
-        # index_copy_ into the staging pages. Same bytes as before, ~L launches
-        # per batch instead of L per block.
+        # Phase 2: ONE gather over all layers + ONE uniform layout transform.
+        # cpu_cache is a single [L, S, 2, P, H, C] tensor, so index_select
+        # on the slot axis fetches every layer's slots in a single dispatch.
+        # The transform [2, P, H, C] -> [H, P, 2C] is one permute+reshape for
+        # the whole batch (K in [..., :C], V in [..., C:2C] — byte-identical
+        # to the old per-layer cat, verified by the staging roundtrip tests),
+        # then one host memcpy into the pinned ring buffer. Replaces ~88 tiny
+        # per-layer CPU dispatches with ~4.
+        if not allocs:
+            return result, skipped
         device = self.gpu_k_caches[0].device
         cpu_slots_t = torch.tensor(
             [cs for _, cs, _ in allocs], dtype=torch.long
         )
+        n = len(allocs)
         dbg = None
         try:
             from offload_package.debug import dbg as _dbg_fetch
             dbg = _dbg_fetch
         except Exception:
             pass
-        # Host and device temporaries must outlive the async H2D copy issued on
-        # copy_stream; dropping them early lets the caching allocator recycle
-        # staging tensors mid-write. `base_ids` must also be created inside the
-        # copy_stream context: it is consumed by kernels on copy_stream, and a
-        # default-stream allocation would be recycled by the default-stream
-        # allocator while the copy-stream index_copy_ is still reading it
-        # (cross-stream UAF -> device-side "index out of bounds" assert).
         gpu_slabs: list[torch.Tensor] = []
-        host_slabs: list[torch.Tensor] = []
+        slab = self._acquire_slab(n)
         try:
+            _timing.start("pool.cpu_gather")
+            gathered = self.cpu_cache.index_select(1, cpu_slots_t)  # [L, n, 2, P, H, C]
+            _timing.end("pool.cpu_gather")
+            _timing.start("pool.transform")
+            combined = (
+                gathered.permute(0, 1, 4, 3, 2, 5)          # [L, n, H, P, 2, C]
+                .reshape(*gathered.shape[:2], *slab.shape[2:])  # [L, n, H, P, 2C]
+            )
+            slab[:, :n].copy_(combined)
+            _timing.end("pool.transform")
             with torch.cuda.stream(self.copy_stream):
                 base_ids = (
                     torch.tensor([s for _, _, s in allocs], dtype=torch.long, device=device)
@@ -153,41 +282,36 @@ class KVStagingPool:
                 for layer, (k_cache, _v_cache) in enumerate(
                     zip(self.gpu_k_caches, self.gpu_v_caches)
                 ):
-                    # cpu_cache layer: [S, 2, P, H, C] -> gather slots -> split KV ->
-                    # transpose to [n, H, P, C] each -> cat -> [n, H, P, 2C]
-                    _timing.start("pool.cpu_gather")
-                    g = self.cpu_cache[layer].index_select(0, cpu_slots_t)
-                    _timing.end("pool.cpu_gather")
-                    _timing.start("pool.transform")
-                    k = g[:, 0].permute(0, 2, 1, 3)
-                    v = g[:, 1].permute(0, 2, 1, 3)
-                    combined = torch.cat([k, v], dim=-1).contiguous()
-                    _timing.end("pool.transform")
                     _timing.start("pool.h2d")
-                    combined_gpu = combined.to(device, non_blocking=True)
+                    combined_gpu = slab[layer, :n].to(device, non_blocking=True)
                     k_cache.index_copy_(0, base_ids, combined_gpu)
                     _timing.end("pool.h2d")
-                    host_slabs.append(combined)
                     gpu_slabs.append(combined_gpu)
                 event = torch.cuda.Event()
                 event.record(self.copy_stream)
-            # One ordering point for the batch: attention reads staged pages only
-            # after this. The temporaries above are now safe to drop.
-            _timing.start("pool.h2d_sync")
+            # GPU ordering point ONLY: the default stream (decode) must observe
+            # these copies. wait_stream is a stream dependency, not a host
+            # block -- the CPU returns immediately and phase 3 publishes the
+            # slots while the transfers are still in flight; the pinned slab
+            # is ring-buffered, so its reuse syncs this event two batches
+            # later. Eviction of an in-flight-staged block is safe for the
+            # same reason: the overwrite lands in the OTHER ring buffer.
             torch.cuda.current_stream(device=device).wait_stream(self.copy_stream)
-            event.synchronize()
-            _timing.end("pool.h2d_sync")
+            self._slab_events[self._slab_cur] = event
+            self._slab_pending[self._slab_cur].extend(gpu_slabs)
         except Exception:
             # Copies failed: hand the reserved slots back so nothing leaks, and
             # leave the occupancy LRU untouched (entries are only inserted on
-            # success below). Re-raise: a failed fetch must not be silent.
+            # success below). Drain the copy stream so no slab buffer is left
+            # with a phantom in-flight event. Re-raise: a failed fetch must
+            # not be silent.
+            self._reset_slab_ring()
             for _, _, slot in allocs:
                 self._free.append(slot)
             raise
-        del host_slabs, gpu_slabs
         if dbg is not None:
-            dbg(f"[POOL DEBUG] ensure_resident staged {len(allocs)} blocks "
-                f"(slots={[s for _, _, s in allocs]}), skipped {len(skipped)}")
+            dbg(f"[POOL DEBUG] ensure_resident staged {len(allocs)} blocks, "
+                f"skipped {len(skipped)}")
         # Phase 3: publish occupancy only now that the copies succeeded.
         for ref, _cs, slot in allocs:
             self._lru[ref] = slot
@@ -195,14 +319,20 @@ class KVStagingPool:
             result[ref] = slot
         return result, skipped
 
-    def _allocate_slot(self, incoming: BlockRef, exclude: set[int] | None = None) -> int:
+    def _allocate_slot(
+        self,
+        incoming: BlockRef,
+        exclude: set[int] | None = None,
+        protect: set[BlockRef] | frozenset = frozenset(),
+    ) -> int:
         """Reserve a staging slot; the caller publishes it into the LRU only
         after the copy succeeds. Score-aware eviction when full: always evicts
-        the lowest-scored STAGING-resident entry. `_lru` entries whose
-        residency is not STAGING are desync artifacts -- they are never used as
-        eviction victims (evicting one would flip a live GPU block to "CPU"
-        with a stale cpu_slot) and are reported once. Raises when nothing is
-        left."""
+        the lowest-scored STAGING-resident entry that is NOT in `protect`
+        (protected refs are in the caller's current gather; their slots must
+        survive this batch). `_lru` entries whose residency is not STAGING are
+        desync artifacts -- they are never used as eviction victims (evicting
+        one would flip a live GPU block to "CPU" with a stale cpu_slot) and
+        are reported once. Raises when nothing is left."""
         if self._free:
             slot = self._free.pop()
         else:
@@ -210,6 +340,8 @@ class KVStagingPool:
             desynced = []
             for ref, sl in self._lru.items():
                 if exclude is not None and sl in exclude:
+                    continue
+                if ref in protect:
                     continue
                 loc = self.residency.get(ref)
                 if loc is not None and loc.residency == Residency.STAGING:
@@ -226,7 +358,7 @@ class KVStagingPool:
                 )
             if not lru_candidates:
                 raise RuntimeError("No staging slots available and no candidates to evict")
-            scores = self.offload_manager.scorer.scores(lru_candidates)
+            scores = self._eviction_scorer.scores(lru_candidates)
             evict_idx = int(torch.argmin(scores).item())
             evicted = lru_candidates[evict_idx]
             old = self.residency.get(evicted)

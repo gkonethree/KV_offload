@@ -224,17 +224,12 @@ class OffloadOrchestrator:
             request_ids, sparse_idx, sparse_len, self.page_size
         )
         _timing.end("lag.collect")
-        _dbg(f"[ORCHESTRATOR DEBUG] needed blocks: {[(ref.request_id, ref.block_idx) for ref in needed]}")
         cpu_needed = [
             ref for ref in needed
             if (loc := self.residency.get(ref)) is not None
             and loc.residency == Residency.CPU
         ]
-        _dbg(f"[ORCHESTRATOR DEBUG] cpu_needed: {[(ref.request_id, ref.block_idx) for ref in cpu_needed]}")
-        for ref in needed:
-            loc = self.residency.get(ref)
-            if loc:
-                _dbg(f"[ORCHESTRATOR DEBUG]   Block {ref}: residency={loc.residency.name}, gpu_block={loc.gpu_block_id}, cpu_slot={loc.cpu_slot}, staging_slot={loc.staging_slot}")
+        _dbg(f"[ORCHESTRATOR DEBUG] needed {len(needed)} blocks, cpu_needed {len(cpu_needed)}")
         _timing.start("lag.stage")
         result, skipped = self.staging_pool.ensure_resident(cpu_needed)
         _timing.end("lag.stage")
@@ -246,7 +241,7 @@ class OffloadOrchestrator:
                 "remains responsible for them",
                 len(skipped), len(cpu_needed),
             )
-        _dbg(f"[ORCHESTRATOR DEBUG] ensure_resident result: {result}")
+        _dbg(f"[ORCHESTRATOR DEBUG] ensure_resident staged {len(result)} slots")
         return result
 
     def note_selection(
@@ -263,8 +258,22 @@ class OffloadOrchestrator:
         back, so this adds no meaningful sync cost. Scorers without a
         ``note_usage`` hook (paged_eviction, random) make this a no-op.
         """
-        note = getattr(self.offload_manager.scorer, "note_usage", None)
-        if not callable(note):
+        # Feed EVERY scorer that consumes recency: the offload scorer (when
+        # scorer_type=lru) AND the staging pool's independent eviction scorer
+        # (when staging_eviction=lru). Identity-guarded: when they are the
+        # same object (legacy "scorer" inheritance) tick it only once.
+        scorers = []
+        offload_scorer = self.offload_manager.scorer
+        evict_scorer = getattr(self.staging_pool, "_eviction_scorer", None)
+        if callable(getattr(offload_scorer, "note_usage", None)):
+            scorers.append(offload_scorer)
+        if (
+            evict_scorer is not None
+            and evict_scorer is not offload_scorer
+            and callable(getattr(evict_scorer, "note_usage", None))
+        ):
+            scorers.append(evict_scorer)
+        if not scorers:
             return
         if sparse_idx.numel() == 0 or page_size <= 0:
             return
@@ -273,7 +282,10 @@ class OffloadOrchestrator:
         _timing.start("lru.note")
         blocks_all = torch.div(sparse_idx, page_size, rounding_mode="floor")
         for b in range(sparse_idx.shape[0]):
-            note(str(request_ids[b]), blocks_all[b].unique().tolist())
+            rid = str(request_ids[b])
+            blocks = blocks_all[b].unique().tolist()
+            for scorer in scorers:
+                scorer.note_usage(rid, blocks)
         _timing.end("lru.note")
 
     def patch_paged_kv_indices(
@@ -296,47 +308,6 @@ class OffloadOrchestrator:
             self.residency,
             staging_map,
         )
-
-    def promote_hot_cpu_blocks(
-        self, request_id: str, max_count: int = 4
-    ) -> dict[BlockRef, int]:
-        """Pre-stage the highest-scored CPU-resident blocks of a request (R2).
-
-        The oracle sparse scorer cannot see CPU-resident blocks (their paged
-        indices are null-remapped), so a cold page becomes selectable again
-        only by being staged BEFORE the score pass; capture that page and the
-        stage it lands in. Ranking reuses the offload scorer (highest score =
-        most important — the same signal that picks eviction victims, so a
-        promoted block was by definition retained as long as possible under
-        memory pressure). Staging-pool overflow evicts the lowest-scored
-        staging resident back to CPU, never silently.
-
-        Returns the {BlockRef: staging_slot} map actually staged.
-        """
-        if max_count <= 0 or not self._sparse_mode:
-            return {}
-        refs = [
-            ref
-            for ref in self.residency.refs_for_request(str(request_id))
-            if (loc := self.residency.get(ref)) is not None
-            and loc.residency == Residency.CPU
-        ]
-        if not refs:
-            return {}
-        scores = self.offload_manager.scorer.scores(refs)
-        order = torch.argsort(scores, descending=True)
-        picked = [refs[i] for i in order[:max_count].tolist()]
-        staged, skipped = self.staging_pool.ensure_resident(picked)
-        if skipped:
-            logger.warning(
-                "promote_hot_cpu_blocks: %d/%d candidates could not be staged "
-                "(staging exhausted)", len(skipped), len(picked),
-            )
-        _dbg(
-            f"[ORCH PROMOTE] req={request_id}: promoted {len(staged)}/{len(refs)} "
-            f"cold blocks (cpu_blocks={self.residency.num_cpu_blocks})"
-        )
-        return staged
 
     def on_request_done(self, request_id: str) -> None:
         self._cleanup_request(request_id)

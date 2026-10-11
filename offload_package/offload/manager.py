@@ -244,7 +244,7 @@ class KVOffloadManager:
             scored_candidates,
             keep,
         )
-        _dbg(f"[OFFLOAD MANAGER DEBUG] refs_to_evict={refs_to_evict}")
+        _dbg(f"[OFFLOAD MANAGER DEBUG] evicting {len(refs_to_evict)} refs")
 
         offloaded = []
         refs_with_gpu: list[BlockRef] = []
@@ -252,7 +252,6 @@ class KVOffloadManager:
 
         for ref in refs_to_evict:
             loc = self.residency.get(ref)
-            _dbg(f"[OFFLOAD MANAGER DEBUG] Processing ref={ref}, loc={loc}")
 
             if loc is None:
                 _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: loc is None")

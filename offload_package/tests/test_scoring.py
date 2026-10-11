@@ -137,9 +137,9 @@ class TestPagedEvictionScorer:
         assert scores[0].item() == float("-inf")   # unknown -> evicted first
         assert scores[1].item() == pytest.approx(2.0)
 
-    def test_unknown_scores_sort_last_for_promotion(self):
-        """promote_hot_cpu_blocks sorts descending: unknown (-inf) refs must
-        never be picked ahead of scored ones."""
+    def test_unknown_scores_sort_last_for_keep_ranking(self):
+        """Highest-first ranking (e.g. keep-set ordering): unknown (-inf)
+        refs must never be picked ahead of scored ones."""
         scorer = PagedEvictionScorer()
         known = [BlockRef("req1", i) for i in range(3)]
         v_norm = torch.tensor([[3.0], [1.0], [2.0]], dtype=torch.float32)

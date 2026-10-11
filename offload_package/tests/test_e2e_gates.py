@@ -70,7 +70,8 @@ def test_short_gate_token_match():
     """pq vs pq+offload@0.99, 262-token prompt + 64 greedy tokens."""
     r = _run(
         [PY, "bench_1req_off99.py", "pq,pq+off99"],
-        env_extra={"BENCH_NEW_TOKENS": "64", "BENCH_PROMPT_REPS": "10"},
+        env_extra={"BENCH_NEW_TOKENS": "64", "BENCH_PROMPT_REPS": "10",
+                   "BENCH_INTERVAL": "32"},
     )
     assert r.returncode == 0, f"bench failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}"
     assert "pq+off99: PASS" in r.stdout, (
@@ -104,6 +105,41 @@ def test_runner_ids_fault_injection_raises():
     )
 
 
+def test_pressure_probe_exactness():
+    """Eviction + protection under real staging pressure (12 slots vs the
+    ~16-block selected set of the short prompt): the pool must evict only
+    blocks this step's gather does not need, and every step must still show
+    byte-exact staged reads and fp64-reference attention. This closes the
+    coverage gap that let the mid-fetch eviction corruption hide."""
+    r = _run(
+        [PY, "bench_1req_off99.py", "pq+off99-t12"],
+        env_extra={
+            "BENCH_NEW_TOKENS": "48",
+            "BENCH_PROMPT_REPS": "10",
+            "BENCH_INTERVAL": "32",
+            "SKYLIGHT_PQ_VERIFY": "1",
+            "SKYLIGHT_PQ_VERIFY_STEPS": "64",
+        },
+    )
+    assert r.returncode == 0, f"bench failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}"
+    steps = 0
+    for line in r.stdout.splitlines():
+        m = re.search(
+            r"\[PQ VERIFY\] step=(\d+) layer=0:.*?"
+            r"k_bytes_mismatch=(\d+) v_bytes_mismatch=(\d+) "
+            r"page_wrong=(\d+) null_page_reads=(\d+).*?"
+            r"ref_cos=([0-9.]+)", line)
+        if not m:
+            continue
+        steps += 1
+        kmis, vmis, pwrong, nulls = (int(m.group(i)) for i in range(2, 6))
+        cos = float(m.group(6))
+        assert kmis == 0 and vmis == 0, f"byte mismatch at step {m.group(1)}: {line}"
+        assert pwrong == 0 and nulls == 0, f"bad page read at step {m.group(1)}: {line}"
+        assert cos >= 0.9999, f"fp64 reference mismatch at step {m.group(1)}: {cos}"
+    assert steps >= 12, f"expected >=12 probe steps, saw {steps}"
+
+
 def test_probe_step_exactness():
     """Every decode step: staged reads byte-identical to source-of-truth and
     kernel attention equal to the fp64 reference over the selected set."""
@@ -112,6 +148,7 @@ def test_probe_step_exactness():
         env_extra={
             "BENCH_NEW_TOKENS": "32",
             "BENCH_PROMPT_REPS": "10",
+            "BENCH_INTERVAL": "32",
             "SKYLIGHT_PQ_VERIFY": "1",
             "SKYLIGHT_PQ_VERIFY_STEPS": "40",
         },

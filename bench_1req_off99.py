@@ -57,12 +57,17 @@ from vllm.config import KVTransferConfig
 MODEL = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
 MAX_MODEL_LEN = 18000            # ~8.1k input + 128 out headroom
 MAX_NEW_TOKENS = int(os.environ.get('BENCH_NEW_TOKENS', '8192'))
-INTERVAL_TOKENS = 128
+INTERVAL_TOKENS = int(os.environ.get('BENCH_INTERVAL', '128'))
 
 # Single request: ~26 tokens per repetition. BENCH_PROMPT_REPS sets the
 # length (40 -> ~1k tokens).
 PROMPT = ('The history of artificial intelligence is a story of ambition, '
           'setbacks, and breakthroughs across decades of research. ') * \
+    int(os.environ.get('BENCH_PROMPT_REPS', '40'))
+
+# Second request's prompt for the long-lived-process reuse test.
+PROMPT_B = ('Quantum computing promises to reshape cryptography, optimization, '
+            'and molecular simulation once fault-tolerant hardware arrives. ') * \
     int(os.environ.get('BENCH_PROMPT_REPS', '40'))
 
 if os.environ.get('BENCH_PROMPT') == 'varied':
@@ -75,47 +80,58 @@ if os.environ.get('BENCH_PROMPT') == 'varied':
         for i in range(170))
 
 SPARSE_ENV = {
-    'SKYLIGHT_SPARSE_TOPK': '0.1',
+    'SKYLIGHT_SPARSE_TOPK': os.environ.get('BENCH_TOPK', '0.1'),
     'SKYLIGHT_SPARSE_SINK': '64',
     'SKYLIGHT_SPARSE_LOCAL': '64',
     'SKYLIGHT_SPARSE_CHANNEL_NUM': '64',
+    'SKYLIGHT_PQ_GQA_SHARE': '1',   # operating mode: selection per kv-head
 }
 
 CONFIGS = {
     'pq': dict(method='pq', offload=False),
     'pq2': dict(method='pq', offload=False),  # determinism control
+    'oracle': dict(method='oracle', offload=False),
+    'oracle+off50': dict(method='oracle', offload=True, fraction=0.5,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='paged_eviction'),
     'pq+off99': dict(method='pq', offload=True, fraction=0.99,
                      staging_policy='auto', num_staging_slots=None,
                      scorer_type='paged_eviction'),
     'pq+off99-rand': dict(method='pq', offload=True, fraction=0.99,
                           staging_policy='auto', num_staging_slots=None,
                           scorer_type='random'),
+    'pq+off99-lru': dict(method='pq', offload=True, fraction=0.99,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='lru'),
     'pq+off99-tiny': dict(method='pq', offload=True, fraction=0.99,
                           staging_policy='fixed', num_staging_slots=64),
-    'pq+off99-t16': dict(method='pq', offload=True, fraction=0.99,
-                         staging_policy='fixed', num_staging_slots=16,
+    'pq+off99-t12': dict(method='pq', offload=True, fraction=0.99,
+                         staging_policy='fixed', num_staging_slots=12,
                          scorer_type='paged_eviction'),
-    'pq+off99-t16-rand': dict(method='pq', offload=True, fraction=0.99,
-                              staging_policy='fixed', num_staging_slots=16,
-                              scorer_type='random'),
     'pq+off50': dict(method='pq', offload=True, fraction=0.5,
                      staging_policy='auto', num_staging_slots=None,
                      scorer_type='paged_eviction'),
     'pq+off50-rand': dict(method='pq', offload=True, fraction=0.5,
                           staging_policy='auto', num_staging_slots=None,
                           scorer_type='random'),
+    'pq+off50-lru': dict(method='pq', offload=True, fraction=0.5,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='lru'),
+    'pq+off50-s512': dict(method='pq', offload=True, fraction=0.5,
+                          staging_policy='fixed', num_staging_slots=512,
+                          scorer_type='paged_eviction'),
+    'pq+off50-s512-rand': dict(method='pq', offload=True, fraction=0.5,
+                               staging_policy='fixed', num_staging_slots=512,
+                               scorer_type='random'),
+    'pq+off20': dict(method='pq', offload=True, fraction=0.2,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction'),
     'pq+off25': dict(method='pq', offload=True, fraction=0.25,
                      staging_policy='auto', num_staging_slots=None,
                      scorer_type='paged_eviction'),
     'pq+off25-rand': dict(method='pq', offload=True, fraction=0.25,
                           staging_policy='auto', num_staging_slots=None,
                           scorer_type='random'),
-    'pq+off99-lru': dict(method='pq', offload=True, fraction=0.99,
-                        staging_policy='auto', num_staging_slots=None,
-                        scorer_type='lru'),
-    'pq+off50-lru': dict(method='pq', offload=True, fraction=0.5,
-                         staging_policy='auto', num_staging_slots=None,
-                         scorer_type='lru'),
     'pq+off25-lru': dict(method='pq', offload=True, fraction=0.25,
                          staging_policy='auto', num_staging_slots=None,
                          scorer_type='lru'),
@@ -174,9 +190,39 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
     sp = SamplingParams(temperature=0, top_p=1.0, max_tokens=MAX_NEW_TOKENS, ignore_eos=True)
     torch.cuda.synchronize()
     t0 = time.time()
-    outputs = llm.generate([PROMPT], sp)
+    if os.environ.get('BENCH_TRACE_MULTINOMIAL') == '1':
+        import traceback as _tb
+        _orig_mn = torch.multinomial
+        _mn_count = [0]
+        def _traced_multinomial(*a, **k):
+            if _mn_count[0] < 3:
+                _mn_count[0] += 1
+                print(f"\n=== torch.multinomial call #{_mn_count[0]} stack ===", flush=True)
+                _tb.print_stack()
+            return _orig_mn(*a, **k)
+        torch.multinomial = _traced_multinomial
+
+    if os.environ.get('BENCH_PROFILE') == '1':
+        from torch.profiler import profile, ProfilerActivity
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            with_stack=True,
+        ) as prof:
+            outputs = llm.generate([PROMPT], sp)
+        print(prof.key_averages(group_by_stack_n=8).table(
+            sort_by='self_cpu_time_total', row_limit=35))
+    else:
+        outputs = llm.generate([PROMPT], sp)
     torch.cuda.synchronize()
     elapsed = time.time() - t0
+
+    reuse = None
+    if os.environ.get('BENCH_REUSE') == '1':
+        torch.cuda.synchronize()
+        t_r0 = time.time()
+        outputs_b = llm.generate([PROMPT_B], sp)
+        torch.cuda.synchronize()
+        reuse = time.time() - t_r0
 
     in_tokens = len(outputs[0].prompt_token_ids)
     out_tokens = len(outputs[0].outputs[0].token_ids)
@@ -192,6 +238,10 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
     print(f"  peak GPU allocated: {peak_gb:.2f} GB")
     print(f"  out: {outputs[0].outputs[0].text[:110]!r}")
     print(f"  token_ids[:32]: {list(outputs[0].outputs[0].token_ids)[:32]}")
+    if reuse is not None:
+        rb = len(outputs_b[0].outputs[0].token_ids)
+        print(f"  REUSE req#2: total {reuse:.1f}s, TPOT {reuse / max(rb,1) * 1000:.2f} ms/token "
+              f"({rb} tokens; codebook already fitted -> no pq.fit)")
 
     result = {
         'name': name, 'prompt_tokens': in_tokens, 'new_tokens': out_tokens,

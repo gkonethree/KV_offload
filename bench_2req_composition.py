@@ -65,6 +65,7 @@ SPARSE_ENV = {
     'SKYLIGHT_SPARSE_SINK': '64',
     'SKYLIGHT_SPARSE_LOCAL': '64',
     'SKYLIGHT_SPARSE_CHANNEL_NUM': '64',
+    'SKYLIGHT_PQ_GQA_SHARE': '1',   # operating mode: selection per kv-head
 }
 
 CONFIGS = {

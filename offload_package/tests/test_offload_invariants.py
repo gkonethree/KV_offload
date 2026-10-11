@@ -372,123 +372,6 @@ class TestAllocatorIsolation:
             pool.get_new_blocks(1)
 
 
-class TestPromotionWatch:
-    """R2 promotion: highest-scored CPU-resident blocks get pre-staged."""
-
-    def _orch_with_cpu_blocks(self, n_cpu=6):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-        from offload_package.integration.manager import OffloadOrchestrator
-        from offload_package.offload.manager import KVOffloadManager
-        from offload_package.scoring.paged_eviction import PagedEvictionScorer
-        from offload_package.scoring.base import BlockKVStats
-        from offload_package.staging.pool import KVStagingPool
-
-        num_layers, num_pages = 1, 64
-        H, N, C = 2, 16, 64
-        staging_slots = 4
-        staging_base = num_pages - staging_slots
-
-        combined = torch.randn(num_pages, H, N, 2 * C, dtype=torch.float16, device="cuda")
-        cpu_cache = torch.empty(
-            (num_layers, 32, 2, N, H, C), dtype=torch.float16, device="cpu", pin_memory=True
-        )
-        residency = ResidencyTable()
-        scorer = PagedEvictionScorer()
-        offload_manager = KVOffloadManager(
-            scorer=scorer, residency=residency,
-            gpu_k_caches=[combined], gpu_v_caches=[combined],
-            cpu_cache=cpu_cache, gpu_budget_blocks=staging_base, kv_layout="HND",
-        )
-        staging_pool = KVStagingPool(
-            num_slots=staging_slots, staging_base_page=staging_base,
-            gpu_k_caches=[combined], gpu_v_caches=[combined],
-            cpu_cache=cpu_cache, residency=residency, offload_manager=offload_manager,
-        )
-        from offload_package.controller import KVCompressionController
-        orch = OffloadOrchestrator(
-            offload_manager=offload_manager, staging_pool=staging_pool,
-            residency=residency, controller=KVCompressionController(16, 16),
-            page_size=N, staging_base_page_idx=staging_base, offload_fraction=0.5,
-        )
-
-        refs = [BlockRef("req1", i) for i in range(n_cpu)]
-        # scores ascending in block index: block i has score i+1
-        stats = BlockKVStats(
-            v_norm=torch.arange(1, n_cpu + 1, dtype=torch.float32).unsqueeze(1),
-            k_norm=torch.ones(n_cpu, 1, dtype=torch.float32),
-            block_ids=refs,
-        )
-        scorer.update(stats)
-        for i, ref in enumerate(refs):
-            residency.mark_gpu(ref, gpu_block_id=i, complete=True)
-        return orch, residency, refs, staging_base
-
-    @staticmethod
-    def _cpu_mark(residency, refs):
-        for i, ref in enumerate(refs):
-            residency.mark_cpu(ref, cpu_slot=i)
-
-    def test_promote_picks_highest_scored(self):
-        orch, residency, refs, staging_base = self._orch_with_cpu_blocks(6)
-        self._cpu_mark(residency, refs)
-        n0 = residency.num_cpu_blocks
-        staged = orch.promote_hot_cpu_blocks("req1", max_count=2)
-        assert len(staged) == 2
-        # The two highest-scored blocks (idx 5, 4) must be staged
-        assert BlockRef("req1", 5) in staged
-        assert BlockRef("req1", 4) in staged
-        assert BlockRef("req1", 0) not in staged
-        assert residency.num_cpu_blocks == n0 - 2
-        for ref, slot in staged.items():
-            loc = residency.get(ref)
-            assert loc.residency == Residency.STAGING
-            assert loc.staging_slot == slot
-            assert 0 <= slot < 4  # within pool
-
-    def test_promote_noop_when_nothing_cold(self):
-        orch, residency, refs, _ = self._orch_with_cpu_blocks(3)
-        self._cpu_mark(residency, refs)
-        for ref in refs:  # flip all to staging
-            residency.mark_staging(ref, staging_slot=ref.block_idx)
-        assert residency.num_cpu_blocks == 0
-        assert orch.promote_hot_cpu_blocks("req1", 2) == {}
-
-    def test_promote_bounded_by_max_count(self):
-        orch, residency, refs, _ = self._orch_with_cpu_blocks(6)
-        self._cpu_mark(residency, refs)
-        staged = orch.promote_hot_cpu_blocks("req1", max_count=1)
-        assert len(staged) == 1
-        assert BlockRef("req1", 5) in staged
-
-    def test_promote_zero_disables(self):
-        orch, residency, refs, _ = self._orch_with_cpu_blocks(3)
-        self._cpu_mark(residency, refs)
-        assert orch.promote_hot_cpu_blocks("req1", max_count=0) == {}
-        assert residency.num_cpu_blocks == 3
-
-    def test_promoted_content_matches_original(self):
-        """A promoted block's staging page must equal the original GPU page."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-        orch, _, refs, staging_base = self._orch_with_cpu_blocks(8)
-        # Real offload (GPU->CPU copy) via offload_fraction on half the blocks.
-        offloaded = orch.offload_manager.offload_fraction(refs, 0.5, set(refs))
-        assert offloaded  # some went to CPU for real
-        originals = {}
-        combined = orch.staging_pool.gpu_k_caches[0]
-        for ref in offloaded:
-            originals[ref] = combined[ref.block_idx].clone()
-
-        staged = orch.promote_hot_cpu_blocks("req1", max_count=4)
-        assert staged
-        for ref, slot in staged.items():
-            staged_page = combined[staging_base + slot]
-            assert torch.equal(staged_page, originals[ref]), (
-                f"{ref}: staged page content mismatch after offload+promote"
-            )
-
-
 class TestFusedScorer:
     """K2: fused scorer parity vs the per-layer torch path (CUDA and Triton)."""
 
@@ -574,38 +457,102 @@ class TestStagingSizing:
 
     @staticmethod
     def _fake_configs(max_model_len: int, max_num_seqs: int,
-                      block_size: int, num_blocks: int):
+                      block_size: int, num_blocks: int,
+                      num_kv_heads: int = 4, num_q_heads: int = 32,
+                      tp_size: int = 1):
         from types import SimpleNamespace
         vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(max_model_len=max_model_len),
+            model_config=SimpleNamespace(
+                max_model_len=max_model_len,
+                hf_config=SimpleNamespace(
+                    num_attention_heads=num_q_heads * tp_size),
+            ),
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=tp_size),
         )
         kv_cache_config = SimpleNamespace(
             num_blocks=num_blocks,
             kv_cache_groups=[SimpleNamespace(
-                kv_cache_spec=SimpleNamespace(block_size=block_size),
+                kv_cache_spec=SimpleNamespace(
+                    block_size=block_size, num_kv_heads=num_kv_heads),
             )],
         )
         return vllm_config, kv_cache_config
 
+    @staticmethod
+    def _union_factor(topk: float, g: int) -> float:
+        return 1.0 - (1.0 - topk) ** g
+
     def test_staging_sizing_auto(self, monkeypatch):
+        """Union-aware sizing: no GQA-share -> G_eff = H_q (32 independent
+        q-heads), so the pool covers 1-(1-topk)^32 of the middle range."""
         from offload_package.integration.connector import _auto_staging_slots_for
 
         monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.1")
         monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "512")
         monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "512")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.delenv("SKYLIGHT_PQ_GQA_SHARE", raising=False)
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
 
         max_len, max_seqs, page, num_blocks = 65536, 4, 16, 10_000_000
         vc, kc = self._fake_configs(max_len, max_seqs, page, num_blocks)
 
-        # Expected: mid = 64512; pages_per_req = 64 + ceil(0.1*64512/16) = 468;
-        # est = int(4 * 468 * 1.10) = 2059; cap = 2.5M -> not binding.
         mid = max_len - 512 - 512
-        pages_per_req = (512 + 512) // page + int(0.1 * mid / page + 0.999)
+        union = self._union_factor(0.1, 32)
+        pages_per_req = 64 + int(union * mid / page + 0.999)
         expected = int(max_seqs * pages_per_req * 1.10)
         assert _auto_staging_slots_for(vc, kc) == expected
+
+    def test_staging_sizing_auto_gqa_share(self, monkeypatch):
+        """GQA-share: G_eff = H_kv (4 kv-heads), shrinking the union ~4x
+        versus 32 independent q-heads at the same topk."""
+        from offload_package.integration.connector import _auto_staging_slots_for
+
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.05")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "64")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "64")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.setenv("SKYLIGHT_PQ_GQA_SHARE", "1")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
+
+        vc, kc = self._fake_configs(18000, 1, 16, 10_000_000)
+        # 8 + ceil(0.1855*17872/16) = 8+208 = 216; *1.1 -> 237.
+        assert _auto_staging_slots_for(vc, kc) == 237
+
+        # Share flag on a NON-pq method must not shrink: oracle selects
+        # per q-head regardless of the pq env var.
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "oracle")
+        mid = 18000 - 128
+        union = self._union_factor(0.05, 32)
+        pages = 8 + int(union * mid / 16 + 0.999)
+        assert _auto_staging_slots_for(vc, kc) == max(
+            64, int(pages * 1.10))
+
+    def test_staging_sizing_extra_config_knobs(self, monkeypatch):
+        """kv_connector_extra_config overrides the env knobs (previously
+        dead: stored in OffloadConfig but never consumed by the sizer)."""
+        from offload_package.integration.connector import _auto_staging_slots_for
+
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.1")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.setenv("SKYLIGHT_PQ_GQA_SHARE", "1")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
+
+        vc, kc = self._fake_configs(8192, 1, 16, 10_000_000)
+        union = self._union_factor(0.1, 4)
+        pages = int(union * 8192 / 16 + 0.999)
+        base = max(64, int(pages * 1.10))
+        assert _auto_staging_slots_for(vc, kc) == base
+        got = _auto_staging_slots_for(vc, kc, {"staging_safety_margin": 2.0})
+        assert got == max(64, int(pages * 2.0))
+        assert got != base
 
     def test_staging_sizing_auto_capped(self, monkeypatch):
         from offload_package.integration.connector import _auto_staging_slots_for
@@ -613,6 +560,8 @@ class TestStagingSizing:
         monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.5")
         monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "512")
         monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "512")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.setenv("SKYLIGHT_PQ_GQA_SHARE", "1")
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
 
@@ -626,6 +575,8 @@ class TestStagingSizing:
         monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.0")
         monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "0")
         monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.setenv("SKYLIGHT_PQ_GQA_SHARE", "1")
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
 
