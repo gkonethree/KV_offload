@@ -1,0 +1,44 @@
+=== 2026-10-15 09:28:36 start pq staging=auto
+  total time: 287.3s
+  decode TPOT: 140.27 ms/token
+=== 2026-10-15 09:34:40 start pq+off50 staging=auto
+!!! pq+off50 staging=auto exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50_stauto.log
+=== 2026-10-15 09:38:41 start pq+off50-lru staging=auto
+!!! pq+off50-lru staging=auto exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50-lru_stauto.log
+=== 2026-10-15 09:38:42 start pq+off50-rand staging=auto
+!!! pq+off50-rand staging=auto exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50-rand_stauto.log
+=== 2026-10-15 09:38:43 start pq+off50 staging=384
+!!! pq+off50 staging=384 exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50_st384.log
+=== 2026-10-15 09:38:44 start pq+off50-lru staging=384
+!!! pq+off50-lru staging=384 exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50-lru_st384.log
+=== 2026-10-15 09:38:45 start pq+off50-rand staging=384
+!!! pq+off50-rand staging=384 exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50-rand_st384.log
+=== 2026-10-15 09:38:46 start pq+off50 staging=256
+!!! pq+off50 staging=256 exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50_st256.log
+=== 2026-10-15 09:38:46 start pq+off50-lru staging=256
+!!! pq+off50-lru staging=256 exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50-lru_st256.log
+=== 2026-10-15 09:38:47 start pq+off50-rand staging=256
+!!! pq+off50-rand staging=256 exited with an error -- see bench_results/scorers_qwen3-4b_longbench/pq_off50-rand_st256.log
+Traceback (most recent call last):
+  File "/home/gaurav_kumar/KV_offload/bench_results/scorers_qwen3-4b_longbench/summarize.py", line 39, in <module>
+config          staging  TPOT ms  Δ vs pq   discover  fetch  alloc  sched (ms/token)     tokMB   blkMB  tokens vs pq
+pq                 auto    140.3                0.00   0.00   0.00   0.00                   0       0  
+    r = parse(f"{cfg.replace('+', '_')}_st{st}")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gaurav_kumar/KV_offload/bench_results/scorers_qwen3-4b_longbench/summarize.py", line 29, in parse
+    r["tokens"] = json.load(open(tp)) if os.path.exists(tp) else None
+tee: bench_results/scorers_qwen3-4b_longbench/summary.txt                  ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 293, in load
+: No space left on device
+    return loads(fp.read(),
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+=== 2026-10-15 09:38:48 done

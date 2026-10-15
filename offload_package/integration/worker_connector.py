@@ -131,6 +131,19 @@ class OffloadPackageWorker(KVConnectorBase_V1):
 
     def _build_orchestrator(self) -> None:
         """Build the offload orchestrator with all components."""
+        # Only the V1 GPUModelRunner is supported: the Skylight builder maps
+        # decode rows to request ids through runner.input_batch.req_ids, which
+        # the V2 runner (vllm/v1/worker/gpu/model_runner.py) does not have.
+        # Without it no fetch can run and true freeing would read freed pages.
+        if (
+            self.offload_config.enabled
+            and getattr(self._model_runner, "input_batch", None) is None
+        ):
+            raise RuntimeError(
+                "OffloadPackageConnector requires the V1 model runner "
+                "(set VLLM_USE_V2_MODEL_RUNNER=0); the V2 runner has no "
+                "input_batch to map decode rows to request ids."
+            )
         # Normalize KV caches to get the view
         kv_cache_view = normalize_runner_kv_caches(
             self._model_runner.kv_caches,
@@ -153,6 +166,9 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             scorer_head_reduction=self.offload_config.scorer_head_reduction,
             scorer_type=self.offload_config.scorer_type,
             staging_eviction=self.offload_config.staging_eviction,
+            fetch_granularity=self.offload_config.fetch_granularity,
+            max_model_len=int(self._vllm_config.model_config.max_model_len),
+            max_num_seqs=int(self._vllm_config.scheduler_config.max_num_seqs),
         )
 
         # Get the PQ wrapper from the model runner's attention groups
@@ -223,6 +239,14 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                         injected += 1
             try:
                 import skylight.backend as skylight_backend
+                # The id stash and cached sparse pattern belong to the
+                # PREVIOUS engine when this connector is being reused for a
+                # new one (process-global kv-transfer group); clear them so
+                # the first builds of the new engine cannot act on stale
+                # request ids.
+                skylight_backend.SkylightSparseMetadataBuilder._cached_request_ids = []
+                skylight_backend.SkylightSparseMetadataBuilder._cached_sparse_idx = None
+                skylight_backend.SkylightSparseMetadataBuilder._cached_sparse_len = None
                 armed = (skylight_backend.SkylightSparseMetadataBuilder
                          ._offload_orchestrator is self._orchestrator)
                 assert not injected or armed, (
@@ -296,18 +320,9 @@ class OffloadPackageWorker(KVConnectorBase_V1):
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[Optional[set[str]], Optional[set[str]]]:
         """Poll for completed transfers and return finished request IDs."""
-        finished_recving: set[str] = set()
-
-        # Check load events (staging)
-        if self._pending_load_event_indices:
-            load_wm = self._poll_events(is_store=False)
-            for event_idx in [j for j in self._pending_load_event_indices if j <= load_wm]:
-                self._pending_load_event_indices.discard(event_idx)
-                self._completed_load_events[event_idx] = 1
-                # Map event to request IDs
-                if self._metadata and event_idx in self._metadata.load_event_to_reqs:
-                    finished_recving.update(self._metadata.load_event_to_reqs[event_idx])
-
+        # Never report finished_recving: recall is synchronous inside the
+        # decode wrapper, and reporting running requests as async-loaded would
+        # make vLLM treat them as KV-transfer requests.
         # Check store events (offload)
         if self._pending_store_event_indices:
             store_wm = self._poll_events(is_store=True)
@@ -315,7 +330,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                 self._pending_store_event_indices.discard(event_idx)
                 self._completed_store_events[event_idx] = 1
 
-        return None, finished_recving or None
+        return None, None
 
     def _poll_events(self, is_store: bool) -> int:
         events = self._store_events if is_store else self._load_events
@@ -410,8 +425,36 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         return self.request_finished(request, block_ids=[])
 
     def shutdown(self) -> None:
-        """Shutdown the connector."""
+        """Shutdown the connector and drop every reference to the engine.
+
+        The Skylight builder's class attributes point at this worker's
+        orchestrator (KV cache views + the pinned CPU cache) and runner; left
+        in place they keep the whole engine's GPU memory alive after an
+        in-process LLM is shut down.
+        """
         self.flush_and_sync()
+        try:
+            import skylight.backend as skylight_backend
+            b = skylight_backend.SkylightSparseMetadataBuilder
+            ours = (
+                (self._orchestrator is not None
+                 and b._offload_orchestrator is self._orchestrator)
+                or (self._model_runner is not None
+                    and b._offload_runner is self._model_runner)
+            )
+            if ours:
+                b._offload_orchestrator = None
+                b._offload_runner = None
+                b._cached_request_ids = []
+                b._cached_sparse_idx = None
+                b._cached_sparse_len = None
+                b._last_decode_wrapper = None
+                b._last_patched_indices = None
+        except ImportError:
+            pass
+        self._orchestrator = None
+        self._model_runner = None
+        self._metadata = None
 
     def get_handshake_metadata(self):
         """Get handshake metadata for P/D workers."""
@@ -430,6 +473,52 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         is built here once. Block syncing is scheduler-side (sync_request_blocks
         per step with num_computed); the worker-side sync path was dead."""
         _dbg(f"[SET RUNNER DEBUG] set_runner called, id={id(self)}, runner={type(runner)}")
+        # Rebuild when the runner CHANGES, not only when the orchestrator is
+        # missing. vLLM's kv-transfer group is process-global and is never
+        # torn down between LLM instances, so a second engine's
+        # initialize_from_config lands set_runner on THIS (previous engine's)
+        # connector. Keeping the old orchestrator would leave the skylight
+        # builder's class attrs pointed at the dead engine's runner and
+        # residency while the new engine's scheduler feeds the same tables --
+        # cross-engine state corruption that the build-side row-alignment
+        # guard then (correctly) refuses. A runner change means a new engine:
+        # refresh the per-engine offload config from the NEW runner's
+        # vllm_config (the stale handler would otherwise keep the previous
+        # engine's scorer/fraction/granularity), then rebuild the
+        # orchestrator against the new runner's kv caches and re-inject.
+        fresh = self._orchestrator is None or self._model_runner is not runner
         self._model_runner = runner
-        if self._orchestrator is None:
+        if fresh:
+            # A reused connector never sees initialize_from_config for the new
+            # engine; take its KV cache config from the runner so staging
+            # sizing and the staging base page match the NEW pool.
+            new_kv = getattr(runner, "kv_cache_config", None)
+            if new_kv is not None and new_kv is not self.kv_cache_config:
+                self.initialize_from_config(new_kv)
+            new_vc = getattr(runner, "vllm_config", None)
+            if new_vc is not None and new_vc is not self._vllm_config:
+                try:
+                    from offload_package.integration.connector import (
+                        build_offload_config,
+                    )
+                    self.offload_config = build_offload_config(
+                        new_vc, self.kv_cache_config, prev=self.offload_config,
+                    )
+                    self._vllm_config = new_vc
+                    self._staging_slots = self.offload_config.num_staging_slots
+                    if self.kv_cache_config is not None:
+                        self._staging_base_page = (
+                            self.kv_cache_config.num_blocks - self._staging_slots)
+                    logger.info(
+                        "OffloadPackageWorker: refreshed config for reused "
+                        "connector (scorer=%s, granularity=%s, fraction=%s)",
+                        self.offload_config.scorer_type,
+                        self.offload_config.fetch_granularity,
+                        self.offload_config.offload_fraction,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "OffloadPackageWorker: config refresh failed (%s); "
+                        "keeping the previous engine's offload config", e,
+                    )
             self._build_orchestrator()

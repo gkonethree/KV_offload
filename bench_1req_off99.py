@@ -54,8 +54,8 @@ if _orig:
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 
-MODEL = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
-MAX_MODEL_LEN = 18000            # ~8.1k input + 128 out headroom
+MODEL = os.environ.get('BENCH_MODEL', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0')
+MAX_MODEL_LEN = int(os.environ.get('BENCH_MAX_MODEL_LEN', '18000'))  # prompt + decode + headroom
 MAX_NEW_TOKENS = int(os.environ.get('BENCH_NEW_TOKENS', '8192'))
 INTERVAL_TOKENS = int(os.environ.get('BENCH_INTERVAL', '128'))
 
@@ -63,21 +63,27 @@ INTERVAL_TOKENS = int(os.environ.get('BENCH_INTERVAL', '128'))
 # length (40 -> ~1k tokens).
 PROMPT = ('The history of artificial intelligence is a story of ambition, '
           'setbacks, and breakthroughs across decades of research. ') * \
-    int(os.environ.get('BENCH_PROMPT_REPS', '40'))
+    int(os.environ.get('BENCH_PROMPT_REPS', '1'))
+
+# BENCH_PROMPT_FILE replaces the repeated-sentence prompt with a real text
+# (e.g. a LongBench sample already truncated to the target length).
+if os.environ.get('BENCH_PROMPT_FILE'):
+    with open(os.environ['BENCH_PROMPT_FILE']) as _f:
+        PROMPT = _f.read()
 
 # Second request's prompt for the long-lived-process reuse test.
 PROMPT_B = ('Quantum computing promises to reshape cryptography, optimization, '
             'and molecular simulation once fault-tolerant hardware arrives. ') * \
-    int(os.environ.get('BENCH_PROMPT_REPS', '40'))
+    int(os.environ.get('BENCH_PROMPT_REPS', '1'))
 
-if os.environ.get('BENCH_PROMPT') == 'varied':
-    # Non-degenerate prompt: varied content per block, so greedy logits are
-    # not a tie-fest; ~15 tokens/sentence -> 540 sentences ~ 8.1k tokens.
-    PROMPT = ''.join(
-        f"Observation {i}: the calibrated reading was {(i * 37) % 997}, "
-        f"which the field team called noteworthy, and the reviewers of "
-        f"section {(i * 11) % 23} marked it pending further review. "
-        for i in range(170))
+# if os.environ.get('BENCH_PROMPT') == 'varied':
+#     # Non-degenerate prompt: varied content per block, so greedy logits are
+#     # not a tie-fest; ~15 tokens/sentence -> 540 sentences ~ 8.1k tokens.
+#     PROMPT = ''.join(
+#         f"Observation {i}: the calibrated reading was {(i * 37) % 997}, "
+#         f"which the field team called noteworthy, and the reviewers of "
+#         f"section {(i * 11) % 23} marked it pending further review. "
+#         for i in range(170))
 
 SPARSE_ENV = {
     'SKYLIGHT_SPARSE_TOPK': os.environ.get('BENCH_TOPK', '0.1'),
@@ -89,25 +95,7 @@ SPARSE_ENV = {
 
 CONFIGS = {
     'pq': dict(method='pq', offload=False),
-    'pq2': dict(method='pq', offload=False),  # determinism control
-    'oracle': dict(method='oracle', offload=False),
-    'oracle+off50': dict(method='oracle', offload=True, fraction=0.5,
-                         staging_policy='auto', num_staging_slots=None,
-                         scorer_type='paged_eviction'),
-    'pq+off99': dict(method='pq', offload=True, fraction=0.99,
-                     staging_policy='auto', num_staging_slots=None,
-                     scorer_type='paged_eviction'),
-    'pq+off99-rand': dict(method='pq', offload=True, fraction=0.99,
-                          staging_policy='auto', num_staging_slots=None,
-                          scorer_type='random'),
-    'pq+off99-lru': dict(method='pq', offload=True, fraction=0.99,
-                         staging_policy='auto', num_staging_slots=None,
-                         scorer_type='lru'),
-    'pq+off99-tiny': dict(method='pq', offload=True, fraction=0.99,
-                          staging_policy='fixed', num_staging_slots=64),
-    'pq+off99-t12': dict(method='pq', offload=True, fraction=0.99,
-                         staging_policy='fixed', num_staging_slots=12,
-                         scorer_type='paged_eviction'),
+
     'pq+off50': dict(method='pq', offload=True, fraction=0.5,
                      staging_policy='auto', num_staging_slots=None,
                      scorer_type='paged_eviction'),
@@ -115,37 +103,84 @@ CONFIGS = {
                           staging_policy='auto', num_staging_slots=None,
                           scorer_type='random'),
     'pq+off50-lru': dict(method='pq', offload=True, fraction=0.5,
-                         staging_policy='auto', num_staging_slots=None,
-                         scorer_type='lru'),
-    'pq+off50-s512': dict(method='pq', offload=True, fraction=0.5,
-                          staging_policy='fixed', num_staging_slots=512,
-                          scorer_type='paged_eviction'),
-    'pq+off50-s512-rand': dict(method='pq', offload=True, fraction=0.5,
-                               staging_policy='fixed', num_staging_slots=512,
-                               scorer_type='random'),
-    'pq+off20': dict(method='pq', offload=True, fraction=0.2,
-                     staging_policy='auto', num_staging_slots=None,
-                     scorer_type='paged_eviction'),
-    'pq+off25': dict(method='pq', offload=True, fraction=0.25,
-                     staging_policy='auto', num_staging_slots=None,
-                     scorer_type='paged_eviction'),
-    'pq+off25-rand': dict(method='pq', offload=True, fraction=0.25,
                           staging_policy='auto', num_staging_slots=None,
-                          scorer_type='random'),
-    'pq+off25-lru': dict(method='pq', offload=True, fraction=0.25,
+                          scorer_type='lru'),
+    'pq+off50-tok': dict(method='pq', offload=True, fraction=0.5,
                          staging_policy='auto', num_staging_slots=None,
-                         scorer_type='lru'),
+                         scorer_type='paged_eviction',
+                         fetch_granularity='per_layer_tokens'),
+    'pq+off50-lru-tok': dict(method='pq', offload=True, fraction=0.5,
+                             staging_policy='auto', num_staging_slots=None,
+                             scorer_type='lru',
+                             fetch_granularity='per_layer_tokens'),
+    # 70% offload, per-layer token recall (scorer comparison under staging
+    # pressure: the auto pool is smaller than the offloaded set late in a run).
+    'pq+off70': dict(method='pq', offload=True, fraction=0.7,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction',
+                     fetch_granularity='per_layer_tokens'),
+    'pq+off70-lru': dict(method='pq', offload=True, fraction=0.7,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='lru',
+                         fetch_granularity='per_layer_tokens'),
+    # Explicit block-granularity baselines for the token-vs-block matrix
+    # (independent of the fetch_granularity default).
+    'pq+off50-blk': dict(method='pq', offload=True, fraction=0.5,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='paged_eviction',
+                         fetch_granularity='block'),
+    'pq+off50-lru-blk': dict(method='pq', offload=True, fraction=0.5,
+                             staging_policy='auto', num_staging_slots=None,
+                             scorer_type='lru',
+                             fetch_granularity='block'),
+
+    # Gate configs (e2e gate suite). off99 forces nearly-everything-fetched;
+    # t12 forces the chunked-exact fallback under 12-slot staging pressure.
+    'pq+off99': dict(method='pq', offload=True, fraction=0.99,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction'),
+    'pq+off99-t12': dict(method='pq', offload=True, fraction=0.99,
+                         staging_policy='fixed', num_staging_slots=12,
+                         scorer_type='paged_eviction'),
+    'pq+off99-tok': dict(method='pq', offload=True, fraction=0.99,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='paged_eviction',
+                         fetch_granularity='per_layer_tokens'),
+    'pq+off99-t12-tok': dict(method='pq', offload=True, fraction=0.99,
+                             staging_policy='fixed', num_staging_slots=12,
+                             scorer_type='paged_eviction',
+                             fetch_granularity='per_layer_tokens'),
+
 }
 
 
+
+def shutdown_llm(llm):
+    """Release an in-process engine's GPU memory.
+
+    vLLM gc.freeze()s the heap at engine startup, so `del llm` alone frees
+    nothing; EngineCore.shutdown() unfreezes it and runs the worker/connector
+    shutdown (which drops the offload package's engine references).
+    """
+    try:
+        llm.llm_engine.engine_core.shutdown()
+    except Exception as e:  # attribute path changed / already shut down
+        print(f"  engine shutdown failed ({e}); falling back to gc.unfreeze", flush=True)
+    gc.unfreeze()
+
 def run(name, method, offload, fraction=0.5, staging_policy='auto',
-        num_staging_slots=None, scorer_type='paged_eviction'):
+        num_staging_slots=None, scorer_type='paged_eviction',
+        fetch_granularity='per_layer_tokens'):
     print(f"\n{'=' * 70}\nCONFIG: {name}\n{'=' * 70}", flush=True)
     for k, v in SPARSE_ENV.items():
         os.environ[k] = v
     os.environ['SKYLIGHT_SPARSE_METHOD'] = method
 
     kv = None
+    if offload and os.environ.get('BENCH_STAGING_SLOTS'):
+        # Fixed staging size for every offload config (staging-pressure sweeps).
+        staging_policy = 'fixed'
+        num_staging_slots = int(os.environ['BENCH_STAGING_SLOTS'])
     if offload:
         extra = {
             'enabled': True,
@@ -155,6 +190,7 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
             'interval_tokens': INTERVAL_TOKENS,
             'true_free': True,
             'scorer_type': scorer_type,
+            'fetch_granularity': fetch_granularity,
         }
         if num_staging_slots is not None:
             extra['num_staging_slots'] = num_staging_slots
@@ -170,7 +206,7 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
 
     kwargs = dict(
         model=MODEL,
-        dtype='float16',
+        dtype=os.environ.get('BENCH_DTYPE', 'float16'),
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=0.20,
         enforce_eager=True,
@@ -182,12 +218,27 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
     )
     if kv is not None:
         kwargs['kv_transfer_config'] = kv
+    # BENCH_WARMUP=1: measure steady-state decode only. A short warm-up
+    # generation on the same prompt pays the one-time per-process costs (PQ
+    # codebook fit at the first decode step, JIT); prefix caching is off so the
+    # timed request re-prefills identically in every config (offloaded blocks
+    # lose their cache hashes, which would otherwise make prefill
+    # config-dependent); stats are on so per-request token timestamps exist.
+    warmup = os.environ.get('BENCH_WARMUP') == '1'
+    if warmup:
+        kwargs['disable_log_stats'] = False
+        kwargs['enable_prefix_caching'] = False
 
     t_init0 = time.time()
     llm = LLM(**kwargs)
     t_init = time.time() - t_init0
 
     sp = SamplingParams(temperature=0, top_p=1.0, max_tokens=MAX_NEW_TOKENS, ignore_eos=True)
+    if warmup:
+        llm.generate([PROMPT], SamplingParams(
+            temperature=0, top_p=1.0, max_tokens=8, ignore_eos=True))
+        from offload_package import timing as _timing
+        _timing.reset()  # breakdown covers the timed request only
     torch.cuda.synchronize()
     t0 = time.time()
     if os.environ.get('BENCH_TRACE_MULTINOMIAL') == '1':
@@ -234,6 +285,11 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
     print(f"  new tokens: {out_tokens}")
     print(f"  total time: {elapsed:.1f}s")
     print(f"  decode TPOT: {tpot_ms:.2f} ms/token")
+    m = getattr(outputs[0], 'metrics', None)
+    if m is not None and m.first_token_ts and m.last_token_ts and out_tokens > 1:
+        print(f"  TTFT: {m.first_token_latency * 1000:.1f} ms")
+        print(f"  decode-only TPOT: "
+              f"{(m.last_token_ts - m.first_token_ts) / (out_tokens - 1) * 1000:.2f} ms/token")
     print(f"  throughput: {out_tokens / max(elapsed, 1e-9):.1f} tok/s")
     print(f"  peak GPU allocated: {peak_gb:.2f} GB")
     print(f"  out: {outputs[0].outputs[0].text[:110]!r}")
@@ -253,6 +309,7 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
     import json
     with open(f"/tmp/opencode/tokens_{name.replace('+', '_')}.json", "w") as f:
         json.dump(result['tokens'], f)
+    shutdown_llm(llm)
     del llm
     gc.collect()
     torch.cuda.empty_cache()

@@ -484,6 +484,15 @@ class TestStagingSizing:
     def _union_factor(topk: float, g: int) -> float:
         return 1.0 - (1.0 - topk) ** g
 
+    @staticmethod
+    def _expected(max_len, sink, local, page, union, f, max_seqs, safety=1.10):
+        """Documented formula: only offloaded blocks are staged, sink/local
+        are pinned, never more than the offloadable set."""
+        import math
+        mid_pages = -(-(max_len - sink - local) // page)
+        staged = min(math.ceil(f * union * mid_pages), math.ceil(f * mid_pages))
+        return max(64, int(max_seqs * staged * safety))
+
     def test_staging_sizing_auto(self, monkeypatch):
         """Union-aware sizing: no GQA-share -> G_eff = H_q (32 independent
         q-heads), so the pool covers 1-(1-topk)^32 of the middle range."""
@@ -500,11 +509,9 @@ class TestStagingSizing:
         max_len, max_seqs, page, num_blocks = 65536, 4, 16, 10_000_000
         vc, kc = self._fake_configs(max_len, max_seqs, page, num_blocks)
 
-        mid = max_len - 512 - 512
         union = self._union_factor(0.1, 32)
-        pages_per_req = 64 + int(union * mid / page + 0.999)
-        expected = int(max_seqs * pages_per_req * 1.10)
-        assert _auto_staging_slots_for(vc, kc) == expected
+        expected = self._expected(max_len, 512, 512, page, union, 0.5, max_seqs)
+        assert _auto_staging_slots_for(vc, kc, {"offload_fraction": 0.5}) == expected
 
     def test_staging_sizing_auto_gqa_share(self, monkeypatch):
         """GQA-share: G_eff = H_kv (4 kv-heads), shrinking the union ~4x
@@ -520,17 +527,16 @@ class TestStagingSizing:
         monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")
 
         vc, kc = self._fake_configs(18000, 1, 16, 10_000_000)
-        # 8 + ceil(0.1855*17872/16) = 8+208 = 216; *1.1 -> 237.
-        assert _auto_staging_slots_for(vc, kc) == 237
+        x = {"offload_fraction": 0.99}
+        shared = self._expected(18000, 64, 64, 16, self._union_factor(0.05, 4), 0.99, 1)
+        assert _auto_staging_slots_for(vc, kc, x) == shared
 
         # Share flag on a NON-pq method must not shrink: oracle selects
         # per q-head regardless of the pq env var.
         monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "oracle")
-        mid = 18000 - 128
-        union = self._union_factor(0.05, 32)
-        pages = 8 + int(union * mid / 16 + 0.999)
-        assert _auto_staging_slots_for(vc, kc) == max(
-            64, int(pages * 1.10))
+        unshared = self._expected(18000, 64, 64, 16, self._union_factor(0.05, 32), 0.99, 1)
+        assert _auto_staging_slots_for(vc, kc, x) == unshared
+        assert unshared > shared
 
     def test_staging_sizing_extra_config_knobs(self, monkeypatch):
         """kv_connector_extra_config overrides the env knobs (previously
@@ -547,12 +553,37 @@ class TestStagingSizing:
 
         vc, kc = self._fake_configs(8192, 1, 16, 10_000_000)
         union = self._union_factor(0.1, 4)
-        pages = int(union * 8192 / 16 + 0.999)
-        base = max(64, int(pages * 1.10))
-        assert _auto_staging_slots_for(vc, kc) == base
-        got = _auto_staging_slots_for(vc, kc, {"staging_safety_margin": 2.0})
-        assert got == max(64, int(pages * 2.0))
+        base = self._expected(8192, 0, 0, 16, union, 0.99, 1, 1.10)
+        assert _auto_staging_slots_for(vc, kc, {"offload_fraction": 0.99}) == base
+        got = _auto_staging_slots_for(
+            vc, kc, {"offload_fraction": 0.99, "staging_safety_margin": 2.0})
+        assert got == self._expected(8192, 0, 0, 16, union, 0.99, 1, 2.0)
         assert got != base
+
+    def test_staging_sizing_counts_only_offloadable_blocks(self, monkeypatch):
+        """Staging covers selected AND offloaded blocks, capped at the
+        offloadable set; the per-request block budget maps to a fraction."""
+        from offload_package.integration.connector import _auto_staging_slots_for
+
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "1.0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "64")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "64")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.setenv("SKYLIGHT_PQ_GQA_SHARE", "1")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.0")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "1.0")
+        monkeypatch.delenv("OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET", raising=False)
+        vc, kc = self._fake_configs(16512, 1, 16, 10_000_000, num_kv_heads=8)
+        mid_pages = (16512 - 128) // 16                     # 1024
+        # union == 1: the estimate is exactly the offloadable set, f * mid_pages
+        assert _auto_staging_slots_for(vc, kc, {"offload_fraction": 0.25}) == 256
+        assert _auto_staging_slots_for(vc, kc, {"offload_fraction": 0.5}) == 512
+        # keep 768 of 1024 on GPU -> f = 0.25 -> same as above
+        assert _auto_staging_slots_for(
+            vc, kc, {"gpu_block_budget_per_request": 768}) == 256
+        # nothing offloaded -> the 64-slot floor
+        assert _auto_staging_slots_for(vc, kc, {"offload_fraction": 0.0}) == 64
+        assert mid_pages == 1024
 
     def test_staging_sizing_auto_capped(self, monkeypatch):
         from offload_package.integration.connector import _auto_staging_slots_for

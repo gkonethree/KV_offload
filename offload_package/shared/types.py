@@ -31,6 +31,11 @@ class OrchestratorConfig:
     scorer_head_reduction: str = "mean"
     scorer_type: str = "paged_eviction"  # "paged_eviction" or "random"
     staging_eviction: str = "lru"  # "scorer", "lru" or "random"
+    fetch_granularity: str = "per_layer_tokens"  # or "block"
+    # Sizing for the GPU residency mirror (vectorized fetch discovery);
+    # 0 leaves the mirror off and discovery uses the host loop.
+    max_model_len: int = 0
+    max_num_seqs: int = 0
 
 
 def build_orchestrator(
@@ -94,6 +99,15 @@ def build_orchestrator(
         )
 
     residency = ResidencyTable()
+    if cfg.max_model_len > 0 and cfg.max_num_seqs > 0:
+        residency.enable_device_mirror(
+            num_layers=len(k_caches),
+            max_blocks=-(-cfg.max_model_len // cfg.page_size),
+            # Requests can outlive a step (finishing / preempted), so leave
+            # headroom; the mirror grows on demand anyway.
+            num_slots=2 * cfg.max_num_seqs + 2,
+            device=k_caches[0].device,
+        )
     offload_manager = KVOffloadManager(
         scorer=scorer,
         residency=residency,
@@ -123,9 +137,10 @@ def build_orchestrator(
         residency=residency,
         offload_manager=offload_manager,
         eviction_scorer=eviction_scorer,
+        eviction_policy=cfg.staging_eviction,
     )
     controller = KVCompressionController(cfg.W, cfg.page_size)
-    return OffloadOrchestrator(
+    orch = OffloadOrchestrator(
         offload_manager=offload_manager,
         staging_pool=staging_pool,
         residency=residency,
@@ -134,6 +149,11 @@ def build_orchestrator(
         staging_base_page_idx=staging_base,
         offload_fraction=cfg.offload_fraction,
     )
+    # Recall granularity: read by the PQ decode wrapper at fetch time
+    # ("block" = whole-column fetch, "per_layer_tokens" = selected offsets
+    # of the calling layer's slice only).
+    orch.fetch_granularity = cfg.fetch_granularity
+    return orch
 
 
 def normalize_runner_kv_caches(

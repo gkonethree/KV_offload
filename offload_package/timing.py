@@ -43,6 +43,7 @@ ENABLED = os.environ.get("SKYLIGHT_OFFLOAD_TIMING", "0") == "1"
 _total: defaultdict[str, float] = defaultdict(float)
 _count: defaultdict[str, int] = defaultdict(int)
 _max: defaultdict[str, float] = defaultdict(float)
+_bytes: defaultdict[str, int] = defaultdict(int)
 _t0: dict[str, float] = {}
 _step_counter = 0
 
@@ -58,11 +59,25 @@ def end(stage: str) -> None:
     t0 = _t0.pop(stage, None)
     if t0 is None:
         return
-    dt = (time.perf_counter() - t0) * 1e3
+    dt = time.perf_counter() - t0
     _total[stage] += dt
     _count[stage] += 1
     if dt > _max[stage]:
         _max[stage] = dt
+
+
+def note_bytes(stage: str, nbytes: int) -> None:
+    """Accumulate a byte counter (printed with the report, not timed)."""
+    if ENABLED:
+        _bytes[stage] += int(nbytes)
+
+
+def reset() -> None:
+    """Drop everything accumulated so far (e.g. after a warm-up request)."""
+    global _step_counter
+    for d in (_total, _count, _max, _bytes, _t0):
+        d.clear()
+    _step_counter = 0
 
 
 def step() -> None:
@@ -83,11 +98,15 @@ def report(final: bool = False) -> None:
           f"(calls/step shown as calls; mean/max per call)", flush=True)
     print(f"{'stage':<18} {'total_ms':>10} {'calls':>8} "
           f"{'mean_ms':>9} {'max_ms':>9}", flush=True)
+    # Accumulators hold perf_counter seconds; the table is in milliseconds.
     for stage in sorted(_total, key=lambda s: -_total[s]):
         n = _count[stage]
-        print(f"{stage:<18} {_total[stage]:>10.1f} {n:>8} "
-              f"{_total[stage] / max(n, 1):>9.3f} {_max[stage]:>9.3f}",
+        print(f"{stage:<18} {_total[stage] * 1e3:>10.1f} {n:>8} "
+              f"{_total[stage] * 1e3 / max(n, 1):>9.3f} {_max[stage] * 1e3:>9.3f}",
               flush=True)
+    if _bytes:
+        print(f"[bytes moved, MB] " + " ".join(
+            f"{s}={_bytes[s] / 1e6:.1f}" for s in sorted(_bytes)), flush=True)
 
 
 @atexit.register

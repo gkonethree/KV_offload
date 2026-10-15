@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from offload_package.scoring.base import BlockRef
 from offload_package.staging.residency import BlockLocation, Residency, ResidencyTable
@@ -278,3 +279,53 @@ class TestResidencyVersionAndIndex:
         table.remove(BlockRef("req2", 1))
         assert [r.block_idx for r in table.refs_for_request("req1")] == [1, 2, 3, 4]
         assert [r.block_idx for r in table.refs_for_request("req2")] == [0, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_device_mirror_matches_host_table_under_random_transitions():
+    """The GPU mirror (state / per-layer coverage) must equal the host table
+    after every flush, across random transitions, request churn and slot
+    growth."""
+    import random
+    from offload_package.staging.residency import DEV_CPU, DEV_GPU, DEV_STAGING
+    rng = random.Random(0)
+    L, MB = 3, 12
+    res = ResidencyTable()
+    res.enable_device_mirror(num_layers=L, max_blocks=MB, num_slots=1, device="cuda")
+    live: set = set()
+    for step in range(400):
+        rid = f"r{rng.randrange(5)}"
+        ref = BlockRef(rid, rng.randrange(MB))
+        loc = res.get(ref)
+        op = rng.random()
+        if loc is None or op < 0.15:
+            res.mark_gpu(ref, rng.randrange(100), complete=True); live.add(ref)
+        elif op < 0.35:
+            res.mark_cpu(ref, rng.randrange(50))
+        elif op < 0.55 and loc.cpu_slot is not None:
+            if rng.random() < 0.5:
+                res.mark_staging(ref, rng.randrange(8))
+            else:
+                res.mark_staging(ref, rng.randrange(8), layer=rng.randrange(L),
+                                 offset_mask=rng.randrange(1, 1 << 16))
+        elif op < 0.7 and loc.residency == Residency.STAGING:
+            res.merge_staged_mask(ref, rng.randrange(L), rng.randrange(1, 1 << 16))
+        elif op < 0.8:
+            res.remove(ref); live.discard(ref)
+        if step % 7 == 0:
+            res.flush_device()
+            st = res.dev_state.cpu(); cov = res.dev_cov.cpu()
+            for r in list(live):
+                slot = res.slots_for([r.request_id])[0]
+                l = res.get(r)
+                exp = {Residency.GPU: DEV_GPU, Residency.CPU: DEV_CPU,
+                       Residency.STAGING: DEV_STAGING}[l.residency]
+                assert int(st[slot, r.block_idx]) == exp, (step, r)
+                for layer in range(L):
+                    got = int(cov[layer, slot, r.block_idx])
+                    if l.residency == Residency.STAGING:
+                        want = res.staged_coverage(r, layer)
+                        assert (got & 0xFFFF) == want, (step, r, layer)
+                    else:
+                        assert got == 0, (step, r, layer)
+    assert res._num_slots >= 5          # grew from 1

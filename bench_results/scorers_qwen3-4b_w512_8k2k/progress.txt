@@ -1,0 +1,43 @@
+=== 2026-10-15 00:12:19 smoke test (pq+off50, short)
+  prompt tokens: 2101
+  new tokens: 16
+  decode TPOT: 12910.20 ms/token
+config            time(s)  TPOT(ms)    tok/s  peak GPU(GB)  init(s)
+=== 2026-10-15 00:19:15 start pq
+  prompt tokens: 8191
+  new tokens: 2048
+  total time: 254.0s
+  decode TPOT: 124.03 ms/token
+  throughput: 8.1 tok/s
+  peak GPU allocated: 33.08 GB
+config            time(s)  TPOT(ms)    tok/s  peak GPU(GB)  init(s)
+=== 2026-10-15 00:24:36 start pq+off50
+  prompt tokens: 8191
+  new tokens: 2048
+  total time: 336.4s
+  decode TPOT: 164.27 ms/token
+  throughput: 6.1 tok/s
+  peak GPU allocated: 33.08 GB
+config            time(s)  TPOT(ms)    tok/s  peak GPU(GB)  init(s)
+=== 2026-10-15 00:31:38 start pq+off50-lru
+  prompt tokens: 8191
+  new tokens: 2048
+  total time: 339.3s
+  decode TPOT: 165.69 ms/token
+  throughput: 6.0 tok/s
+  peak GPU allocated: 33.09 GB
+config            time(s)  TPOT(ms)    tok/s  peak GPU(GB)  init(s)
+=== 2026-10-15 00:38:44 start pq+off50-rand
+  prompt tokens: 8191
+  new tokens: 2048
+  total time: 337.4s
+  decode TPOT: 164.77 ms/token
+  throughput: 6.1 tok/s
+  peak GPU allocated: 33.08 GB
+config            time(s)  TPOT(ms)    tok/s  peak GPU(GB)  init(s)
+config            prompt   new  time(s)  TPOT(ms)   tok/s  peakGB  tokens vs pq
+pq                  8191  2048    254.0    124.03     8.1   33.08  -
+pq+off50            8191  2048    336.4    164.27     6.1   33.08  identical
+pq+off50-lru        8191  2048    339.3    165.69     6.0   33.09  identical
+pq+off50-rand       8191  2048    337.4    164.77     6.1   33.08  identical
+=== 2026-10-15 00:45:46 done

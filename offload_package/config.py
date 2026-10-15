@@ -10,6 +10,10 @@ class OffloadConfig:
 
     enabled: bool = True
     offload_fraction: float = 0.20
+    # Absolute alternative to offload_fraction: when set, each request keeps
+    # at most this many offloadable blocks GPU-resident (sink, local-window
+    # and the partially-filled tail are pinned and not counted).
+    gpu_block_budget_per_request: int | None = None
     num_cpu_slots: int = 4096
     num_staging_slots: int = 64
     interval_tokens: int = 32
@@ -29,6 +33,11 @@ class OffloadConfig:
     # actual re-fetch cost driver); "scorer": inherit the offload scorer;
     # "random": uncorrelated control.
     staging_eviction: str = "lru"
+    # Recall granularity: "block" fetches whole 16-token x all-layer columns
+    # of every cold selected block; "per_layer_tokens" fetches only each
+    # layer's selected in-page offsets of that layer's own slice (per-layer
+    # 16-bit masks gate validity; incremental fill into the same page).
+    fetch_granularity: str = "per_layer_tokens"
     # Auto mode: cap staging at this fraction of the GPU KV pool.
     staging_max_pool_frac: float = 0.25
     # Auto mode: multiply the computed estimate by this headroom factor.
@@ -42,6 +51,9 @@ class OffloadConfig:
         return cls(
             enabled=flag("OFFLOAD_PACKAGE_ENABLED"),
             offload_fraction=float(os.getenv("OFFLOAD_PACKAGE_OFFLOAD_FRACTION", "0.20")),
+            gpu_block_budget_per_request=(
+                int(os.environ["OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET"])
+                if os.getenv("OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET") else None),
             num_cpu_slots=int(os.getenv("OFFLOAD_PACKAGE_CPU_SLOTS", "4096")),
             num_staging_slots=int(os.getenv("OFFLOAD_PACKAGE_STAGING_SLOTS", "64")),
             interval_tokens=int(os.getenv("OFFLOAD_PACKAGE_INTERVAL", "32")),
@@ -53,11 +65,16 @@ class OffloadConfig:
             staging_max_pool_frac=float(os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")),
             staging_safety_margin=float(os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")),
             staging_eviction=os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru"),
+            fetch_granularity=os.getenv(
+                "OFFLOAD_PACKAGE_FETCH_GRANULARITY", "per_layer_tokens"),
         )
 
     def __post_init__(self):
         if not 0.0 <= self.offload_fraction < 1.0:
             raise ValueError("offload_fraction must be in [0, 1)")
+        if (self.gpu_block_budget_per_request is not None
+                and self.gpu_block_budget_per_request < 0):
+            raise ValueError("gpu_block_budget_per_request must be >= 0")
         if self.scorer_type not in ("paged_eviction", "random", "lru"):
             raise ValueError("scorer_type must be 'paged_eviction', 'random' or 'lru'")
         if self.staging_policy not in ("fixed", "auto"):
@@ -66,5 +83,8 @@ class OffloadConfig:
             raise ValueError("staging_max_pool_frac must be in (0, 1]")
         if self.staging_eviction not in ("scorer", "lru", "random"):
             raise ValueError("staging_eviction must be 'scorer', 'lru' or 'random'")
+        if self.fetch_granularity not in ("block", "per_layer_tokens"):
+            raise ValueError(
+                "fetch_granularity must be 'block' or 'per_layer_tokens'")
         if self.staging_safety_margin < 1.0:
             raise ValueError("staging_safety_margin must be >= 1.0")

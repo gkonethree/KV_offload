@@ -1,0 +1,5 @@
+=== 12:45:24 start recording
+RECORDED paged_eviction: steps=2048 triggers=4 fetched_tokens=172019
+RECORDED lru: steps=2048 triggers=4 fetched_tokens=171799
+RECORDED random: steps=2048 triggers=4 fetched_tokens=171993
+=== 13:03:07 done

@@ -1,0 +1,12 @@
+=== 2026-10-15 10:58:13 smoke test (warm-up mode, pq+off50, 16 tokens)
+  TTFT: 150.1 ms
+  decode-only TPOT: 161.84 ms/token
+=== 2026-10-15 11:01:36 start pq staging=auto (attempt 1)
+  total time: 129.8s
+  TTFT: 161.5 ms
+  decode-only TPOT: 63.32 ms/token
+=== 2026-10-15 11:06:47 start pq+off50 staging=auto (attempt 1)
+  total time: 211.9s
+  TTFT: 148.6 ms
+  decode-only TPOT: 103.44 ms/token
+=== 2026-10-15 11:13:12 start pq+off50-lru staging=auto (attempt 1)

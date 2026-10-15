@@ -78,13 +78,29 @@ def _union_selector_count(vllm_config, kv_cache_config, share: bool) -> int:
 
 
 def _auto_staging_slots_for(vllm_config, kv_cache_config, extra_config=None) -> int:
-    """Auto-size staging: cover the UNION of all scoring heads' selections per
-    request, times the steady-state max batch, plus margin, clamped to a
-    fraction of the KV pool (never crashes on small pools).
+    """Auto-size staging to the blocks that can actually be STAGED.
 
-    Knobs come from kv_connector_extra_config first (staging_safety_margin,
+    Only offloaded (CPU-resident) blocks are ever staged, and sink /
+    local-window blocks are pinned on GPU, so per request the estimate is
+
+        staged = min(f * union * mid_pages,   # selected AND offloaded
+                     f * mid_pages)           # never more than is offloaded
+
+    where mid_pages covers max_model_len minus sink+local, union is the
+    fraction of the middle the scoring heads select together (independent
+    heads: 1-(1-topk)^G_eff -- an upper bound, real heads overlap), and f is
+    the offload fraction (or 1 - budget/mid_pages with
+    gpu_block_budget_per_request). The f * union term assumes the offload
+    choice is uncorrelated with top-k selection; a scorer that offloads
+    exactly the selected blocks can exceed it, which costs re-fetches /
+    the chunked fallback (both exact), never correctness.
+
+    Times max_num_seqs, plus margin, clamped to a fraction of the KV pool.
+    Knobs come from kv_connector_extra_config first (offload_fraction,
+    gpu_block_budget_per_request, staging_safety_margin,
     staging_max_pool_frac), then the OFFLOAD_PACKAGE_* env vars.
     """
+    import math
     extra_config = dict(extra_config or {})
     topk = float(_os.getenv("SKYLIGHT_SPARSE_TOPK", "0.1"))
     sink = int(_os.getenv("SKYLIGHT_SPARSE_SINK", "0"))
@@ -93,6 +109,7 @@ def _auto_staging_slots_for(vllm_config, kv_cache_config, extra_config=None) -> 
     max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     page_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
     mid = max(0, max_len - sink - local)
+    mid_pages = -(-mid // page_size)
 
     method = _os.getenv("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
     share = (
@@ -101,8 +118,19 @@ def _auto_staging_slots_for(vllm_config, kv_cache_config, extra_config=None) -> 
     )
     g_eff = _union_selector_count(vllm_config, kv_cache_config, share)
     union_factor = 1.0 - (1.0 - min(topk, 1.0)) ** g_eff
-    pages_per_req = ((sink + local) // page_size
-                     + int(union_factor * mid / page_size + 0.999))
+
+    budget = extra_config.get("gpu_block_budget_per_request")
+    if budget is None and _os.getenv("OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET"):
+        budget = _os.environ["OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET"]
+    if budget is not None:
+        f = max(0.0, 1.0 - int(budget) / max(mid_pages, 1))
+    else:
+        f = float(extra_config.get(
+            "offload_fraction",
+            _os.getenv("OFFLOAD_PACKAGE_OFFLOAD_FRACTION", "0.20")))
+    offloadable = math.ceil(f * mid_pages)
+    staged_per_req = min(math.ceil(f * union_factor * mid_pages), offloadable)
+
     safety = float(extra_config.get(
         "staging_safety_margin",
         _os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")))
@@ -110,17 +138,86 @@ def _auto_staging_slots_for(vllm_config, kv_cache_config, extra_config=None) -> 
         "staging_max_pool_frac",
         _os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")))
     num_blocks = int(kv_cache_config.num_blocks)
-    est = int(max_seqs * pages_per_req * safety)
+    est = int(max_seqs * staged_per_req * safety)
     cap = max(1, int(num_blocks * frac))
     result = max(64, min(est, cap))
     logger.info(
         "OffloadPackageConnector: auto staging policy -> %d slots "
         "(est=%d, cap=%d, max_len=%d, max_seqs=%d, topk=%.4f, G_eff=%d, "
-        "share=%s, union=%.3f, sink=%d, local=%d)",
+        "share=%s, union=%.3f, offload_frac=%.3f, offloadable/req=%d, "
+        "staged/req=%d, sink=%d, local=%d)",
         result, est, cap, max_len, max_seqs, topk, g_eff, share,
-        union_factor, sink, local,
+        union_factor, f, offloadable, staged_per_req, sink, local,
     )
     return result
+
+
+def build_offload_config(
+    vllm_config,
+    kv_cache_config,
+    prev: OffloadConfig | None = None,
+) -> OffloadConfig:
+    """Parse OffloadConfig from a vllm_config's kv_connector_extra_config.
+
+    `prev` carries forward the staging sizing when `kv_cache_config` is not
+    available (the reused-worker path: a second engine's vLLM never calls
+    initialize_from_config on the process-global connector, so its pool
+    numbers come from the previous engine -- identical in the same-scenario
+    benches; documented limitation).
+    """
+    extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+    enabled = extra_config.get("enabled", True)
+    num_staging_slots = int(extra_config.get(
+        "num_staging_slots",
+        prev.num_staging_slots if prev is not None else 64,
+    ))
+    policy = extra_config.get(
+        "staging_policy",
+        _os.getenv("OFFLOAD_PACKAGE_STAGING_POLICY", "fixed"),
+    )
+    if policy == "auto":
+        if kv_cache_config is not None:
+            num_staging_slots = _auto_staging_slots_for(
+                vllm_config, kv_cache_config, extra_config,
+            )
+        elif prev is not None:
+            num_staging_slots = prev.num_staging_slots
+
+    return OffloadConfig(
+        enabled=enabled,
+        offload_fraction=extra_config.get("offload_fraction", 0.2),
+        gpu_block_budget_per_request=(
+            int(extra_config["gpu_block_budget_per_request"])
+            if extra_config.get("gpu_block_budget_per_request") is not None
+            else (int(_os.environ["OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET"])
+                  if _os.getenv("OFFLOAD_PACKAGE_GPU_BLOCK_BUDGET") else None)),
+        num_cpu_slots=extra_config.get("num_cpu_slots", 4096),
+        num_staging_slots=num_staging_slots,
+        interval_tokens=extra_config.get("interval_tokens", 32),
+        scorer_decay=extra_config.get("scorer_decay", 1.0),
+        scorer_head_reduction=extra_config.get("scorer_head_reduction", "mean"),
+        true_free=extra_config.get(
+            "true_free",
+            _os.getenv("OFFLOAD_PACKAGE_TRUE_FREE", "1").lower()
+            in {"1", "true", "yes", "on"},
+        ),
+        staging_policy=policy,
+        staging_max_pool_frac=float(extra_config.get(
+            "staging_max_pool_frac",
+            _os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25"))),
+        staging_safety_margin=float(extra_config.get(
+            "staging_safety_margin",
+            _os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10"))),
+        scorer_type=extra_config.get(
+            "scorer_type",
+            _os.getenv("OFFLOAD_PACKAGE_SCORER_TYPE", "paged_eviction")),
+        staging_eviction=extra_config.get(
+            "staging_eviction",
+            _os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru")),
+        fetch_granularity=extra_config.get(
+            "fetch_granularity",
+            _os.getenv("OFFLOAD_PACKAGE_FETCH_GRANULARITY", "per_layer_tokens")),
+    )
 
 
 class OffloadPackageConnector(KVConnectorBase_V1):
@@ -133,48 +230,10 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
-        
-        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        enabled = extra_config.get("enabled", True)
-        num_staging_slots = int(extra_config.get("num_staging_slots", 64))
 
-        policy = extra_config.get(
-            "staging_policy",
-            _os.getenv("OFFLOAD_PACKAGE_STAGING_POLICY", "fixed"),
-        )
-        if policy == "auto":
-            num_staging_slots = _auto_staging_slots_for(
-                vllm_config, kv_cache_config, extra_config,
-            )
+        self.offload_config = build_offload_config(
+            vllm_config, kv_cache_config)
 
-        self.offload_config = OffloadConfig(
-            enabled=enabled,
-            offload_fraction=extra_config.get("offload_fraction", 0.2),
-            num_cpu_slots=extra_config.get("num_cpu_slots", 4096),
-            num_staging_slots=num_staging_slots,
-            interval_tokens=extra_config.get("interval_tokens", 32),
-            scorer_decay=extra_config.get("scorer_decay", 1.0),
-            scorer_head_reduction=extra_config.get("scorer_head_reduction", "mean"),
-            true_free=extra_config.get(
-                "true_free",
-                _os.getenv("OFFLOAD_PACKAGE_TRUE_FREE", "1").lower()
-                in {"1", "true", "yes", "on"},
-            ),
-            staging_policy=policy,
-            staging_max_pool_frac=float(extra_config.get(
-                "staging_max_pool_frac",
-                _os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25"))),
-            staging_safety_margin=float(extra_config.get(
-                "staging_safety_margin",
-                _os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10"))),
-            scorer_type=extra_config.get(
-                "scorer_type",
-                _os.getenv("OFFLOAD_PACKAGE_SCORER_TYPE", "paged_eviction")),
-            staging_eviction=extra_config.get(
-                "staging_eviction",
-                _os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru")),
-        )
-        
         self.kv_cache_config = kv_cache_config
         self._orchestrator = None
         self._model_runner = None
@@ -210,11 +269,50 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             self._worker_handler.initialize_from_config(kv_cache_config)
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool", kv_cache_manager=None) -> None:
-        """Bind GPU BlockPool to scheduler manager."""
-        if self._scheduler_manager is not None:
-            self._scheduler_manager.bind_gpu_block_pool(
+        """Bind GPU BlockPool to scheduler manager.
+
+        vLLM's kv-transfer group is process-global, so a second engine in the
+        same process reuses this connector. A bind on an already-bound
+        scheduler handler therefore means a NEW engine: rebuild the handler
+        from the worker's (refreshed) config so the staging reservation,
+        offload fraction, true-free gate and per-request state all belong to
+        the new engine instead of the previous one.
+        """
+        sched = self._scheduler_manager
+        if sched is not None and sched._gpu_block_pool is not None:
+            from offload_package.integration.scheduler_connector import (
+                OffloadPackageScheduler,
+            )
+            worker = self._worker_handler
+            kv_cfg = getattr(kv_cache_manager, "kv_cache_config", None) or (
+                worker.kv_cache_config if worker is not None else self.kv_cache_config
+            )
+            self.offload_config = (
+                worker.offload_config if worker is not None else self.offload_config
+            )
+            vc = worker._vllm_config if worker is not None else self._vllm_config
+            sched = OffloadPackageScheduler(
+                vc, kv_cfg, self.offload_config, worker_handler=worker,
+            )
+            self._scheduler_manager = sched
+            logger.info("OffloadPackageConnector: rebuilt scheduler handler "
+                        "for a new engine (connector reuse)")
+        if sched is not None:
+            sched.bind_gpu_block_pool(
                 gpu_block_pool, kv_cache_manager=kv_cache_manager
             )
+            worker = self._worker_handler
+            if (
+                worker is not None
+                and self.offload_config.enabled
+                and worker._staging_slots != sched.offload_config.num_staging_slots
+            ):
+                raise RuntimeError(
+                    "staging size mismatch: worker places "
+                    f"{worker._staging_slots} staging pages but the scheduler "
+                    f"reserved {sched.offload_config.num_staging_slots}; "
+                    "staging would overlap allocatable KV pages"
+                )
 
     def set_runner(self, runner) -> None:
         _dbg(f"[CONNECTOR DEBUG] set_runner called, runner={type(runner)}, worker_handler={id(self._worker_handler) if self._worker_handler else None}")
@@ -261,6 +359,12 @@ class OffloadPackageConnector(KVConnectorBase_V1):
     def shutdown(self):
         if self._worker_handler is not None:
             self._worker_handler.shutdown()
+        sched = self._scheduler_manager
+        if sched is not None:
+            sched._orchestrator = None
+            sched._gpu_block_pool = None
+            sched._kv_cache_manager = None
+        self._model_runner = None
     
     def get_kv_connector_stats(self):
         return None
@@ -307,14 +411,13 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         Guarantees a valid OffloadPackageMetadata is returned (never None)
         to satisfy the vLLM worker's assertion.
         """
-        try:
-            if self._scheduler_manager is not None:
-                result = self._scheduler_manager.build_connector_meta(scheduler_output)
-                if result is not None:
-                    return result
-        except Exception as e:
-            import logging
-            logging.warning(f"build_connector_meta scheduler_manager failed: {e}")
+        # No blanket except: a swallowed failure here silently drops this
+        # step's offloads/store events and can leave blocks marked CPU whose
+        # pages are never freed. Fail loudly instead.
+        if self._scheduler_manager is not None:
+            result = self._scheduler_manager.build_connector_meta(scheduler_output)
+            if result is not None:
+                return result
         
         # Fallback: always return a valid (possibly empty) metadata object
         from offload_package.integration.metadata import OffloadPackageMetadata

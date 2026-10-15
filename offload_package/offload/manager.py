@@ -209,78 +209,59 @@ class KVOffloadManager:
         fraction: float,
         scored_blocks: set[BlockRef] | None = None,
     ) -> list[BlockRef]:
-        """Offload the lowest-scoring fraction of complete GPU blocks."""
-        _dbg(f"[OFFLOAD MANAGER DEBUG] offload_fraction called: candidates={len(candidates)}, fraction={fraction}")
-
+        """Offload the lowest-scoring ``fraction`` of the scored, complete,
+        GPU-resident ``candidates`` (rounded to nearest; 0 when fraction=0)."""
         if not 0.0 <= fraction < 1.0:
             raise ValueError("fraction must be in [0, 1)")
+        eligible = self._eligible(candidates, scored_blocks)
+        n_offload = int(len(eligible) * fraction + 0.5)
+        return self.offload_lowest(eligible, n_offload)
 
-        # Only consider blocks that have been scored
-        if scored_blocks is None:
-            scored_blocks = set()
-        
-        scored_candidates = [
+    def _eligible(
+        self,
+        candidates: Sequence[BlockRef],
+        scored_blocks: set[BlockRef] | None,
+    ) -> list[BlockRef]:
+        scored_blocks = scored_blocks if scored_blocks is not None else set()
+        return [
             ref
             for ref in candidates
             if ref in scored_blocks
             and (loc := self.residency.get(ref)) is not None
             and loc.residency == Residency.GPU
             and loc.complete
+            and loc.gpu_block_id is not None
         ]
-        _dbg(f"[OFFLOAD MANAGER DEBUG] scored_candidates={len(scored_candidates)}, scored_blocks={len(scored_blocks)}, candidates={len(candidates)}")
 
-        # Use ceiling to ensure at least 1 block is offloaded when fraction > 0
-        n_offload = max(1, int(len(scored_candidates) * fraction + 0.5))
-        _dbg(f"[OFFLOAD MANAGER DEBUG] n_offload={n_offload}, scored_candidates={len(scored_candidates)}, fraction={fraction}")
+    def offload_lowest(
+        self,
+        eligible: Sequence[BlockRef],
+        n_offload: int,
+    ) -> list[BlockRef]:
+        """Copy the ``n_offload`` lowest-scored refs of ``eligible`` (all
+        scored, complete, GPU-resident) to CPU and mark them CPU-resident.
 
-        if n_offload <= 0 or len(scored_candidates) == 0:
-            _dbg(f"[OFFLOAD MANAGER DEBUG] returning empty: n_offload={n_offload}, scored_candidates={len(scored_candidates)}")
+        Raises on copy failure (including CPU pool exhaustion): a silent
+        partial offload would desync the caller's accounting.
+        """
+        _dbg(f"[OFFLOAD MANAGER DEBUG] offload_lowest: eligible={len(eligible)}, n_offload={n_offload}")
+        if n_offload <= 0 or not eligible:
             return []
-
+        n_offload = min(n_offload, len(eligible))
         # select_for_eviction() interprets budget as the number to KEEP.
-        keep = len(scored_candidates) - n_offload
-
         refs_to_evict = self.scorer.select_for_eviction(
-            scored_candidates,
-            keep,
+            list(eligible), len(eligible) - n_offload,
         )
-        _dbg(f"[OFFLOAD MANAGER DEBUG] evicting {len(refs_to_evict)} refs")
-
-        offloaded = []
-        refs_with_gpu: list[BlockRef] = []
-        gpu_ids: list[int] = []
-
-        for ref in refs_to_evict:
-            loc = self.residency.get(ref)
-
-            if loc is None:
-                _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: loc is None")
-                continue
-            if loc.gpu_block_id is None:
-                _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: gpu_block_id is None")
-                continue
-            if loc.residency != Residency.GPU:
-                _dbg(f"[OFFLOAD MANAGER DEBUG] Skipping: residency={loc.residency}")
-                continue
-
-            refs_with_gpu.append(ref)
-            gpu_ids.append(loc.gpu_block_id)
-
-        if refs_with_gpu:
-            try:
-                # One batched pass: per-layer index_select + one big D2H burst.
-                cpu_slots, event = self._copy_gpu_to_cpu_batch(gpu_ids)
-                event.synchronize()
-                for ref, slot in zip(refs_with_gpu, cpu_slots):
-                    self.residency.mark_cpu(ref, slot)
-                offloaded = refs_with_gpu
-            except Exception as e:
-                _dbg(f"[OFFLOAD MANAGER DEBUG] Exception during copy: {e}")
-                import traceback
-                traceback.print_exc()
-
-        _dbg(f"[OFFLOAD MANAGER DEBUG] returning offloaded={len(offloaded)}")
-        return offloaded
+        gpu_ids = [self.residency.get(ref).gpu_block_id for ref in refs_to_evict]
+        if not refs_to_evict:
+            return []
+        # One batched pass: per-layer index_select + one big D2H burst.
+        cpu_slots, event = self._copy_gpu_to_cpu_batch(gpu_ids)
+        event.synchronize()
+        for ref, slot in zip(refs_to_evict, cpu_slots):
+            self.residency.mark_cpu(ref, slot)
+        _dbg(f"[OFFLOAD MANAGER DEBUG] offloaded={len(refs_to_evict)}")
+        return list(refs_to_evict)
 
     def maybe_offload(self, candidates: Sequence[BlockRef]) -> list[BlockRef]:
         gpu_candidates = [

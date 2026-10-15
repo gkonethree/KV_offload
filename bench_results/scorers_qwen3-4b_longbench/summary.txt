@@ -1,0 +1,12 @@
+TPOT = decode-only (first->last token, after a warm-up request that pays the PQ fit).
+config          staging  TPOT ms  Δ vs pq  TTFT s   discover  fetch  alloc  sched (ms/token)     tokMB   blkMB  tokens vs pq
+pq                 auto     62.8              0.2       0.00   0.00   0.00   0.00                   0       0  
+pq+off50           auto     77.1   +22.8%     0.2      10.56   0.84   0.00   0.12                 704       0  diff @50
+pq+off50-lru       auto     75.2   +19.7%     0.1      10.50   1.16   0.00   0.11                 702       0  diff @11
+pq+off50-rand      auto     71.5   +13.9%     0.2       9.77   0.84   0.00   0.11                 704       0  diff @50
+pq+off50            709     79.0   +25.9%     0.2      10.93   0.85   0.00   0.12                 704       0  diff @11
+pq+off50-lru        709     79.0   +25.9%     0.2      10.98   1.13   0.00   0.11                 704       0  diff @50
+pq+off50-rand       709     81.3   +29.5%     0.2      11.36   1.30   0.00   0.18                 704       0  diff @86
+
+blkMB > 0 means the chunked whole-block fallback fired (per-layer cold set > staging).
+Token differences vs pq are expected noise (pq itself is not run-to-run deterministic).

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os as _os
 from collections import OrderedDict
 from collections.abc import Sequence
 
@@ -41,6 +42,7 @@ class KVStagingPool:
         residency: ResidencyTable,
         offload_manager: KVOffloadManager,
         eviction_scorer=None,
+        eviction_policy: str = "scorer",
     ) -> None:
         if num_slots <= 0:
             raise ValueError("num_slots must be > 0")
@@ -64,6 +66,12 @@ class KVStagingPool:
         # Default: inherit the offload scorer (legacy behavior, and what the
         # unit tests that assert score-aware eviction rely on).
         self._eviction_scorer = eviction_scorer or offload_manager.scorer
+        # "lru": victims come from the pool's own occupancy order, which is
+        # touched on EVERY layer's use (fetch, fill or already-staged pick).
+        # So when layer L allocates, the blocks layer L-1 used are the most
+        # recent and evicted last; at layer 0, the previous step's last
+        # layer's blocks are. Other policies rank by the eviction scorer.
+        self._eviction_policy = str(eviction_policy)
         self._copy_stream: torch.cuda.Stream | None = None
         # Ring of pinned staging slabs [layers, num_slots, H, P, 2C]:
         # per-layer H2Ds are issued from PINNED slices (pageable sources
@@ -79,6 +87,75 @@ class KVStagingPool:
         self._SLAB_RING = 2
         self._lru: OrderedDict[BlockRef, int] = OrderedDict()
         self._free = list(range(num_slots - 1, -1, -1))
+        # In-page token count (GPU cache layout [num_blocks, H, P, 2C]).
+        self._page_size = int(gpu_k_caches[0].shape[2])
+        # data_ptr -> layer index: the wrapper identifies the calling layer
+        # by its KV cache tensor (cache_id = k_cache.data_ptr()).
+        self._layer_of_ptr = {
+            int(c.data_ptr()): i for i, c in enumerate(self.gpu_k_caches)
+        }
+        # Token-granular fetch scratch: pinned [ring][max_tok, H, 2C] buffers
+        # with the same deferred-event discipline as the block slab ring.
+        self._tok_slabs: list[torch.Tensor] = []
+        self._tok_events: list[object | None] = []
+        self._tok_pending: list[list[torch.Tensor]] = []
+        self._tok_turn = 0
+        self._TOK_RING = 2
+        self._tok_capacity = 0
+
+    @property
+    def _page_bytes(self) -> int:
+        src = self.gpu_k_caches[0]          # [num_blocks, H, P, 2C]
+        n = src.numel() // src.shape[0]
+        return int(n) * src.element_size()
+
+    @property
+    def _block_bytes(self) -> int:
+        return self._page_bytes * len(self.gpu_k_caches)
+
+    def layer_of(self, cache_id: int) -> int:
+        idx = self._layer_of_ptr.get(int(cache_id))
+        if idx is None:
+            raise RuntimeError(
+                f"KV cache {int(cache_id)} is not one of the staged layers; "
+                "the token fetch path needs the calling layer's cache id."
+            )
+        return idx
+
+    def _acquire_tok_slab(self, n: int) -> torch.Tensor:
+        """Pinned scratch for one token fetch batch, ring-buffered like the
+        block slabs: the host sync for buffer i's transfers happens two
+        batches later, overlapping with CPU work."""
+        src = self.gpu_k_caches[0]          # [num_blocks, H, P, 2C]
+        H, C2 = int(src.shape[1]), int(src.shape[3])
+        if not self._tok_slabs or n > self._tok_capacity:
+            cap = max(n, self._tok_capacity, 4096)
+            self._tok_slabs = [
+                torch.empty((cap, H, C2), dtype=src.dtype,
+                            device="cpu", pin_memory=True)
+                for _ in range(self._TOK_RING)
+            ]
+            self._tok_events = [None] * self._TOK_RING
+            self._tok_pending = [[] for _ in range(self._TOK_RING)]
+            self._tok_capacity = cap
+        idx = self._tok_turn
+        self._tok_turn = (self._tok_turn + 1) % len(self._tok_slabs)
+        self._tok_cur = idx
+        ev = self._tok_events[idx]
+        if ev is not None:
+            _timing.start("pool.h2d_sync")
+            ev.synchronize()
+            _timing.end("pool.h2d_sync")
+            self._tok_events[idx] = None
+            self._tok_pending[idx].clear()
+        return self._tok_slabs[idx]
+
+    def _reset_tok_ring(self) -> None:
+        if self._tok_slabs:
+            self.copy_stream.synchronize()
+        self._tok_events = [None] * len(self._tok_slabs)
+        for pending in self._tok_pending:
+            pending.clear()
 
     @property
     def copy_stream(self) -> torch.cuda.Stream:
@@ -130,11 +207,63 @@ class KVStagingPool:
         self._slab_events = [None] * len(self._pinned_slabs)
         for pending in self._slab_pending:
             pending.clear()
+        if self._tok_slabs:
+            self._tok_events = [None] * len(self._tok_slabs)
+            for pending in self._tok_pending:
+                pending.clear()
+
+    def _touch(self, refs) -> None:
+        """Mark staged refs as used by the current layer (most recent)."""
+        for ref in refs:
+            if ref in self._lru:
+                self._lru.move_to_end(ref)
+
+    def _victim_order(self, protect_set, device_protect: bool = False) -> list[BlockRef]:
+        """Evictable staged refs, first victim first.
+
+        With the residency's device mirror and ``device_protect``, blocks the
+        CURRENT layer selected (dev_last_use == tick, written by the
+        vectorized discovery) are protected too, and LRU order comes from
+        dev_last_use -- every layer touches its whole selection in one
+        scatter, so no per-ref host touch is needed.
+        """
+        candidates: list[BlockRef] = []
+        desynced: list[BlockRef] = []
+        for r in self._lru.keys():          # oldest touch first
+            if r in protect_set:
+                continue
+            loc = self.residency.get(r)
+            if loc is not None and loc.residency == Residency.STAGING:
+                candidates.append(r)
+            else:
+                desynced.append(r)
+        if desynced and not _DESYNC_WARNED:
+            _DESYNC_WARNED["done"] = True
+            logger.warning(
+                "KVStagingPool: %d occupancy-LRU entries have non-STAGING "
+                "residency (desync); they are ignored as eviction "
+                "candidates. First offenders: %s",
+                len(desynced), desynced[:3],
+            )
+        use_dev = device_protect and getattr(self.residency, "has_device_mirror", False)
+        if candidates and use_dev:
+            lu = self.residency.last_use_of(candidates)
+            tick = self.residency.tick
+            kept = [(r, u) for r, u in zip(candidates, lu) if u != tick]
+            candidates = [r for r, _ in kept]
+            if self._eviction_policy == "lru":
+                # Stable: ties keep occupancy (insertion/touch) order.
+                return [r for r, _ in sorted(kept, key=lambda t: t[1])]
+        if not candidates or self._eviction_policy == "lru":
+            return candidates
+        order = torch.argsort(self._eviction_scorer.scores(candidates))
+        return [candidates[i] for i in order.tolist()]
 
     def ensure_resident(
         self,
         refs: Sequence[BlockRef],
         protect: Sequence[BlockRef] | None = None,
+        device_protect: bool = True,
     ) -> tuple[dict[BlockRef, int], list[BlockRef]]:
         """Stage `refs` into GPU staging pages.
 
@@ -154,6 +283,7 @@ class KVStagingPool:
         reads with weight 1.
         """
         protect_set = set(protect) if protect else frozenset()
+        self._touch(protect_set)
         result: dict[BlockRef, int] = {}
         to_fetch: list[tuple[BlockRef, int]] = []
         for ref in dict.fromkeys(refs):
@@ -202,29 +332,8 @@ class KVStagingPool:
             else:
                 if not victims_built:
                     victims_built = True
-                    candidates: list[BlockRef] = []
-                    desynced: list[BlockRef] = []
-                    for r, _sl in self._lru.items():
-                        if r in protect_set:
-                            continue
-                        loc = self.residency.get(r)
-                        if loc is not None and loc.residency == Residency.STAGING:
-                            candidates.append(r)
-                        else:
-                            desynced.append(r)
-                    if desynced and not _DESYNC_WARNED:
-                        _DESYNC_WARNED["done"] = True
-                        logger.warning(
-                            "KVStagingPool: %d occupancy-LRU entries have non-STAGING "
-                            "residency (desync); they are ignored as eviction "
-                            "candidates. First offenders: %s",
-                            len(desynced), desynced[:3],
-                        )
-                    if candidates:
-                        order = torch.argsort(
-                            self._eviction_scorer.scores(candidates))
-                        victims = [candidates[i] for i in order.tolist()]
-                        victim_pos = 0
+                    victims = self._victim_order(protect_set, device_protect)
+                    victim_pos = 0
                 while victim_pos < len(victims):
                     evicted = victims[victim_pos]
                     victim_pos += 1
@@ -264,6 +373,7 @@ class KVStagingPool:
         gpu_slabs: list[torch.Tensor] = []
         slab = self._acquire_slab(n)
         try:
+            _timing.note_bytes("pool.d2h_block", n * self._block_bytes)
             _timing.start("pool.cpu_gather")
             gathered = self.cpu_cache.index_select(1, cpu_slots_t)  # [L, n, 2, P, H, C]
             _timing.end("pool.cpu_gather")
@@ -274,6 +384,10 @@ class KVStagingPool:
             )
             slab[:, :n].copy_(combined)
             _timing.end("pool.transform")
+            # WAR ordering: staging pages written below may still be read by
+            # kernels already queued on the compute stream (earlier layers /
+            # the previous step). The copy stream must not overtake them.
+            self.copy_stream.wait_stream(torch.cuda.current_stream(device=device))
             with torch.cuda.stream(self.copy_stream):
                 base_ids = (
                     torch.tensor([s for _, _, s in allocs], dtype=torch.long, device=device)
@@ -317,6 +431,221 @@ class KVStagingPool:
             self._lru[ref] = slot
             self.residency.mark_staging(ref, slot)
             result[ref] = slot
+        return result, skipped
+
+    def ensure_resident_tokens(
+        self,
+        layer: int,
+        requests: Sequence[tuple[BlockRef, Sequence[int]]],
+        protect: Sequence[BlockRef] | None = None,
+        device_protect: bool = True,
+    ) -> tuple[dict[BlockRef, int], list[BlockRef]]:
+        """Token-granular recall: stage only the SELECTED offsets of each
+        requested block, in THIS layer's slice, into (existing or new)
+        canonical staging pages.
+
+        Mirrors `ensure_resident` phase-for-phase:
+          phase 0  dedupe refs, union their offsets, split by residency:
+                   GPU -> skip, STAGING -> incremental fill of the mask gap
+                   into the SAME page (no re-allocation, no index patch),
+                   CPU -> needs a new page.
+          phase 1  allocate pages for CPU refs with the same once-built
+                   eviction order (protect set = this step's selections).
+                   Over-capacity refs land in `skipped` -> caller chunks.
+          phase 2  ONE advanced-index gather over cpu_cache[layer] for every
+                   (slot, offset) of the batch -> ONE permute/reshape to the
+                   [H, 2C] page-token layout -> ONE pinned-slab H2D -> ONE
+                   scattered write into gpu_k_caches[layer][page, :, off].
+          phase 3  publish occupancy + per-layer offset masks, then assert
+                   every requested offset is covered (fail-loud: an
+                   uncovered weight-1 position would read stale bytes).
+
+        Returns (staged, skipped); `staged` maps every satisfied ref to its
+        staging page slot.
+        """
+        layer = int(layer)
+        protect_set = set(protect) if protect else frozenset()
+        self._touch(protect_set)
+        result: dict[BlockRef, int] = {}
+        needed: dict[BlockRef, int] = {}
+        for ref, offsets in requests:
+            m = 0
+            for o in offsets:
+                m |= 1 << int(o)
+            needed[ref] = needed.get(ref, 0) | m
+        to_alloc: list[tuple[BlockRef, int, int]] = []   # (ref, cpu_slot, mask)
+        to_fill: list[tuple[BlockRef, int, int, int]] = []  # (ref, cpu_slot, gap, slot)
+        for ref, mask in needed.items():
+            loc = self.residency.get(ref)
+            if loc is None:
+                raise KeyError(f"Unknown logical block {ref}")
+            if loc.residency == Residency.GPU:
+                continue
+            if loc.residency == Residency.STAGING and loc.staging_slot is not None:
+                self._lru.move_to_end(ref)
+                result[ref] = loc.staging_slot
+                gap = mask & ~self.residency.staged_coverage(ref, layer)
+                if gap:
+                    if loc.cpu_slot is None:
+                        raise RuntimeError(f"{ref} is staged but has no CPU slot")
+                    self.offload_manager.wait_cpu_slot(loc.cpu_slot)
+                    to_fill.append((ref, loc.cpu_slot, gap, loc.staging_slot))
+                continue
+            if loc.cpu_slot is None:
+                raise RuntimeError(f"{ref} is not backed by a CPU slot")
+            self.offload_manager.wait_cpu_slot(loc.cpu_slot)
+            to_alloc.append((ref, loc.cpu_slot, mask))
+        if not to_alloc and not to_fill:
+            return result, []
+
+        # Phase 1: page allocation for CPU-resident refs (same once-built
+        # eviction order as the block path; freshly staged refs are not in
+        # the occupancy LRU until phase 3 publishes them).
+        allocs: list[tuple[BlockRef, int, int, int]] = []  # (ref, cpu, mask, slot)
+        skipped: list[BlockRef] = []
+        _timing.start("pool.alloc")
+        victims: list[BlockRef] = []
+        victim_pos = 0
+        victims_built = False
+        for ref, cpu_slot, mask in to_alloc:
+            slot = None
+            if self._free:
+                slot = self._free.pop()
+            else:
+                if not victims_built:
+                    victims_built = True
+                    victims = self._victim_order(protect_set, device_protect)
+                    victim_pos = 0
+                while victim_pos < len(victims):
+                    evicted = victims[victim_pos]
+                    victim_pos += 1
+                    old = self.residency.get(evicted)
+                    if old is None or old.cpu_slot is None:
+                        continue  # desynced away between build and use
+                    self.residency.mark_cpu(evicted, old.cpu_slot)
+                    slot = self._lru.pop(evicted)
+                    break
+            if slot is None:
+                skipped.append(ref)
+                continue
+            allocs.append((ref, cpu_slot, mask, slot))
+        _timing.end("pool.alloc")
+
+        if not allocs and not to_fill:
+            return result, skipped
+
+        # Phase 2: one gather/transform/H2D/scatter for the whole batch.
+        device = self.gpu_k_caches[0].device
+        k_cache = self.gpu_k_caches[layer]
+        # Expand (cpu_slot, offset-bitmask, staging slot) rows into one
+        # (src slot, src offset, dst page, dst offset) entry per set bit --
+        # vectorized: this runs per layer (and per chunk in the fallback), so
+        # a Python loop over every offset of every page dominated the fetch.
+        rows = ([(c, g, sl) for _, c, g, sl in to_fill]
+                + [(c, m, sl) for _, c, m, sl in allocs])
+        rows_t = torch.tensor(rows, dtype=torch.long)                  # [n, 3]
+        bits = (rows_t[:, 1:2] >> torch.arange(self._page_size)) & 1   # [n, P]
+        r_idx, off_t = bits.nonzero(as_tuple=True)
+        slot_t = rows_t[r_idx, 0]
+        page_t = rows_t[r_idx, 2] + self.base
+        doff_t = off_t
+        n_tok = int(off_t.numel())
+        gpu_slab = None
+        try:
+            _timing.note_bytes(
+                "pool.d2h_token",
+                n_tok * self.gpu_k_caches[0].shape[1]
+                * self.gpu_k_caches[0].shape[3]
+                * self.gpu_k_caches[0].element_size(),
+            )
+            slab = self._acquire_tok_slab(n_tok)
+            _timing.start("pool.cpu_gather")
+            gathered = self.cpu_cache[layer][slot_t, :, off_t, :, :]
+            _timing.end("pool.cpu_gather")
+            _timing.start("pool.transform")
+            tokens = (
+                gathered.permute(0, 2, 1, 3).reshape(n_tok, gathered.shape[2], -1)
+            )
+            slab[:n_tok].copy_(tokens)
+            _timing.end("pool.transform")
+            # WAR ordering: staging pages written below may still be read by
+            # kernels already queued on the compute stream (earlier layers /
+            # the previous step). The copy stream must not overtake them.
+            self.copy_stream.wait_stream(torch.cuda.current_stream(device=device))
+            with torch.cuda.stream(self.copy_stream):
+                if allocs and _os.environ.get(
+                    "OFFLOAD_PACKAGE_TOKEN_ZERO_FILL", "1"
+                ) == "1":
+                    # Zero THIS layer's slice of the newly allocated pages
+                    # before the scatter, so unselected offsets never expose
+                    # the previous tenant's bytes to a read. Only this layer
+                    # can read the page before another fetch: other layers
+                    # gap-fill their own selected offsets first, and
+                    # zero-weight padding picks point at token 0. (The KV
+                    # buffer is zero-initialized, so stale bytes are finite
+                    # KV, never NaN patterns.) One fill instead of one per
+                    # layer -- this runs per chunk in the capacity fallback.
+                    pages_t = torch.tensor(
+                        [self.base + s for _, _, _, s in allocs],
+                        dtype=torch.long, device=device)
+                    k_cache[pages_t] = 0
+                _timing.start("pool.h2d")
+                gpu_slab = slab[:n_tok].to(device, non_blocking=True)
+                page_t_d = page_t.to(device, non_blocking=True)
+                doff_t_d = doff_t.to(device, non_blocking=True)
+                k_cache[page_t_d, :, doff_t_d] = gpu_slab
+                _timing.end("pool.h2d")
+                event = torch.cuda.Event()
+                event.record(self.copy_stream)
+            torch.cuda.current_stream(device=device).wait_stream(self.copy_stream)
+            self._tok_events[self._tok_cur] = event
+            self._tok_pending[self._tok_cur].append(gpu_slab)
+            if to_fill and _os.environ.get(
+                    "SKYLIGHT_POOL_FETCH_DEBUG", "0"
+            ) == "1" and not getattr(self, "_fill_dbg_done", False):
+                self._fill_dbg_done = True
+                self.copy_stream.synchronize()
+                ref0, cs0, gap0, slot0 = to_fill[0]
+                page0 = self.base + slot0
+                o0 = (gap0 & -gap0).bit_length() - 1
+                got = self.gpu_k_caches[layer][page0, :, o0, :].float()
+                exp = tokens[int((off_t == o0).nonzero()[0])].float()
+                print(f"[POOL FILL DBG] layer={layer} ref={ref0} "
+                      f"staging_slot={slot0} cpu_slot={cs0} off={o0} | "
+                      f"wrote={exp[:4].tolist()} "
+                      f"readback={got[0, :4].tolist()} "
+                      f"n_fill={len(to_fill)} n_tok={n_tok} "
+                      f"page={page0} base={self.base}",
+                      flush=True)
+        except Exception:
+            self._reset_tok_ring()
+            for _, _, _, slot in allocs:
+                self._free.append(slot)
+            raise
+
+        # Phase 3: publish occupancy and per-layer offset masks.
+        for ref, cpu_slot, mask, slot in allocs:
+            self._lru[ref] = slot
+            self.residency.mark_staging(ref, slot, layer=layer, offset_mask=mask)
+            result[ref] = slot
+        for ref, cpu_slot, gap, slot in to_fill:
+            self.residency.merge_staged_mask(ref, layer, gap)
+
+        # Fail-loud coverage check: every requested offset must be valid
+        # in its page slice before the kernel reads it.
+        for ref, mask in needed.items():
+            if ref in skipped or self.residency.get(ref) is None:
+                continue
+            if self.residency.get(ref).residency != Residency.STAGING:
+                continue
+            cov = self.residency.staged_coverage(ref, layer)
+            if mask & ~cov:
+                missing = [o for o in range(self._page_size)
+                           if (mask & ~cov) & (1 << o)]
+                raise RuntimeError(
+                    f"token fetch coverage hole for {ref} layer {layer}: "
+                    f"offsets {missing} were selected but never staged"
+                )
         return result, skipped
 
     def _allocate_slot(

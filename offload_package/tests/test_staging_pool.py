@@ -307,3 +307,60 @@ class TestEvictionScorerSplit:
         assert isinstance(orch.offload_manager.scorer, PagedEvictionScorer)
         assert isinstance(orch.staging_pool._eviction_scorer, LRUScorer)
         assert orch.staging_pool._eviction_scorer is not orch.offload_manager.scorer
+
+
+class TestLayerOrderedLRU:
+    """staging_eviction='lru': every layer's use (fetch, gap fill or an
+    already-staged pick passed as `protect`) refreshes recency, so layer L
+    evicts before touching what layer L-1 used, and layer 0 of the next step
+    keeps what the previous step's last layer used."""
+
+    def _setup(self):
+        pool, mgr, res = _make_pool(num_slots=4, layers=3)
+        pool._eviction_policy = "lru"
+        refs = {n: BlockRef("r", i) for i, n in enumerate("ABCDEF")}
+        assert _offload_blocks(mgr, res, list(refs.values())) == list(refs.values())
+        return pool, res, refs
+
+    @staticmethod
+    def _staged(res, ref):
+        return res.get(ref).residency == Residency.STAGING
+
+    def test_previous_layer_blocks_survive(self):
+        pool, res, R = self._setup()
+        pool.ensure_resident_tokens(0, [(R["A"], [0]), (R["B"], [1])])
+        pool.ensure_resident_tokens(1, [(R["C"], [0]), (R["D"], [2])])
+        _, skipped = pool.ensure_resident_tokens(2, [(R["E"], [3])])
+        assert not skipped
+        assert self._staged(res, R["E"])
+        assert self._staged(res, R["C"]) and self._staged(res, R["D"])
+        assert not self._staged(res, R["A"])          # oldest (layer 0) goes
+
+    def test_next_step_layer0_keeps_last_layers_blocks(self):
+        pool, res, R = self._setup()
+        pool.ensure_resident_tokens(0, [(R["A"], [0]), (R["B"], [0])])
+        pool.ensure_resident_tokens(1, [(R["C"], [0]), (R["D"], [0])])
+        # Last layer of the step uses A (already staged -> protect + fill)
+        # and B only via protect (fully covered for that layer).
+        pool.ensure_resident_tokens(
+            2, [(R["A"], [5])], protect=[R["A"], R["B"]])
+        pool.ensure_resident_tokens(0, [(R["E"], [0]), (R["F"], [0])])
+        assert self._staged(res, R["A"]) and self._staged(res, R["B"])
+        assert not self._staged(res, R["C"]) and not self._staged(res, R["D"])
+
+    def test_current_layer_selection_never_evicted(self):
+        pool, res, R = self._setup()
+        pool.ensure_resident_tokens(0, [(R["A"], [0]), (R["B"], [0]),
+                                        (R["C"], [0]), (R["D"], [0])])
+        # A is the oldest, but this layer selects it.
+        pool.ensure_resident_tokens(1, [(R["E"], [0])], protect=[R["A"]])
+        assert self._staged(res, R["A"])
+        assert not self._staged(res, R["B"])
+
+    def test_block_mode_uses_same_order(self):
+        pool, res, R = self._setup()
+        pool.ensure_resident([R["A"], R["B"]])
+        pool.ensure_resident([R["C"], R["D"]])
+        pool.ensure_resident([R["E"]], protect=[R["A"], R["C"]])
+        assert self._staged(res, R["A"]) and self._staged(res, R["C"])
+        assert not self._staged(res, R["B"])

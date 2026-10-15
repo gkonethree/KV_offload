@@ -260,6 +260,20 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
+        # The offload hooks are CLASS attributes injected by the offload
+        # connector. An engine without that connector (e.g. a plain pq run
+        # after an offload run in the same process) must not inherit the
+        # previous engine's orchestrator/runner: it would patch indices and
+        # move codes against a dead engine's residency table.
+        _kvt = getattr(vllm_config, "kv_transfer_config", None)
+        if _kvt is None or getattr(_kvt, "kv_connector", None) != "OffloadPackageConnector":
+            cls_ = SkylightSparseMetadataBuilder
+            cls_._offload_orchestrator = None
+            cls_._offload_runner = None
+            cls_._cached_request_ids = []
+            cls_._cached_sparse_idx = None
+            cls_._cached_sparse_len = None
+
         cfg = SkylightSparseConfig.from_env()
         self._sparse_topk: float = cfg.topk
         self._sparse_sink_size: int = cfg.sink_size
@@ -324,6 +338,22 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             self._sk_prev_seqlen = torch.full((max_bs,), -1, dtype=torch.int64)  # CPU
             if self._sk_syncfree:
                 logger.info("SkylightSparseBackend: SYNC-FREE decode path ON")
+                # Sync-free (block_minmax full-graph only; PQ never takes it)
+                # detects a slot's new occupant from CPU seq-len continuity
+                # alone and rebuilds summaries from the block table. It has no
+                # request-id ownership / row-move logic, so with offload true
+                # freeing it could rebuild from freed pages. Refuse the combo.
+                _x = dict(getattr(_kvt, "kv_connector_extra_config", None) or {})
+                if (
+                    _kvt is not None
+                    and getattr(_kvt, "kv_connector", None) == "OffloadPackageConnector"
+                    and _x.get("enabled", True)
+                    and _x.get("true_free", True)
+                ):
+                    raise ValueError(
+                        "SKYLIGHT_INCR_SYNCFREE=1 is not supported with "
+                        "OffloadPackageConnector true freeing; set "
+                        "true_free=False or disable SKYLIGHT_INCR_SYNCFREE.")
             self._sk_ptotal_fixed = (
                 self._sparse_max_seq_len + self._sk_sub_page - 1) // self._sk_sub_page
             logger.info("SkylightSparseBackend: FULL-cudagraph slot path ON (max_bs=%d, P=%d)",
@@ -537,6 +567,16 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             # capture-time total_k into the graph). Leaving n_keys=None makes the wrapper size
             # total_k from the fixed max_seq_len; per-request L_per still masks invalid tokens.
             self._sk_fill_slots(attn_metadata, common_attn_metadata)
+            if self._sk_pq and not self._sk_fullcg:
+                # Eager PQ: top-k is a fraction of the batch's REAL max
+                # context, not of max_model_len (which made short contexts
+                # effectively dense, padded with zero-weight picks).
+                self._set_n_keys_on_decode(
+                    attn_metadata.decode
+                    if isinstance(attn_metadata.decode, FIDecode)
+                    else None,
+                    int(common_attn_metadata.max_seq_len),
+                )
         else:
             self._set_n_keys_on_decode(
                 attn_metadata.decode
@@ -708,6 +748,10 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             self._sk_prev_sl = torch.zeros(self._sk_maxbs, dtype=_cur_sl.dtype, device=dev)
         _prev_sl = self._sk_prev_sl[:nd]
         _seq_discont = (_cur_sl != _prev_sl + 1) & (_cur_sl != _prev_sl)
+        # Snapshot of every row's previous length (incl. rows >= nd that a
+        # shrinking batch just vacated) for the row-move lookup below; a
+        # device clone, read back only when something changed.
+        _prev_all = self._sk_prev_sl.clone()
         self._sk_prev_sl[:nd] = _cur_sl
         changed = _page_changed | _seq_discont
         if _os.environ.get("SKYLIGHT_DEBUG_SLOTS") == "1":
@@ -717,13 +761,19 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                   flush=True)
         # The ONLY potential sync: detect a position whose occupant changed (needs (re)init).
         # Fires on batch-composition change; steady decode -> all False -> no host work.
+        moves: list[tuple[int, int]] = []    # (src_row, dst_row)
         if bool(changed.any()):
             idx = changed.nonzero(as_tuple=True)[0].tolist()
             seqs = cm.seq_lens[:nd].to("cpu").tolist()
             page = int(self.kv_cache_spec.block_size)
+            moves = self._sk_plan_row_moves(idx, seqs, _prev_all.tolist(), nd)
+            moved_dst = {d for _, d in moves}
             for b in idx:
+                if b in moved_dst:
+                    continue
                 L = int(seqs[b]); npg = (L + page - 1) // page
                 m.sk_pending.append((b, b, L)); m.sk_pages[b] = bt[b, :npg]
+        self._sk_record_row_owners(nd)
         m.sk_maint = self._sk_maint
         m.sk_slots = self._sk_slots_d[:nd]
         m.sk_seqlens = self._sk_seqlens_d[:nd]
@@ -734,9 +784,12 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         # build() runs EAGER every step (prepare_inputs, before any capture), so init here is
         # alloc-safe AND actually executes. Populate each layer's persistent slot buffer that
         # the captured scorer reads; the captured append maintains it per token.
-        if m.sk_pending and self._sk_maint is not None:
+        if (moves or m.sk_pending) and self._sk_maint is not None:
             _pp = [(b, slot, int(L) - 1) for (b, slot, L) in m.sk_pending]
             _sfc = self.compilation_config.static_forward_context
+            if moves:
+                _src = torch.tensor([a for a, _ in moves], dtype=torch.long, device=dev)
+                _dst = torch.tensor([b for _, b in moves], dtype=torch.long, device=dev)
             for _ln in self.layer_names:
                 _lyr = _sfc.get(_ln)
                 if _lyr is None:
@@ -747,8 +800,81 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                 if _kvc is None or _kvc.numel() == 0:
                     continue
                 _buf = self._sk_maint.get_buf(_kvc, m.sk_ptotal)
-                self._sk_maint._k_scale = float(getattr(_lyr, '_k_scale_float', 1.0) or 1.0)
-                self._sk_maint.init_layer(_buf, _kvc, m.sk_pages, _pp, _kvc.dtype)
+                if moves:
+                    # Advanced-index RHS is gathered before the write, so
+                    # permutations (A<->B) are safe. Moves run before inits:
+                    # a vacated source row may be re-initialized below.
+                    _buf[_dst] = _buf[_src]
+                if _pp:
+                    self._sk_maint._k_scale = float(getattr(_lyr, '_k_scale_float', 1.0) or 1.0)
+                    self._sk_maint.init_layer(_buf, _kvc, m.sk_pages, _pp, _kvc.dtype)
+
+    def _sk_current_row_ids(self, nd: int):
+        """Request id per decode row for THIS step, or None if unknown."""
+        runner = type(self)._offload_runner
+        ib = getattr(runner, "input_batch", None) if runner is not None else None
+        ids = list(getattr(ib, "req_ids", []) or [])[:nd]
+        if len(ids) != nd or any(i is None for i in ids):
+            return None
+        return [str(i) for i in ids]
+
+    def _sk_plan_row_moves(self, changed_rows, seqs, prev_all, nd):
+        """For each changed row, find the row its request occupied last step.
+
+        Slot == batch position, so when vLLM condenses the batch (a request
+        finished) a continuing request lands in a new row. Its codes already
+        exist in its OLD row; moving them is exact. Re-encoding from the
+        block table is NOT: under offload with true freeing the pages of its
+        offloaded blocks have been freed and possibly reused by other
+        requests, so the re-encoded codes would be garbage.
+        """
+        ids = self._sk_current_row_ids(nd)
+        owners = getattr(self, "_sk_row_owner", None)
+        moves: list[tuple[int, int]] = []
+        if ids is None or owners is None:
+            self._sk_assert_safe_reencode(changed_rows, ids)
+            return moves
+        old_row = {rid: r for r, rid in enumerate(owners) if rid is not None}
+        need_init = []
+        for b in changed_rows:
+            rid = ids[b]
+            src = old_row.get(rid)
+            if (src is not None and src != b
+                    and int(seqs[b]) in (int(prev_all[src]) + 1, int(prev_all[src]))):
+                moves.append((src, b))
+            else:
+                need_init.append(b)
+        self._sk_assert_safe_reencode(need_init, ids)
+        return moves
+
+    def _sk_assert_safe_reencode(self, rows, ids) -> None:
+        """Re-encoding reads K from the block table; refuse when any of the
+        request's blocks is no longer on its original GPU page."""
+        orch = type(self)._offload_orchestrator
+        if orch is None or not getattr(orch, "true_freeing", False) or not rows:
+            return
+        if ids is None:
+            if getattr(orch, "freed_pages", None):
+                raise RuntimeError(
+                    "PQ codes must be re-encoded for a changed decode row but "
+                    "request ids are unavailable while blocks are offloaded "
+                    "under true freeing; refusing to encode freed pages.")
+            return
+        freed = getattr(orch, "freed_pages", set())
+        for b in rows:
+            for ref in orch.residency.refs_for_request(ids[b]):
+                if ref in freed:
+                    raise RuntimeError(
+                        f"PQ codes for request {ids[b]} (row {b}) would be "
+                        "re-encoded from the block table, but its block "
+                        f"{ref.block_idx} is offloaded (pages freed); refusing.")
+
+    def _sk_record_row_owners(self, nd: int) -> None:
+        ids = self._sk_current_row_ids(nd)
+        owners = [None] * int(self._sk_maxbs)
+        if ids is not None:
+            owners[:nd] = ids
+        self._sk_row_owner = owners
 
     def _sk_fill_slots_syncfree(self, m, cm) -> None:
         """FlashInfer-style: detect summary (re)init purely from CPU seq_lens (no GPU

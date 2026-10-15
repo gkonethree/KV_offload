@@ -1,0 +1,20 @@
+=== 2026-10-15 13:44:47 smoke (pq+off70, 400 slots, 16 tokens)
+  decode-only TPOT: 200.36 ms/token
+=== 2026-10-15 13:47:40 start 8k4k_paged (pq+off70, attempt 1)
+  TTFT: 148.6 ms
+  decode-only TPOT: 377.17 ms/token
+=== 2026-10-15 14:16:19 start 8k4k_lru (pq+off70-lru, attempt 1)
+  TTFT: 149.9 ms
+  decode-only TPOT: 436.98 ms/token
+TPOT = decode-only, after a warm-up request (PQ codebook fit excluded).
+ceiling = one-pass traffic if every token of every block offloaded by the end were fetched once.
+
+run            TPOT ms  TTFT s  discover  fetch  sched (ms/tok)  staging offl.blk   tokMB  ceilMB  blkMB chunks/fetch
+8k4k_paged       377.2    0.15     80.67 217.40   0.10               400      532 1147835    1255      0         1.19
+8k4k_lru         437.0    0.15    106.74 227.46   0.10               400      532  965682    1255      0         1.15
+16k8k_paged   (not run yet)
+16k8k_lru     (not run yet)
+
+tokMB above ceilMB = re-fetches after staging evictions (scorer quality shows up here).
+chunks/fetch > 1 = per-token chunked fallback fired (a layer's cold set exceeded staging).
+=== 2026-10-15 14:49:19 done

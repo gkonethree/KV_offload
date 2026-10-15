@@ -1,0 +1,44 @@
+=== 2026-10-15 11:58:35 smoke test (warm-up mode, pq+off50, 16 tokens)
+  TTFT: 151.2 ms
+  decode-only TPOT: 152.85 ms/token
+=== 2026-10-15 12:02:28 start pq staging=auto (attempt 1)
+  total time: 128.7s
+  TTFT: 151.0 ms
+  decode-only TPOT: 62.78 ms/token
+=== 2026-10-15 12:08:16 start pq+off50 staging=auto (attempt 1)
+  total time: 158.0s
+  TTFT: 150.2 ms
+  decode-only TPOT: 77.11 ms/token
+=== 2026-10-15 12:14:33 start pq+off50-lru staging=auto (attempt 1)
+  total time: 154.0s
+  TTFT: 148.8 ms
+  decode-only TPOT: 75.17 ms/token
+=== 2026-10-15 12:20:38 start pq+off50-rand staging=auto (attempt 1)
+  total time: 146.5s
+  TTFT: 150.5 ms
+  decode-only TPOT: 71.50 ms/token
+=== 2026-10-15 12:26:23 start pq+off50 staging=709 (attempt 1)
+  total time: 161.9s
+  TTFT: 151.0 ms
+  decode-only TPOT: 79.04 ms/token
+=== 2026-10-15 12:33:02 start pq+off50-lru staging=709 (attempt 1)
+  total time: 162.0s
+  TTFT: 151.6 ms
+  decode-only TPOT: 79.05 ms/token
+=== 2026-10-15 12:39:24 start pq+off50-rand staging=709 (attempt 1)
+  total time: 166.5s
+  TTFT: 159.9 ms
+  decode-only TPOT: 81.27 ms/token
+TPOT = decode-only (first->last token, after a warm-up request that pays the PQ fit).
+config          staging  TPOT ms  Δ vs pq  TTFT s   discover  fetch  alloc  sched (ms/token)     tokMB   blkMB  tokens vs pq
+pq                 auto     62.8              0.2       0.00   0.00   0.00   0.00                   0       0  
+pq+off50           auto     77.1   +22.8%     0.2      10.56   0.84   0.00   0.12                 704       0  diff @50
+pq+off50-lru       auto     75.2   +19.7%     0.1      10.50   1.16   0.00   0.11                 702       0  diff @11
+pq+off50-rand      auto     71.5   +13.9%     0.2       9.77   0.84   0.00   0.11                 704       0  diff @50
+pq+off50            709     79.0   +25.9%     0.2      10.93   0.85   0.00   0.12                 704       0  diff @11
+pq+off50-lru        709     79.0   +25.9%     0.2      10.98   1.13   0.00   0.11                 704       0  diff @50
+pq+off50-rand       709     81.3   +29.5%     0.2      11.36   1.30   0.00   0.18                 704       0  diff @86
+
+blkMB > 0 means the chunked whole-block fallback fired (per-layer cold set > staging).
+Token differences vs pq are expected noise (pq itself is not run-to-run deterministic).
+=== 2026-10-15 12:45:23 done

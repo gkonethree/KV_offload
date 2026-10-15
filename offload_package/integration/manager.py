@@ -52,6 +52,10 @@ class OffloadOrchestrator:
         self.true_freeing = False
         # Last residency CPU-version seen by the lag prefetch (gate state).
         self._lag_seen_cpu_version = 0
+        # Blocks whose ORIGINAL GPU page has been returned to the allocator
+        # (true-free surgery done). Until then an offloaded block's page is
+        # still intact and readable through the block table.
+        self.freed_pages: set[BlockRef] = set()
 
     def _enable_sparse_mode(self) -> None:
         """Enable sparse attention offloading mode."""
@@ -322,4 +326,12 @@ class OffloadOrchestrator:
             self.staging_pool.release(ref)
             self.offload_manager.free(ref)
             self._scored.discard(ref)
+            self.freed_pages.discard(ref)
+        # The staging pool's eviction scorer is independent of the offload
+        # scorer (offload_manager.free only forgets the latter): drop the
+        # finished request's ticks too, or they accumulate forever and leak
+        # into a later request that reuses the id.
+        evict_scorer = getattr(self.staging_pool, "_eviction_scorer", None)
+        if evict_scorer is not None and evict_scorer is not self.offload_manager.scorer:
+            evict_scorer.forget(refs)
         self.controller.remove(request_id)
