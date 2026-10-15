@@ -1,0 +1,526 @@
+<title>PQ Selection Atlas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a lab notebook for one experiment. Summary strip, then a layer table that drives
+   everything below it: selection map, page anatomy, distributions. Pages-of-16 is the visual unit. */
+:root {
+  --bg: #f6f7f5;
+  --panel: #ffffff;
+  --ink: #17201d;
+  --muted: #5b6863;
+  --rule: #dfe4e1;
+  --sel: #0f766e;          /* selected token */
+  --sel-soft: #cfe7e3;
+  --waste: #d97706;        /* fetched with its page but never used */
+  --waste-soft: #fbe5c8;
+  --fixed: #6366a8;        /* sink + local: always resident */
+  --empty: #eceeed;        /* position not yet generated */
+  --focus: #0f766e;
+  --alt: #be185d;          /* extra series colour */
+  --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "Public Sans", "Segoe UI", system-ui, sans-serif;
+  --f-data: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101614; --panel: #161e1b; --ink: #e5ece9; --muted: #92a19b; --rule: #27322e;
+    --sel: #2dd4bf; --sel-soft: #1d3d39; --waste: #f59e0b; --waste-soft: #3d2c12;
+    --fixed: #8b8fe0; --empty: #1b2421; --focus: #2dd4bf; --alt: #f472b6; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101614; --panel: #161e1b; --ink: #e5ece9; --muted: #92a19b; --rule: #27322e;
+  --sel: #2dd4bf; --sel-soft: #1d3d39; --waste: #f59e0b; --waste-soft: #3d2c12;
+  --fixed: #8b8fe0; --empty: #1b2421; --focus: #2dd4bf; --alt: #f472b6; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 64px; display: grid; gap: 28px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: clamp(1.6rem, 3.2vw, 2.25rem); font-weight: 700; }
+h2 { font-size: 1.2rem; font-weight: 600; }
+h3 { font-size: 0.95rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+.muted { color: var(--muted); }
+.mono, .num { font-family: var(--f-data); font-variant-numeric: tabular-nums; }
+.label { font-family: var(--f-display); font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+header { display: grid; gap: 10px; }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 14px; font-family: var(--f-data); font-size: 0.8rem; color: var(--muted); }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; background: var(--panel); }
+.seg button { font: 500 0.85rem var(--f-body); color: var(--muted); background: none; border: 0; padding: 6px 12px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--sel); color: var(--panel); }
+button:focus-visible, input:focus-visible, select:focus-visible, tr:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+section { display: grid; gap: 14px; }
+.sec-head { display: grid; gap: 4px; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; min-width: 0; }
+
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.kpi { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; display: grid; gap: 4px; align-content: start; }
+.kpi .v { font-family: var(--f-data); font-size: 1.7rem; font-weight: 500; letter-spacing: -0.02em; }
+.kpi .v small { font-size: 0.85rem; color: var(--muted); }
+.kpi p { font-size: 0.85rem; color: var(--muted); }
+
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+th { text-align: left; font: 600 0.7rem var(--f-display); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+td { padding: 4px 8px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--sel-soft); }
+tbody tr[aria-selected="true"] { background: var(--sel-soft); box-shadow: inset 3px 0 0 var(--sel); }
+.cellbar { display: grid; grid-template-columns: 44px 70px; align-items: center; gap: 6px; font-family: var(--f-data); font-variant-numeric: tabular-nums; }
+.cellbar i { display: block; height: 6px; border-radius: 3px; background: var(--sel); }
+.cellbar i.w { background: var(--waste); }
+
+.layer-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.layer-bar input[type=range] { width: min(320px, 60vw); accent-color: var(--sel); }
+.layer-bar .num { font-size: 1.1rem; min-width: 5ch; }
+.navbtn { font: 600 0.85rem var(--f-body); border: 1px solid var(--rule); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+
+.mapbox { position: relative; overflow-x: auto; }
+canvas { display: block; max-width: 100%; }
+#heat { width: 100%; height: clamp(260px, 52vh, 560px); image-rendering: pixelated; border-radius: 4px; }
+.axis { display: flex; justify-content: space-between; font-family: var(--f-data); font-size: 0.72rem; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.8rem; color: var(--muted); align-items: center; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -2px; margin-right: 5px; }
+.ramp { display: inline-block; width: 90px; height: 10px; border-radius: 2px; vertical-align: -1px; margin: 0 6px; }
+.tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 0.78rem; padding: 6px 9px; border-radius: 5px; max-width: 320px; z-index: 10; line-height: 1.4; }
+.tip .mono { font-size: 0.74rem; }
+
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
+.chart { display: grid; gap: 8px; min-width: 0; }
+.chart p { font-size: 0.82rem; color: var(--muted); }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { fill: var(--muted); font-family: var(--f-data); font-size: 10px; }
+.note { font-size: 0.85rem; color: var(--muted); border-left: 2px solid var(--rule); padding-left: 12px; }
+#pages { width: 100%; height: auto; }
+.pagebar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.pagestats { display: flex; flex-wrap: wrap; gap: 6px 18px; font-family: var(--f-data); font-size: 0.8rem; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="label">KV offload · sparse attention trace</span>
+    <h1>Which tokens does PQ attention actually read?</h1>
+    <p class="muted">Every decode step, PQ scores all cached keys and each KV head keeps a sink window, a local window, and its top-k of the middle. This trace records that choice for every step, layer and KV head, then asks how much of each 16-token page a page-granular fetch would move for nothing.</p>
+    <div class="meta" id="meta"></div>
+    <div class="controls">
+      <span class="label">Prompt</span>
+      <div class="seg" id="traceSeg" role="group" aria-label="Trace"></div>
+    </div>
+  </header>
+
+  <section>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Layer by layer</h2>
+      <p class="muted">Averaged over all decode steps, middle region only. Click a row to inspect that layer below.</p>
+    </div>
+    <div class="panel tbl-wrap"><table id="layerTable"></table></div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Selection map</h2>
+      <p class="muted">Each row is a span of decode steps (time runs down), each column a 16-token page. Brighter means more KV heads picked tokens there. The right edge grows as tokens are generated.</p>
+    </div>
+    <div class="layer-bar">
+      <span class="label">Layer</span>
+      <button class="navbtn" id="prevL" aria-label="Previous layer">‹</button>
+      <input type="range" id="layerSlider" min="0" max="21" value="0" aria-label="Layer">
+      <button class="navbtn" id="nextL" aria-label="Next layer">›</button>
+      <span class="num" id="layerNum">L0</span>
+    </div>
+    <div class="panel" style="display:grid;gap:8px">
+      <div class="mapbox"><canvas id="heat"></canvas></div>
+      <div class="axis"><span>page 0 (token 0)</span><span id="axisMid"></span><span id="axisEnd"></span></div>
+      <div class="legend">
+        <span>none<span class="ramp" id="rampSw"></span>all 4 heads</span>
+        <span><span class="sw" style="background:var(--empty)"></span>not generated yet</span>
+        <span id="promptMark"></span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Page anatomy at one step</h2>
+      <p class="muted">The KV cache of this layer at a single decode step, one column of 16 cells per page. Teal cells were selected. Amber cells sit in a page that some head needed, so a page fetch moves them too, but no head used them.</p>
+    </div>
+    <div class="pagebar">
+      <span class="label">Step</span>
+      <input type="range" id="stepSlider" min="0" max="15" value="0" aria-label="Sampled decode step">
+      <span class="num mono" id="stepNum"></span>
+    </div>
+    <div class="panel" style="display:grid;gap:10px">
+      <div class="pagestats" id="pageStats"></div>
+      <canvas id="pages"></canvas>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--sel)"></span>selected (darker = more heads)</span>
+        <span><span class="sw" style="background:var(--waste-soft);outline:1px solid var(--waste)"></span>moved by page fetch, unused</span>
+        <span><span class="sw" style="background:var(--fixed)"></span>sink / local window</span>
+        <span><span class="sw" style="background:var(--empty)"></span>untouched page</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2 id="distTitle">Distributions</h2>
+      <p class="muted">Where the bytes go for the selected layer, and how stable the selection is.</p>
+    </div>
+    <div class="grid2">
+      <div class="panel chart"><h3>Tokens used per fetched page</h3><p>Out of 16. A page fetch pays for all 16 either way.</p><svg id="chHist"></svg></div>
+      <div class="panel chart"><h3>Bytes moved per step, by fetch granularity</h3><p>Relative to fetching exactly the selected (token, head) pairs.</p><svg id="chVol"></svg></div>
+      <div class="panel chart"><h3>Reuse across steps</h3><p>Selected per step, and how many would be new if staging kept the last 1 or 16 steps.</p><svg id="chReuse"></svg></div>
+      <div class="panel chart"><h3>Distance back from the current token</h3><p>Middle-region selections only, by how far behind the newest token they sit.</p><svg id="chRec"></svg></div>
+      <div class="panel chart"><h3>Concentration</h3><p>Share of all selections captured by the most-picked positions (Lorenz curve).</p><svg id="chLor"></svg></div>
+      <div class="panel chart"><h3>Over the course of decoding</h3><p>Page utilisation (tokens per page), and step-to-step overlap.</p><svg id="chSeries"></svg></div>
+    </div>
+  </section>
+
+  <section id="simSection">
+    <div class="sec-head">
+      <h2>Prefetch simulator</h2>
+      <p class="muted">Replays this trace with every middle page on the CPU and a per-layer GPU cache that holds C pages. Pages a layer needs but the cache lacks must be streamed in. A prefetcher guesses them before the layer runs, so a correct guess arrives in the background (hidden) and a miss stalls the GPU (exposed). Wrong guesses cost transfer only.</p>
+    </div>
+    <div class="controls">
+      <span class="label">GPU cache, as % of pages needed per step</span>
+      <div class="seg" id="capSeg" role="group" aria-label="Cache size"></div>
+      <span class="muted mono" id="capNote"></span>
+    </div>
+    <div class="kpis" id="simKpis"></div>
+    <div class="grid2">
+      <div class="panel chart"><h3>Stalls vs cache size</h3><p>Exposed pages per step per layer, averaged over layers.</p><svg id="chSimCurve"></svg></div>
+      <div class="panel chart"><h3>Where the streamed pages go</h3><p>At the selected cache size, pages per step per layer.</p><svg id="chSimStack"></svg></div>
+      <div class="panel chart"><h3>Stalls by layer</h3><p>Exposed pages per step at the selected cache size.</p><svg id="chSimLayer"></svg></div>
+      <div class="panel chart" style="gap:10px"><h3>Can a predictor see new pages coming?</h3><p>Of the pages a layer needs at step t that it did not need at t−1, the share each predictor would have named. Averaged over layers.</p><div class="tbl-wrap"><table id="recallTable"></table></div></div>
+    </div>
+    <p class="note" id="simNote"></p>
+  </section>
+
+  <p class="note" id="footnote"></p>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script id="atlas-data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  const ALL = JSON.parse(document.getElementById('atlas-data').textContent);
+  const names = Object.keys(ALL);
+  const state = { trace: names[0], layer: 0, sample: 0 };
+  const $ = (id) => document.getElementById(id);
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const fmt = (x, d = 2) => (x == null || Number.isNaN(x)) ? '–' : Number(x).toFixed(d);
+  const pct = (x, d = 0) => (x == null) ? '–' : (100 * x).toFixed(d) + '%';
+  const dec = {};
+  function bytes(b64) { const s = atob(b64); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+  function D() { const d = ALL[state.trace]; if (!dec[state.trace]) dec[state.trace] = { heat: bytes(d.heat), samples: bytes(d.samples) }; return d; }
+  function hexToRgb(h) { h = h.replace('#', ''); if (h.length === 3) h = h.split('').map(c => c + c).join(''); const n = parseInt(h, 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+  function mix(a, b, t) { return [0, 1, 2].map(i => Math.round(a[i] + (b[i] - a[i]) * t)); }
+  const tokText = (t) => (t || '').replace(/▁/g, ' ').replace(/<0x0A>/g, '↵');
+
+  // ---- header / trace switch
+  function renderSeg() {
+    const seg = $('traceSeg'); seg.innerHTML = '';
+    names.forEach(n => {
+      const b = document.createElement('button');
+      b.textContent = n === 'repeat' ? 'Repeated sentence' : n === 'varied' ? 'Varied observations' : n;
+      b.setAttribute('aria-pressed', String(n === state.trace));
+      b.onclick = () => { state.trace = n; state.layer = Math.min(state.layer, D().layers.length - 1); renderAll(); };
+      seg.appendChild(b);
+    });
+  }
+  function renderMeta() {
+    const d = D(), m = d.meta, e = m.sparse_env;
+    $('meta').innerHTML = [
+      m.model.split('/').pop(), `${m.n_layers} layers`, `${m.n_kv_heads} KV heads (${m.n_q_heads} query)`,
+      `prompt ${m.prompt_len} tok`, `+${m.new_tokens} generated`, `page ${m.page_size}`,
+      `top-k ${e.SKYLIGHT_SPARSE_TOPK} of max_model_len ${m.max_model_len}`, `sink ${e.SKYLIGHT_SPARSE_SINK}`, `local ${e.SKYLIGHT_SPARSE_LOCAL}`
+    ].map(s => `<span>${s}</span>`).join('');
+  }
+
+  // ---- KPIs (all layers)
+  function renderKpis() {
+    const L = D().layers;
+    const sum = (k) => L.reduce((a, l) => a + l.volume[k], 0);
+    const pageVsTH = sum('page') / sum('token_head');
+    const pageVsT = sum('page') / sum('token');
+    const util = L.reduce((a, l) => a + l.util_union, 0) / L.length;
+    const jac = L.reduce((a, l) => a + l.jaccard, 0) / L.length;
+    const agree = L.reduce((a, l) => a + l.head_pair_jaccard, 0) / L.length;
+    const sp = L.reduce((a, l) => a + l.sparsity, 0) / L.length;
+    const new16 = L.reduce((a, l) => a + l.new_tok_16 / Math.max(l.sel_tok, 1), 0) / L.length;
+    $('kpis').innerHTML = [
+      ['Page fetch moves', `${fmt(pageVsTH, 1)}<small>×</small>`, `the bytes of fetching only the selected (token, head) pairs; ${fmt(pageVsT, 1)}× vs per-token fetch of all heads.`],
+      ['Tokens used per page', `${fmt(util, 1)}<small> / 16</small>`, 'when a page is touched by any head, averaged over layers and steps.'],
+      ['Middle tokens kept', pct(sp, 1), 'per KV head per step: the top-k share of the middle region.'],
+      ['Step-to-step overlap', pct(jac), `Jaccard of consecutive selections. With a 16-step cache, ${pct(new16)} of picks are new each step.`],
+      ['Head agreement', pct(agree), 'average pairwise Jaccard between KV heads of a layer.'],
+    ].map(([k, v, p]) => `<div class="kpi"><span class="label">${k}</span><span class="v">${v}</span><p>${p}</p></div>`).join('');
+  }
+
+  // ---- layer table
+  function renderTable() {
+    const L = D().layers;
+    const maxW = Math.max(...L.map(l => l.volume.page / l.volume.token_head));
+    const bar = (v, max, txt, cls = '') => `<div class="cellbar"><span>${txt}</span><i class="${cls}" style="width:${Math.max(2, 70 * v / max)}px"></i></div>`;
+    let h = '<thead><tr><th>Layer</th><th>Kept</th><th>Tokens / page</th><th>Page ÷ token-head bytes</th><th>Step overlap</th><th>Head agreement</th><th>Never picked</th></tr></thead><tbody>';
+    L.forEach(l => {
+      const w = l.volume.page / l.volume.token_head;
+      h += `<tr tabindex="0" data-l="${l.layer}" aria-selected="${l.layer === state.layer}">
+        <td class="num">L${l.layer}</td>
+        <td>${bar(l.sparsity, 1, pct(l.sparsity, 1))}</td>
+        <td>${bar(l.util_union, 16, fmt(l.util_union, 1))}</td>
+        <td>${bar(w, maxW, fmt(w, 1) + '×', 'w')}</td>
+        <td>${bar(l.jaccard, 1, pct(l.jaccard))}</td>
+        <td>${bar(l.head_pair_jaccard, 1, pct(l.head_pair_jaccard))}</td>
+        <td class="num">${pct(l.never_frac)}</td></tr>`;
+    });
+    $('layerTable').innerHTML = h + '</tbody>';
+    $('layerTable').querySelectorAll('tbody tr').forEach(tr => {
+      const go = () => setLayer(+tr.dataset.l);
+      tr.onclick = go; tr.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } };
+    });
+  }
+
+  // ---- selection heatmap
+  function renderHeat() {
+    const d = D(), cv = $('heat'), P = d.P, SB = d.sb;
+    const heat = dec[state.trace].heat.subarray(state.layer * SB * P, (state.layer + 1) * SB * P);
+    cv.width = P; cv.height = SB;
+    const ctx = cv.getContext('2d'), img = ctx.createImageData(P, SB);
+    const c0 = hexToRgb(css('--panel')), c1 = hexToRgb(css('--sel')), ce = hexToRgb(css('--empty'));
+    const lut = []; for (let v = 0; v <= 250; v++) lut.push(mix(c0, c1, Math.pow(v / 250, 0.6)));
+    for (let i = 0; i < SB * P; i++) {
+      const v = heat[i], c = v === 255 ? ce : lut[v];
+      img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1]; img.data[i * 4 + 2] = c[2]; img.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    const pp = Math.floor(d.meta.prompt_len / 16);
+    ctx.fillStyle = css('--waste'); ctx.globalAlpha = 0.9; ctx.fillRect(pp, 0, 1, Math.max(2, Math.round(SB * 0.04))); ctx.globalAlpha = 1;
+    $('rampSw').style.background = `linear-gradient(90deg, ${css('--panel')}, ${css('--sel')})`;
+    $('axisMid').textContent = `prompt ends at page ${pp} (orange tick)`;
+    $('axisEnd').textContent = `page ${P - 1} (token ${P * 16 - 1})`;
+    $('promptMark').innerHTML = `rows: ${d.step_bin} decode steps each, ${d.steps} steps total`;
+  }
+  function heatHover(e) {
+    const d = D(), cv = $('heat'), r = cv.getBoundingClientRect();
+    const p = Math.floor((e.clientX - r.left) / r.width * d.P), sb = Math.floor((e.clientY - r.top) / r.height * d.sb);
+    if (p < 0 || p >= d.P || sb < 0 || sb >= d.sb) { $('tip').hidden = true; return; }
+    const v = dec[state.trace].heat[state.layer * d.sb * d.P + sb * d.P + p];
+    const toks = (d.tokens || []).slice(p * 16, p * 16 + 16).map(tokText).join('');
+    const s0 = sb * d.step_bin, s1 = Math.min(d.steps, s0 + d.step_bin) - 1;
+    showTip(e, `<b>page ${p}</b> · tokens ${p * 16}–${p * 16 + 15}<br>steps ${s0}–${s1} · ${v === 255 ? 'not generated yet' : pct(v / 250) + ' of head-token slots picked'}${toks ? `<br><span class="mono">“${escapeHtml(toks.slice(0, 120))}”</span>` : ''}`);
+  }
+  function escapeHtml(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function showTip(e, html) { const t = $('tip'); t.innerHTML = html; t.hidden = false; const x = Math.min(e.clientX + 14, innerWidth - 330); t.style.left = x + 'px'; t.style.top = (e.clientY + 14) + 'px'; }
+
+  // ---- page anatomy
+  function renderPages() {
+    const d = D(), ns = d.sample_steps.length, Lp = d.Lp;
+    $('stepSlider').max = ns - 1; if (state.sample >= ns) state.sample = ns - 1;
+    const step = d.sample_steps[state.sample], L = d.lengths[step];
+    $('stepNum').textContent = `step ${step} · context ${L} tokens`;
+    const row = dec[state.trace].samples.subarray((state.layer * ns + state.sample) * Lp, (state.layer * ns + state.sample + 1) * Lp);
+    const nP = Math.ceil(L / 16), per = Math.max(24, Math.min(64, Math.ceil(nP / Math.ceil(nP / 64))));
+    const rows = Math.ceil(nP / per), cw = 9, ch = 4, gap = 2, bandH = 16 * ch + 10;
+    const cv = $('pages'); const dpr = window.devicePixelRatio || 1;
+    const W = per * (cw + gap) + 30, H = rows * bandH;
+    cv.width = W * dpr; cv.height = H * dpr; cv.style.aspectRatio = `${W} / ${H}`;
+    const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+    const sel = hexToRgb(css('--sel')), soft = css('--sel-soft'), waste = css('--waste-soft'), fixed = css('--fixed'), empty = css('--empty');
+    const mid0 = d.sink, mid1 = L - d.local;
+    let touched = 0, used = 0, headSlots = 0;
+    ctx.font = `10px ${css('--f-data')}`; ctx.fillStyle = css('--muted');
+    for (let p = 0; p < nP; p++) {
+      const r = Math.floor(p / per), c = p % per, x = 30 + c * (cw + gap), y = r * bandH;
+      if (c === 0) ctx.fillText(String(p), 0, y + 10);
+      let any = false;
+      for (let t = 0; t < 16; t++) { const i = p * 16 + t; if (i >= mid0 && i < mid1 && row[i]) any = true; }
+      if (any) touched++;
+      for (let t = 0; t < 16; t++) {
+        const i = p * 16 + t; let col;
+        if (i >= L) col = null;
+        else if (i < mid0 || i >= mid1) col = fixed;
+        else if (row[i]) {
+          const n = (row[i] & 1) + ((row[i] >> 1) & 1) + ((row[i] >> 2) & 1) + ((row[i] >> 3) & 1);
+          used++; headSlots += n;
+          const c2 = mix(hexToRgb(soft.startsWith('#') ? soft : '#cccccc'), sel, 0.35 + 0.65 * n / 4); col = `rgb(${c2})`;
+        } else col = any ? waste : empty;
+        if (!col) continue;
+        ctx.fillStyle = col; ctx.fillRect(x, y + t * ch, cw, ch - 1);
+      }
+      ctx.fillStyle = css('--muted');
+    }
+    const pageSlots = touched * 16 * d.meta.n_kv_heads;
+    $('pageStats').innerHTML = `<span>${touched} pages touched</span><span>${used} tokens selected</span><span>${fmt(used / Math.max(touched, 1), 1)} tokens / touched page</span><span>page fetch moves ${fmt(pageSlots / Math.max(headSlots, 1), 1)}× the selected (token, head) bytes</span>`;
+  }
+
+  // ---- small SVG charts
+  function axes(W, H, m) { return `<line x1="${m.l}" y1="${H - m.b}" x2="${W - m.r}" y2="${H - m.b}" stroke="var(--rule)"/>`; }
+  function barsChart(id, cats, series, opts = {}) {
+    const W = 420, H = 210, m = { l: 40, r: 8, t: 10, b: 28 };
+    const max = opts.max || Math.max(...series.flatMap(s => s.values)) * 1.08 || 1;
+    const n = cats.length, gw = (W - m.l - m.r) / n, bw = Math.max(2, (gw - 3) / series.length);
+    let g = axes(W, H, m);
+    for (let k = 0; k <= 4; k++) { const v = max * k / 4, y = H - m.b - (H - m.t - m.b) * k / 4; g += `<line x1="${m.l}" x2="${W - m.r}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-dasharray="2 3"/><text x="${m.l - 5}" y="${y + 3}" text-anchor="end">${opts.yfmt ? opts.yfmt(v) : fmt(v, v < 10 ? 1 : 0)}</text>`; }
+    cats.forEach((c, i) => {
+      series.forEach((s, j) => { const v = s.values[i], h = (H - m.t - m.b) * v / max; g += `<rect x="${m.l + i * gw + 1.5 + j * bw}" y="${H - m.b - h}" width="${bw - 1}" height="${Math.max(0, h)}" fill="${s.color}"><title>${c}: ${opts.vfmt ? opts.vfmt(v) : fmt(v)}</title></rect>`; });
+      if (!opts.every || i % opts.every === 0 || i === n - 1) g += `<text x="${m.l + i * gw + gw / 2}" y="${H - m.b + 13}" text-anchor="middle">${c}</text>`;
+    });
+    if (opts.labels) opts.labels.forEach((t, i) => { const v = series[0].values[i], h = (H - m.t - m.b) * v / max; g += `<text x="${m.l + i * gw + gw / 2}" y="${H - m.b - h - 4}" text-anchor="middle" style="fill:var(--ink)">${t}</text>`; });
+    if (series.length > 1) g += series.map((s, j) => `<rect x="${m.l + 6 + j * 120}" y="${m.t}" width="9" height="9" fill="${s.color}"/><text x="${m.l + 19 + j * 120}" y="${m.t + 8}">${s.name}</text>`).join('');
+    $(id).setAttribute('viewBox', `0 0 ${W} ${H}`); $(id).innerHTML = g;
+  }
+  function lineChart(id, xs, series, opts = {}) {
+    const W = 420, H = 210, m = { l: 40, r: 40, t: 18, b: 28 };
+    let g = axes(W, H, m);
+    const xmax = opts.xmax || xs[xs.length - 1] || 1;
+    const X = (x) => m.l + (W - m.l - m.r) * x / xmax;
+    series.forEach((s, j) => {
+      const max = s.max, side = s.side || 'l';
+      for (let k = 0; k <= 4 && (j === 0 || side === 'r'); k++) {
+        const y = H - m.b - (H - m.t - m.b) * k / 4;
+        if (j === 0) g += `<line x1="${m.l}" x2="${W - m.r}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-dasharray="2 3"/>`;
+        g += `<text x="${side === 'l' ? m.l - 5 : W - m.r + 5}" y="${y + 3}" text-anchor="${side === 'l' ? 'end' : 'start'}" style="fill:${s.color}">${s.fmt(max * k / 4)}</text>`;
+      }
+      let d = ''; s.values.forEach((v, i) => { if (v == null) return; const y = H - m.b - (H - m.t - m.b) * Math.min(1, v / max); d += (d ? 'L' : 'M') + X(xs[i]).toFixed(1) + ' ' + y.toFixed(1); });
+      if (s.area) { const first = s.values.findIndex(v => v != null); g += `<path d="${d} L${X(xs[s.values.length - 1])} ${H - m.b} L${X(xs[first])} ${H - m.b} Z" fill="${s.color}" fill-opacity="0.12" stroke="none"/>`; }
+      g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8"/>`;
+      if (!opts.noLegend) g += `<rect x="${m.l + 6 + j * 150}" y="2" width="9" height="9" fill="${s.color}"/><text x="${m.l + 19 + j * 150}" y="10">${s.name}</text>`;
+    });
+    (opts.xticks || []).forEach(t => { g += `<text x="${X(t)}" y="${H - m.b + 13}" text-anchor="middle">${opts.xfmt ? opts.xfmt(t) : t}</text>`; });
+    if (opts.diag) g += `<line x1="${X(0)}" y1="${H - m.b}" x2="${X(xmax)}" y2="${m.t}" stroke="var(--rule)" stroke-dasharray="4 3"/>`;
+    $(id).setAttribute('viewBox', `0 0 ${W} ${H}`); $(id).innerHTML = g;
+  }
+  function renderCharts() {
+    const d = D(), l = d.layers[state.layer], sel = css('--sel'), waste = css('--waste'), fixed = css('--fixed'), muted = css('--muted');
+    $('distTitle').textContent = `Distributions · layer ${state.layer}`;
+    const hn = (a) => { const s = a.reduce((x, y) => x + y, 0) || 1; return a.map(v => v / s); };
+    barsChart('chHist', [...Array(16)].map((_, i) => i + 1), [
+      { name: 'any head', values: hn(l.hist_union), color: sel },
+      { name: 'per head', values: hn(l.hist_head), color: fixed },
+    ], { yfmt: (v) => pct(v), vfmt: (v) => pct(v, 1), every: 1 });
+    const v = l.volume, base = v.token_head || 1, keys = ['page', 'page_head', 'token', 'token_head'];
+    barsChart('chVol', ['page (today)', 'page per head', 'token', 'token per head'], [
+      { name: 'bytes', values: keys.map(k => v[k] / base), color: waste },
+    ], { yfmt: (x) => fmt(x, 0) + '×', vfmt: (x) => fmt(x, 2) + '×', labels: keys.map(k => fmt(v[k] / base, 1) + '×') });
+    barsChart('chReuse', ['tokens', 'pages'], [
+      { name: 'selected', values: [l.sel_tok, l.sel_pg], color: sel },
+      { name: 'new vs last step', values: [l.new_tok_1, l.new_pg_1], color: waste },
+      { name: 'new vs last 16', values: [l.new_tok_16, l.new_pg_16], color: fixed },
+    ], { vfmt: (x) => fmt(x, 1) + ' / step' });
+    const edges = d.recency_edges, labs = edges.map((e, i) => i === edges.length - 1 ? `${e}+` : `${e}`);
+    barsChart('chRec', labs, [{ name: 'share', values: hn(l.recency), color: sel }], { yfmt: (x) => pct(x), vfmt: (x) => pct(x, 1) });
+    const q = l.lorenz.map((_, i) => (i + 1) / l.lorenz.length);
+    lineChart('chLor', q, [{ name: 'share of selections', values: l.lorenz, max: 1, color: sel, area: true, fmt: (x) => pct(x) }],
+      { xmax: 1, xticks: [0, 0.25, 0.5, 0.75, 1], xfmt: (x) => pct(x) + ' of positions', diag: true });
+    const n = l.series.util_union.length, xs = [...Array(n)].map((_, i) => i * d.step_bin);
+    lineChart('chSeries', xs, [
+      { name: 'tokens per touched page', values: l.series.util_union, max: 16, color: waste, fmt: (x) => fmt(x, 0) },
+      { name: 'step overlap', values: l.series.jaccard, max: 1, color: sel, side: 'r', fmt: (x) => pct(x) },
+    ], { xmax: d.steps, xticks: [0, Math.round(d.steps / 2), d.steps], xfmt: (x) => `step ${x}` });
+    renderSim();
+  }
+
+  // ---- prefetch simulator
+  const POL = {
+    'none': ['No prefetch', '--muted'], 'prev': ['Last step', '--sel'], 'prev+spatial1': ['Last step ±1 page', '--fixed'],
+    'history16': ['Last 16 steps', '--ink'], 'crosslayer': ['Previous layer', '--waste'], 'cross+prev': ['Prev. layer + last step', '--alt'],
+    'perfect': ['Perfect knowledge', '--rule'],
+  };
+  const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  function legendHtml(pols) { return pols.map(p => `<span><span class="sw" style="background:var(${POL[p][1]})"></span>${POL[p][0]}</span>`).join(''); }
+  function renderSim() {
+    const d = D(), sim = d.sim;
+    $('simSection').hidden = !sim; if (!sim) return;
+    if (state.cap == null || state.cap >= sim.caps.length) state.cap = 1;
+    const seg = $('capSeg'); seg.innerHTML = '';
+    sim.caps.forEach((c, i) => {
+      const b = document.createElement('button'); b.textContent = pct(sim.cap_fracs[i]);
+      b.title = `${c} pages per layer`; b.setAttribute('aria-pressed', String(i === state.cap));
+      b.onclick = () => { state.cap = i; renderSim(); }; seg.appendChild(b);
+    });
+    const C = sim.caps[state.cap], T = (p) => sim.table[p][String(C)];
+    const need = sim.hot_pages, floor = Math.max(0, need - C);
+    $('capNote').textContent = `GPU cache holds ${C} pages per layer. Each step, a layer's selected tokens fall in about ${fmt(need, 0)} different pages, so ${floor > 0.5 ? `at least ${fmt(floor, 0)} pages per layer must come from the CPU every step` : 'everything it needs can stay on the GPU'}.`;
+    const ex = (p) => mean(T(p).exposed), hi = (p) => mean(T(p).hidden), wa = (p) => mean(T(p).wasted);
+    const streamed = ex('none'), mb = (pages) => pages * sim.page_bytes * sim.layers / 1e6;
+    $('simKpis').innerHTML = [
+      ['Streamed per step', `${fmt(streamed, 1)}<small> pages/layer</small>`, `${fmt(mb(streamed), 1)} MB per decode step across ${sim.layers} layers. Set by cache size, not by the prefetcher.`],
+      ['Stalls, no prefetch', `${fmt(ex('none'), 1)}`, 'pages per layer per step fetched while the GPU waits.'],
+      ['Stalls, last-step prefetch', `${fmt(ex('prev'), 1)}`, `${pct(1 - ex('prev') / Math.max(ex('none'), 1e-9))} hidden, ${fmt(wa('prev'), 1)} wasted pages per step.`],
+      ['Stalls, 16-step history', `${fmt(ex('history16'), 1)}`, `${pct(1 - ex('history16') / Math.max(ex('none'), 1e-9))} hidden, ${fmt(wa('history16'), 1)} wasted pages per step.`],
+    ].map(([k, v, p]) => `<div class="kpi"><span class="label">${k}</span><span class="v">${v}</span><p>${p}</p></div>`).join('');
+
+    const pols = sim.policies, col = (p) => css(POL[p][1]);
+    lineChart('chSimCurve', sim.cap_fracs, pols.map(p => ({
+      name: POL[p][0], values: sim.caps.map(c => mean(sim.table[p][String(c)].exposed)),
+      max: Math.max(...sim.caps.map(c => mean(sim.table.none[String(c)].exposed))) * 1.05 || 1, color: col(p), fmt: (x) => fmt(x, 0),
+    })), { xmax: sim.cap_fracs[sim.cap_fracs.length - 1], xticks: sim.cap_fracs.filter((_, i) => i % 2 === 0 || i === sim.cap_fracs.length - 1), xfmt: (x) => pct(x) + ' of need', noLegend: true });
+    $('chSimCurve').insertAdjacentHTML('afterend', '');
+    let leg = $('simLegend'); if (!leg) { leg = document.createElement('div'); leg.id = 'simLegend'; leg.className = 'legend'; $('chSimCurve').after(leg); }
+    leg.innerHTML = legendHtml(pols);
+
+    // stacked horizontal bars
+    const W = 420, rowH = 24, m = { l: 150, r: 12, t: 6, b: 24 }, H = m.t + pols.length * rowH + m.b;
+    const max = Math.max(...pols.map(p => hi(p) + ex(p) + wa(p))) * 1.05 || 1, X = (v) => (W - m.l - m.r) * v / max;
+    let g = '';
+    pols.forEach((p, i) => {
+      const y = m.t + i * rowH; let x = m.l;
+      g += `<text x="${m.l - 8}" y="${y + 15}" text-anchor="end" style="fill:var(--ink)">${POL[p][0]}</text>`;
+      [['hidden', hi(p), '--sel'], ['exposed', ex(p), '--waste'], ['wasted', wa(p), '--muted']].forEach(([k, v, c]) => {
+        g += `<rect x="${x}" y="${y + 4}" width="${Math.max(0, X(v))}" height="${rowH - 9}" fill="var(${c})" ${k === 'wasted' ? 'fill-opacity="0.45"' : ''}><title>${POL[p][0]}: ${k} ${fmt(v, 1)} pages/step</title></rect>`; x += X(v);
+      });
+    });
+    for (let k = 0; k <= 4; k++) { const v = max * k / 4; g += `<text x="${m.l + X(v)}" y="${H - 6}" text-anchor="middle">${fmt(v, 0)}</text>`; }
+    $('chSimStack').setAttribute('viewBox', `0 0 ${W} ${H}`); $('chSimStack').innerHTML = g;
+    let leg2 = $('simLegend2'); if (!leg2) { leg2 = document.createElement('div'); leg2.id = 'simLegend2'; leg2.className = 'legend'; $('chSimStack').after(leg2); }
+    leg2.innerHTML = '<span><span class="sw" style="background:var(--sel)"></span>hidden (prefetched in time)</span><span><span class="sw" style="background:var(--waste)"></span>exposed (GPU stalls)</span><span><span class="sw" style="background:var(--muted);opacity:.45"></span>wasted transfer</span>';
+
+    const lp = ['none', 'prev', 'history16', 'crosslayer'], xs = [...Array(sim.layers)].map((_, i) => i);
+    lineChart('chSimLayer', xs, lp.map(p => ({ name: POL[p][0], values: T(p).exposed, max: Math.max(...T('none').exposed) * 1.05 || 1, color: col(p), fmt: (x) => fmt(x, 0) })),
+      { xmax: sim.layers - 1, xticks: [0, 5, 10, 15, sim.layers - 1], xfmt: (x) => 'L' + x, noLegend: true });
+    let leg3 = $('simLegend3'); if (!leg3) { leg3 = document.createElement('div'); leg3.id = 'simLegend3'; leg3.className = 'legend'; $('chSimLayer').after(leg3); }
+    leg3.innerHTML = legendHtml(lp);
+
+    const R = sim.recall, keys = [['spatial1', '±1 page of last step'], ['spatial2', '±2 pages of last step'], ['history16', 'used in last 16 steps'], ['crosslayer', 'previous layer, same step'], ['cross+spatial1', 'previous layer + ±1 page']];
+    let h = '<thead><tr><th>Predictor</th><th>Recall (mean)</th><th>Worst layer</th><th>Best layer</th></tr></thead><tbody>';
+    keys.forEach(([k, lab]) => { const v = R.map(r => r[k]); h += `<tr><td>${lab}</td><td class="num">${pct(mean(v))}</td><td class="num">${pct(Math.min(...v))}</td><td class="num">${pct(Math.max(...v))}</td></tr>`; });
+    $('recallTable').innerHTML = h + `</tbody><caption style="caption-side:bottom;text-align:left;padding-top:8px" class="muted">New pages per step: ${fmt(mean(R.map(r => r.new)), 1)} of ${fmt(mean(R.map(r => r.need)), 0)} needed, per layer.</caption>`;
+    $('simNote').textContent = `Assumptions: off99-style residency (all middle pages on CPU unless cached), one LRU cache per layer, sink/local pages always resident, and enough PCIe bandwidth to land every predicted page before its layer runs. Page = ${sim.page_bytes / 1024} KB (16 tokens × ${D().meta.n_kv_heads} KV heads × K and V, fp16). Bandwidth contention and transfer latency are not modelled.`;
+  }
+
+  function setLayer(l) {
+    const n = D().layers.length; state.layer = Math.max(0, Math.min(n - 1, l));
+    $('layerSlider').value = state.layer; $('layerNum').textContent = 'L' + state.layer;
+    $('layerTable').querySelectorAll('tbody tr').forEach(tr => tr.setAttribute('aria-selected', String(+tr.dataset.l === state.layer)));
+    renderHeat(); renderPages(); renderCharts();
+  }
+  function renderAll() {
+    const d = D();
+    renderSeg(); renderMeta(); renderKpis(); renderTable();
+    $('layerSlider').max = d.layers.length - 1;
+    setLayer(state.layer);
+    $('footnote').textContent = `Bytes are counted in (token × KV head) slots, so ratios are byte ratios. Sink and local windows are excluded from fetch accounting because they stay resident. Positions picked in fewer than 64 eligible steps are left out of "never picked". Generated text (first 160 chars): “${(d.meta.output_text || '').slice(0, 160).replace(/\s+/g, ' ')}”`;
+  }
+
+  $('layerSlider').oninput = (e) => setLayer(+e.target.value);
+  $('prevL').onclick = () => setLayer(state.layer - 1);
+  $('nextL').onclick = () => setLayer(state.layer + 1);
+  $('stepSlider').oninput = (e) => { state.sample = +e.target.value; renderPages(); };
+  $('heat').addEventListener('mousemove', heatHover);
+  $('heat').addEventListener('mouseleave', () => { $('tip').hidden = true; });
+  const rerender = () => { renderHeat(); renderPages(); renderCharts(); };
+  try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', rerender); } catch (e) {}
+  new MutationObserver(rerender).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  renderAll();
+})();
+</script>

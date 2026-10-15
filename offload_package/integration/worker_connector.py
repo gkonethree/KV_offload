@@ -153,6 +153,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             scorer_head_reduction=self.offload_config.scorer_head_reduction,
             scorer_type=self.offload_config.scorer_type,
             staging_eviction=self.offload_config.staging_eviction,
+            staging_granularity=self.offload_config.staging_granularity,
         )
 
         # Get the PQ wrapper from the model runner's attention groups

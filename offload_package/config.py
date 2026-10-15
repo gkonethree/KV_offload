@@ -29,6 +29,10 @@ class OffloadConfig:
     # actual re-fetch cost driver); "scorer": inherit the offload scorer;
     # "random": uncorrelated control.
     staging_eviction: str = "lru"
+    # "block": a staged block holds every layer's KV in one shared slot
+    # (KVStagingPool). "layer": stage only the layer that selected it, each
+    # layer with its own num_staging_slots region (PerLayerStagingPool).
+    staging_granularity: str = "block"
     # Auto mode: cap staging at this fraction of the GPU KV pool.
     staging_max_pool_frac: float = 0.25
     # Auto mode: multiply the computed estimate by this headroom factor.
@@ -53,6 +57,7 @@ class OffloadConfig:
             staging_max_pool_frac=float(os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")),
             staging_safety_margin=float(os.getenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")),
             staging_eviction=os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru"),
+            staging_granularity=os.getenv("OFFLOAD_PACKAGE_STAGING_GRANULARITY", "block"),
         )
 
     def __post_init__(self):
@@ -66,5 +71,7 @@ class OffloadConfig:
             raise ValueError("staging_max_pool_frac must be in (0, 1]")
         if self.staging_eviction not in ("scorer", "lru", "random"):
             raise ValueError("staging_eviction must be 'scorer', 'lru' or 'random'")
+        if self.staging_granularity not in ("block", "layer"):
+            raise ValueError("staging_granularity must be 'block' or 'layer'")
         if self.staging_safety_margin < 1.0:
             raise ValueError("staging_safety_margin must be >= 1.0")

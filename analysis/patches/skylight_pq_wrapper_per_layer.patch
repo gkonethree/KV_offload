@@ -1,0 +1,189 @@
+diff --git a/pq_optimized/batch_decode_with_paged_kv_cache_wrapper.py b/pq_optimized/batch_decode_with_paged_kv_cache_wrapper.py
+index a4929d1..f2e6623 100644
+--- a/pq_optimized/batch_decode_with_paged_kv_cache_wrapper.py
++++ b/pq_optimized/batch_decode_with_paged_kv_cache_wrapper.py
+@@ -423,6 +423,8 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
+         are kept for shadow mode (true freeing off) and for steps with
+         nothing on CPU.
+         """
++        if self._pl_active():
++            return self._pl_discover(sparse_idx, page_size, request_ids)
+         orch = getattr(self, "_offload_orchestrator", None)
+         if orch is None:
+             return None
+@@ -528,6 +530,8 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
+         refs could not be staged (staging exhausted) -- the caller must treat
+         that as a partial failure, never proceed as if it were complete.
+         """
++        if self._pl_active():
++            return self._pl_apply(refs, indptr_l, request_ids, protect)
+         orch = getattr(self, "_offload_orchestrator", None)
+         if orch is None:
+             _dbg("[FETCH DEBUG] _apply_inrun_fetch: no orchestrator")
+@@ -577,6 +581,158 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
+         _dbg(f"[FETCH DEBUG] _apply_inrun_fetch: patched {len(pos)} indices")
+         return staging_map, missing
+ 
++    # ---- per-layer staging (offload_package PerLayerStagingPool) -------------
++    # A staged block lives in ONE layer's staging region, so its slot id is only
++    # valid for that layer. The paged-index array is shared by all layers of a
++    # step, so every layer re-points the entries of the offloaded blocks IT
++    # selected before its kernel runs. Entries another layer left behind can
++    # point at this layer's unrelated slot contents, but this layer's kernel
++    # only reads positions in its own selection, all of which are re-pointed.
++
++    def _pl_pool(self):
++        orch = getattr(self, "_offload_orchestrator", None)
++        return getattr(orch, "staging_pool", None) if orch is not None else None
++
++    def _pl_active(self) -> bool:
++        return bool(getattr(self._pl_pool(), "per_layer", False))
++
++    def _pl_layer_index(self, paged_kv_cache):
++        pool = self._pl_pool()
++        if not getattr(pool, "per_layer", False):
++            return None
++        t = paged_kv_cache[0] if isinstance(paged_kv_cache, (tuple, list)) else paged_kv_cache
++        layer = pool.layer_of(t)
++        if layer is None:
++            raise RuntimeError(
++                "per-layer staging: this layer's KV tensor (data_ptr="
++                f"{t.data_ptr()}) matches none of the orchestrator's per-layer "
++                "caches; refusing to stage into an unknown layer.")
++        return layer
++
++    def _pl_patch(self, slot_map, indptr_l, request_ids):
++        """Point each (request, block) entry of slot_map at base + slot."""
++        if not slot_map:
++            return
++        base = int(self._pl_pool().base)
++        row_of = {rid: i for i, rid in enumerate(request_ids)}
++        pos = [int(indptr_l[row_of[r.request_id]]) + int(r.block_idx) for r in slot_map]
++        val = [base + int(s) for s in slot_map.values()]
++        dev = self._kv_indices_int32.device
++        self._kv_indices_int32.index_copy_(
++            0,
++            torch.tensor(pos, dtype=torch.long).to(dev, non_blocking=True),
++            torch.tensor(val, dtype=self._kv_indices_int32.dtype).to(dev, non_blocking=True),
++        )
++
++    def _pl_rows(self, B, request_ids, res, true_freeing):
++        """Host copy of indptr + row/request alignment check, once per step
++        (layer 0) instead of once per layer: the batch is fixed within a step."""
++        layer = self._pl_cur_layer
++        cached = getattr(self, "_pl_rows_cache", None)
++        if layer != 0 and cached is not None and cached[0] == B:
++            return cached[1]
++        indptr_l = self._kv_indptr_int32[: B + 1].tolist()
++        for b in range(B):
++            tracked = len(res.refs_for_request(str(request_ids[b])))
++            span = int(indptr_l[b + 1]) - int(indptr_l[b])
++            if tracked == 0 or span != tracked:
++                if true_freeing:
++                    raise RuntimeError(
++                        f"per-layer staging: row {b} ({request_ids[b]}) out of "
++                        f"sync (tracked={tracked}, span={span}).")
++                self._pl_rows_cache = None
++                return None
++        self._pl_rows_cache = (B, indptr_l)
++        return indptr_l
++
++    def _pl_discover(self, sparse_idx, page_size, request_ids):
++        """Per-layer twin of _discover_inrun_fetch, kept on the device.
++
++        For each row: mark the blocks this layer selected, intersect with the
++        request's offloaded set, re-point those already staged in this layer
++        (one torch.where into the shared index array) and stamp their LRU
++        tick. The host only learns which selected offloaded blocks are NOT
++        staged here (one sync); those are returned as refs to fetch, with the
++        staged ones as `protected`."""
++        orch = self._offload_orchestrator
++        pool, res = orch.staging_pool, orch.residency
++        true_freeing = bool(getattr(orch, "true_freeing", False))
++        if getattr(res, "num_cpu_blocks", 0) == 0:
++            return None
++        if request_ids is None or len(request_ids) != sparse_idx.shape[0]:
++            if true_freeing:
++                raise RuntimeError(
++                    "per-layer staging: decode rows do not map to request ids "
++                    "while CPU-resident blocks exist under true freeing.")
++            return None
++        from offload_package.scoring.base import BlockRef
++        B = sparse_idx.shape[0]
++        _timing.start("wrap.pl_rows")
++        indptr_l = self._pl_rows(B, request_ids, res, true_freeing)
++        _timing.end("wrap.pl_rows")
++        if indptr_l is None:
++            return None
++        layer = self._pl_cur_layer
++        if layer == 0:
++            pool.tick += 1
++        rids = [str(r) for r in request_ids]
++        base = int(pool.base)
++        idx_buf = self._kv_indices_int32
++        miss_rows, staged_rows = [], []
++        _timing.start("wrap.pl_mask")
++        for b in range(B):
++            s0, s1 = int(indptr_l[b]), int(indptr_l[b + 1])
++            n = s1 - s0
++            blocks = torch.div(sparse_idx[b].reshape(-1), page_size,
++                               rounding_mode="floor").clamp_(0, n - 1)
++            sel = torch.zeros(n, dtype=torch.bool, device=idx_buf.device)
++            sel[blocks] = True
++            cpu_sel = sel & pool.cpu_mask(rids[b], n)
++            slots = pool.slot_table(rids[b], n)[layer, :n]
++            staged = cpu_sel & (slots >= 0)
++            seg = idx_buf[s0:s1]
++            seg.copy_(torch.where(staged, (slots + base).to(seg.dtype), seg))
++            pool.last_use_table(rids[b], n)[layer, :n].masked_fill_(staged, pool.tick)
++            miss_rows.append(cpu_sel & (slots < 0))
++            staged_rows.append(staged)
++        _timing.end("wrap.pl_mask")
++        both = torch.stack([m.sum() for m in miss_rows]
++                           + [s.sum() for s in staged_rows]).tolist()   # the one sync
++        counts = both[:B]
++        st = getattr(pool, "stats", None)
++        if st is not None:
++            st['sel_hits'] = st.get('sel_hits', 0) + int(sum(both[B:]))
++            st['sel_misses'] = st.get('sel_misses', 0) + int(sum(counts))
++        if not any(counts):
++            return None
++        refs, protected = [], []
++        for b in range(B):
++            if counts[b]:
++                refs += [BlockRef(rids[b], i) for i in miss_rows[b].nonzero().flatten().tolist()]
++                protected += [BlockRef(rids[b], i)
++                              for i in staged_rows[b].nonzero().flatten().tolist()]
++        return refs, protected, indptr_l, rids
++
++    def _pl_apply(self, refs, indptr_l, request_ids, protect=None):
++        """Per-layer twin of _apply_inrun_fetch."""
++        pool = self._pl_pool()
++        _timing.start("wrap.pl_stage")
++        staging_map, missing = pool.ensure_resident_layer(
++            self._pl_cur_layer, refs, protect=protect)
++        _timing.end("wrap.pl_stage")
++        _timing.start("wrap.patch")
++        self._pl_patch(staging_map, indptr_l, request_ids)
++        _timing.end("wrap.patch")
++        if staging_map:
++            # Newly staged blocks are in use by this layer now.
++            ticks = {}
++            for r in staging_map:
++                ticks.setdefault(r.request_id, []).append(r.block_idx)
++            for rid, ix in ticks.items():
++                pool.last_use_table(rid, max(ix) + 1)[
++                    self._pl_cur_layer, torch.tensor(ix, device=pool.device)] = pool.tick
++        return staging_map, missing
++
+     # ---- debug: verify attention is computed on the blocks topk requested ----
+ 
+     def _verify_topk_attention(
+@@ -956,6 +1112,7 @@ class BatchDecodeWithPagedKVCacheWrapper(_DenseOptimizedWrapper):
+             k_cache, v_cache, kv_stride_page, kv_stride_a1, kv_stride_a2,
+             kv_v_offset_elem, page_size, n_kv,
+         ) = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
++        self._pl_cur_layer = self._pl_layer_index(paged_kv_cache)
+         nhd = self._kv_layout == "NHD"
+         kv_stride_n, kv_stride_h = (
+             (kv_stride_a1, kv_stride_a2) if nhd else (kv_stride_a2, kv_stride_a1)

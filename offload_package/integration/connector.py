@@ -173,6 +173,9 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             staging_eviction=extra_config.get(
                 "staging_eviction",
                 _os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru")),
+            staging_granularity=extra_config.get(
+                "staging_granularity",
+                _os.getenv("OFFLOAD_PACKAGE_STAGING_GRANULARITY", "block")),
         )
         
         self.kv_cache_config = kv_cache_config

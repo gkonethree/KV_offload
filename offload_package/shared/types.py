@@ -31,6 +31,7 @@ class OrchestratorConfig:
     scorer_head_reduction: str = "mean"
     scorer_type: str = "paged_eviction"  # "paged_eviction" or "random"
     staging_eviction: str = "lru"  # "scorer", "lru" or "random"
+    staging_granularity: str = "block"  # "block" or "layer"
 
 
 def build_orchestrator(
@@ -114,16 +115,28 @@ def build_orchestrator(
         eviction_scorer = RandomScorer()
     else:
         eviction_scorer = scorer  # inherit the offload scorer
-    staging_pool = KVStagingPool(
-        num_slots=cfg.num_staging_slots,
-        staging_base_page=staging_base,
-        gpu_k_caches=k_caches,
-        gpu_v_caches=v_caches,
-        cpu_cache=cpu_cache,
-        residency=residency,
-        offload_manager=offload_manager,
-        eviction_scorer=eviction_scorer,
-    )
+    if cfg.staging_granularity == "layer":
+        from offload_package.staging.per_layer_pool import PerLayerStagingPool
+        staging_pool = PerLayerStagingPool(
+            num_slots=cfg.num_staging_slots,
+            staging_base_page=staging_base,
+            gpu_k_caches=k_caches,
+            gpu_v_caches=v_caches,
+            cpu_cache=cpu_cache,
+            residency=residency,
+            offload_manager=offload_manager,
+        )
+    else:
+        staging_pool = KVStagingPool(
+            num_slots=cfg.num_staging_slots,
+            staging_base_page=staging_base,
+            gpu_k_caches=k_caches,
+            gpu_v_caches=v_caches,
+            cpu_cache=cpu_cache,
+            residency=residency,
+            offload_manager=offload_manager,
+            eviction_scorer=eviction_scorer,
+        )
     controller = KVCompressionController(cfg.W, cfg.page_size)
     return OffloadOrchestrator(
         offload_manager=offload_manager,
