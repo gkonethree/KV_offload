@@ -33,9 +33,8 @@ from vllm.v1.attention.backends.flashinfer import (
     FlashInferMetadata,
     FlashInferMetadataBuilder,
 )
-
 from vllm.v1.attention.backends.utils import (
-    get_flashinfer_layout_string,
+    get_flashinfer_layout_string,  # this vLLM fork has no get_kv_cache_layout
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -43,19 +42,16 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from skylight.config import SkylightSparseConfig
 
 logger = init_logger(__name__)
-import os as _os
-from offload_package import timing as _timing
-_DBG = _os.environ.get("OFFLOAD_PACKAGE_DEBUG", "0") == "1"
-def _dbg(msg: str) -> None:
-    if _DBG:
-        print(msg, flush=True)
 
-# Module-level cache for sparse pattern (shared across class instances)
-_sparse_pattern_cache = {
-    'sparse_idx': None,
-    'sparse_len': None,
-    'request_ids': None,
-}
+try:  # KV-offload timing (offload_package); Skylight also runs without it
+    from offload_package import timing as _timing
+except ImportError:
+    class _timing:  # no-op stand-in for offload_package.timing
+        @staticmethod
+        def start(stage: str) -> None:
+            pass
+
+        end = start
 
 
 class _NoFastPlanDecodeWrapper:
@@ -91,9 +87,6 @@ class _NoFastPlanDecodeWrapper:
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
         """Delegate to inner ``run`` then update the sparsity-fraction Gauge."""
-        _dbg(f"[_NoFastPlanDecodeWrapper DEBUG] run() CALLED, inner type={type(self._inner).__name__}, has_run={hasattr(self._inner, 'run')}")
-        import sys
-        sys.stdout.flush()
         result = self._inner.run(*args, **kwargs)
         get_stats = getattr(self._inner, "get_sparsity_stats", None)
         if callable(get_stats):
@@ -123,24 +116,57 @@ def _import_sparse_wrapper_cls():
             from block_minmax_incr_optimized import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
             )
-        elif method == "sparse_optimized":
-            from offload_package.integration.sparse_optimized_adapter import (
-                SparseOptimizedAdapterWrapper as cls,
+        elif method == "pq":
+            # Pure-torch selection (no CUDA kernel yet): correct, but far
+            # slower per step than the other two. Meant for accuracy studies,
+            # not throughput numbers.
+            from pq import (
+                BatchDecodeWithPagedKVCacheWrapper as cls,
             )
-        elif method == "offload":
-            from offload_package.integration.sparse_offload_adapter import (
-                SparseOffloadAdapterWrapper as cls,
-            )
-        elif method in ("pq", "pq_optimized"):
+        elif method == "pq_optimized":
+            # Graph-safe production path: slot-buffer codes, a CUDA ADC
+            # scorer, and sparse_optimized's decode. Same selection as 'pq',
+            # arranged so a cudagraph can hold it.
             from pq_optimized import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
             )
-        elif method in ("pqrs", "pqrs_optimized"):
+        elif method == "pqrs_optimized":
+            # pq_optimized plus vAttention's weighted sample of the residual.
+            # No extra kernel: sparse_decode already applies gather weights as
+            # a log-shift, which is the estimator.
             from pqrs_optimized import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
             )
-        elif method in ("pqis", "pqis_optimized"):
+        elif method == "pqis_optimized":
+            # vAttention++ Algorithm 1: Gumbel-top-k over the PQ scores draws a
+            # sample from softmax(s~), and inverse inclusion probabilities
+            # correct it. Same budget as pq_optimized -- the sample replaces the
+            # top-k block rather than extending it -- so the two differ only in
+            # the estimator.
             from pqis_optimized import (
+                BatchDecodeWithPagedKVCacheWrapper as cls,
+            )
+        elif method == "qis_optimized":
+            # Quest bounds + importance sampling. block_minmax's per-sub-page
+            # min/max score, stratified the way pqis stratifies PQ scores, and
+            # selected PER QUERY HEAD -- which is why it decodes through
+            # sparse_optimized rather than FlashInfer's paged-sparse kernel
+            # (that one takes a single page list per request, so block_minmax
+            # collapses its per-head bounds with amax).
+            #
+            # It needs the SUMMARY maintainer, not the PQ code maintainer, and
+            # gets it by NOT being listed in the pq_optimized branch below --
+            # the fullcg fallback installs SlotSummaryMaintainer. Adding
+            # 'qis_optimized' to that list would hand it PQ codes it cannot
+            # read.
+            from qis_optimized import (
+                BatchDecodeWithPagedKVCacheWrapper as cls,
+            )
+        elif method == "pqrs":
+            # pq plus vAttention's weighted sampling of the residual. Sample
+            # size comes from SKYLIGHT_PQRS_NSAMPLE; 0 makes it identical to
+            # 'pq'. Same pure-torch caveat.
+            from pqrs import (
                 BatchDecodeWithPagedKVCacheWrapper as cls,
             )
         elif method in ("oracle", ""):
@@ -150,8 +176,8 @@ def _import_sparse_wrapper_cls():
         else:
             raise ValueError(
                 f"SKYLIGHT_SPARSE_METHOD={method!r} not recognized "
-                "(expected 'oracle', 'block_minmax', 'sparse_optimized', "
-                "'pq', 'pqrs', or 'offload')."
+                "(expected 'oracle', 'block_minmax', 'pq', 'pqrs', 'pq_optimized', "
+                "'pqrs_optimized', 'pqis_optimized' or 'qis_optimized')."
             )
     except ImportError as exc:
         raise ImportError(
@@ -197,6 +223,15 @@ class SkylightSparseBackend(FlashInferBackend):
 
     @staticmethod
     def get_name() -> str:
+        # Must equal an :class:`AttentionBackendEnum` member name. vllm
+        # internally does ``AttentionBackendEnum[backend.get_name()]`` (see
+        # ``vllm/model_executor/layers/attention/attention.py``) and would
+        # ValueError on any string not in the enum. We register under the
+        # ``CUSTOM`` placeholder slot (the only enum entry meant for
+        # third-party backends), so this must return ``"CUSTOM"``.
+        #
+        # Without forking vllm we can't add a ``SKYLIGHT_SPARSE`` enum
+        # member; the user-facing selection name is ``CUSTOM`` everywhere.
         return "CUSTOM"
 
     @staticmethod
@@ -207,49 +242,26 @@ class SkylightSparseBackend(FlashInferBackend):
     def get_builder_cls() -> type["SkylightSparseMetadataBuilder"]:
         return SkylightSparseMetadataBuilder
 
-    # Override to support standard decoder attention
-    @classmethod
-    def supports_attn_type(cls, attn_type: str) -> bool:
-        return attn_type in ("DECODER", "decoder")
-
-    @classmethod
-    def is_sparse(cls) -> bool:
-        return False  # Dense decoder interface with sparse kernels internally
-
-    @classmethod
-    def supports_sparse(cls) -> bool:
-        return True
-
-    @classmethod
-    def supports_attn_type(cls, attn_type: str) -> bool:
-        return attn_type in ("DECODER", "decoder")
-
 
 class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     """Parent's metadata, with the per-step decode wrapper swapped to sparse."""
 
-    # Class-level reference to orchestrator (set by worker connector)
+    # ---- KV offload hooks (offload_package) ---------------------------------
+    # Class-level references set by the offload worker connector
+    # (offload_package/integration/worker_connector.py).
     _offload_orchestrator: object | None = None
-    # Class-level reference to the GPU model runner (set by worker connector).
-    # Used to derive the CURRENT step's decode request ids (post-reorder,
-    # decode rows first) at build time -- the scheduler-bound ids arrive one
-    # step late (bind runs after build) and their order can differ from the
-    # runner's row order in mixed batches.
+    # The GPU model runner: used to derive the CURRENT step's decode request
+    # ids at build time (post-reorder, decode rows first) -- the
+    # scheduler-bound ids arrive one step late and their order can differ from
+    # the runner's row order in mixed batches.
     _offload_runner: object | None = None
     # Last bail reason recorded by _patch_indices_for_staging for this build.
     _patch_bail_reason: str | None = None
-    # Engine-step serial (bumped per build) and the step whose pattern was
-    # last D2H-cached; together they limit pattern caching to once per step.
+    # Engine-step serial (bumped per build) and the step whose selection was
+    # last noted; together they limit selection noting to once per step.
     _step_serial: int = 0
     _pattern_cached_serial: int = -1
-    # Cached sparse pattern from previous step
-    _cached_sparse_idx: torch.Tensor | None = None
-    _cached_sparse_len: torch.Tensor | None = None
     _cached_request_ids: list[str] | None = None
-    # Debug: last patched paged indices (set by _patch_indices_for_staging)
-    _last_patched_indices: torch.Tensor | None = None
-    # Class-level reference to last decode wrapper created (for debugging)
-    _last_decode_wrapper: object | None = None
 
     def __init__(
         self,
@@ -266,13 +278,14 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         # previous engine's orchestrator/runner: it would patch indices and
         # move codes against a dead engine's residency table.
         _kvt = getattr(vllm_config, "kv_transfer_config", None)
-        if _kvt is None or getattr(_kvt, "kv_connector", None) != "OffloadPackageConnector":
+        self._sk_offload_cfg = None
+        if _kvt is not None and getattr(_kvt, "kv_connector", None) == "OffloadPackageConnector":
+            self._sk_offload_cfg = dict(getattr(_kvt, "kv_connector_extra_config", None) or {})
+        else:
             cls_ = SkylightSparseMetadataBuilder
             cls_._offload_orchestrator = None
             cls_._offload_runner = None
             cls_._cached_request_ids = []
-            cls_._cached_sparse_idx = None
-            cls_._cached_sparse_len = None
 
         cfg = SkylightSparseConfig.from_env()
         self._sparse_topk: float = cfg.topk
@@ -310,13 +323,100 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             os.environ.get("SKYLIGHT_INCR_FULLCG") == "1"
             and os.environ.get("SKYLIGHT_INCR_SLOT") == "1"
         )
+        # SKYLIGHT_SPARSE_DYNAMIC_TOPK=1: size the selected set from the batch's
+        # ACTUAL max_seq_len every step, so topk means x% of the live context
+        # rather than x% of max_model_len. Without it, methods on the FULL-cg
+        # path (block_minmax, pq_optimized, pqrs_optimized) use a fixed token
+        # count derived from max_model_len while 'oracle', which is not on that
+        # path, already gets the dynamic budget -- so the two are not
+        # budget-matched at the same nominal topk.
+        #
+        # REQUIRES EAGER DECODE. total_k = sink + k_mid + local is the captured
+        # shape of sparse_idx, so a per-batch n_keys changes it between replays.
+        # serve_and_eval_aime forces --enforce-eager when this is set; nothing
+        # here can detect capture reliably across vllm versions, so it is the
+        # caller's contract.
+        # SKYLIGHT_SPARSE_BUDGET_MODE = auto | dynamic | fixed
+        #   auto    (default) whatever each path does today: 'oracle' dynamic,
+        #           the FULL-cg methods fixed. NOT budget-matched.
+        #   dynamic every method sizes topk from the live context. Honest
+        #           labels, but requires eager decode.
+        #   fixed   no method pushes n_keys, so 'oracle' joins the FULL-cg
+        #           methods on a fixed count from max_model_len. Matched, stays
+        #           captured, and makes k_mid a known constant -- which is what
+        #           lets pqrs's top-k/sample split be set exactly.
+        _mode = os.environ.get("SKYLIGHT_SPARSE_BUDGET_MODE", "auto").strip().lower()
+        if _mode not in ("auto", "dynamic", "fixed"):
+            raise ValueError(
+                f"SKYLIGHT_SPARSE_BUDGET_MODE={_mode!r} not recognized "
+                "(expected 'auto', 'dynamic' or 'fixed')."
+            )
+        # Mirrors SlotCodeMaintainer's own read; the backend needs it to
+        # know when to force a deferred codebook fit.
+        _du = os.environ.get("SKYLIGHT_SPARSE_DENSE_UNTIL", "").strip()
+        self._sk_dense_until = int(_du) if _du else 0
+        self._sk_fixed_topk = _mode == "fixed"
+        self._sk_dynamic_topk = (
+            _mode == "dynamic"
+            or os.environ.get("SKYLIGHT_SPARSE_DYNAMIC_TOPK") == "1"
+        )
+        if self._sk_fixed_topk and self._sk_dynamic_topk:
+            raise ValueError(
+                "SKYLIGHT_SPARSE_BUDGET_MODE=fixed conflicts with "
+                "SKYLIGHT_SPARSE_DYNAMIC_TOPK=1; pick one."
+            )
+        if self._sk_dynamic_topk:
+            logger.info("SKYLIGHT_SPARSE_DYNAMIC_TOPK=1: topk is x%% of the live "
+                        "context; REQUIRES eager decode (uncaptured shapes)")
         self._sk_maint = None
         self._sk_syncfree = False
         self._sk_slots_d = None
         self._sk_seqlens_d = None
         self._sk_sub_page = int(os.environ.get("SKYLIGHT_SPARSE_SUB_PAGE", "8"))
         self._sk_ptotal_fixed = 0
-        if self._sk_fullcg:
+        # Which maintainer backs the FULL-cudagraph slot path. The hook below
+        # (_sk_fill_slots) is method-agnostic: slot assignment, the persistent
+        # buffers and change detection are the same problem for any
+        # incrementally maintained per-request summary. Only the CONTENTS
+        # differ -- per-sub-page min/max bounds for block_minmax, per-token PQ
+        # codes for pq_optimized -- so both are driven through the same three
+        # calls: get_buf, init_layer, and the captured append.
+        _sk_method = os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
+        if self._sk_fullcg and _sk_method in ("pq_optimized", "pqrs_optimized",
+                                              "pqis_optimized"):
+            from pq_optimized.slot_codes import SlotCodeMaintainer
+
+            max_bs = int(vllm_config.scheduler_config.max_num_seqs)
+            cap = getattr(vllm_config.compilation_config, "max_cudagraph_capture_size", None)
+            if cap:
+                max_bs = min(max_bs, int(cap))
+            self._sk_maint = SlotCodeMaintainer(
+                h_kv=int(self.kv_cache_spec.num_kv_heads),
+                m=int(os.environ.get("SKYLIGHT_PQ_SUBSPACES", "16")),
+                page=int(self.kv_cache_spec.block_size),
+                n_slots=max_bs,
+                l_max=int(self._sparse_max_seq_len),
+                max_batch=max_bs,
+            )
+            self._sk_maint._codebook_size = int(
+                os.environ.get("SKYLIGHT_PQ_CODEBOOK", "256"))
+            self._sk_maint._fit_sample = int(
+                os.environ.get("SKYLIGHT_PQ_FIT_SAMPLE", "4096"))
+            self._sk_maint._ch = (
+                int(self.head_dim) if self._sparse_channel_num == -1
+                else int(self._sparse_channel_num))
+            self._sk_maxbs = max_bs
+            self._sk_owner = None
+            self._sk_slots_d = torch.zeros(max_bs, dtype=torch.int32, device=device)
+            self._sk_seqlens_d = torch.zeros(max_bs, dtype=torch.int32, device=device)
+            self._sk_pos = torch.arange(max_bs, dtype=torch.int32, device=device)
+            self._sk_prev_seqlen = torch.full((max_bs,), -1, dtype=torch.int64)
+            # For PQ the "summary width" is the token axis, not a sub-page count.
+            self._sk_ptotal_fixed = int(self._sparse_max_seq_len)
+            logger.info(
+                "SkylightSparseBackend: FULL-cudagraph PQ slot path ON "
+                "(max_bs=%d, L_max=%d)", max_bs, self._sk_ptotal_fixed)
+        elif self._sk_fullcg:
             from block_minmax_incr_optimized.summary_maintain import SlotSummaryMaintainer
             # n_slots MUST cover vLLM's largest captured decode batch (it profiles/captures up
             # to decode_cudagraph_max_bs); under-sizing crashes capture. Bound serving memory by
@@ -338,78 +438,35 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             self._sk_prev_seqlen = torch.full((max_bs,), -1, dtype=torch.int64)  # CPU
             if self._sk_syncfree:
                 logger.info("SkylightSparseBackend: SYNC-FREE decode path ON")
-                # Sync-free (block_minmax full-graph only; PQ never takes it)
-                # detects a slot's new occupant from CPU seq-len continuity
-                # alone and rebuilds summaries from the block table. It has no
-                # request-id ownership / row-move logic, so with offload true
-                # freeing it could rebuild from freed pages. Refuse the combo.
-                _x = dict(getattr(_kvt, "kv_connector_extra_config", None) or {})
-                if (
-                    _kvt is not None
-                    and getattr(_kvt, "kv_connector", None) == "OffloadPackageConnector"
-                    and _x.get("enabled", True)
-                    and _x.get("true_free", True)
-                ):
+                # The sync-free path detects a slot's new occupant from CPU
+                # seq-len continuity alone and rebuilds summaries from the
+                # block table: no request ownership, physical lengths. Under KV
+                # offload that can rebuild from freed (true freeing) or
+                # compacted (token-level offload) pages. Refuse the combo.
+                _x = self._sk_offload_cfg
+                if _x is not None and _x.get("enabled", True) and (
+                        _x.get("true_free", True)
+                        or _x.get("offload_granularity", "block") == "token"):
                     raise ValueError(
                         "SKYLIGHT_INCR_SYNCFREE=1 is not supported with "
-                        "OffloadPackageConnector true freeing; set "
-                        "true_free=False or disable SKYLIGHT_INCR_SYNCFREE.")
+                        "OffloadPackageConnector true freeing or token-level "
+                        "offloading; disable SKYLIGHT_INCR_SYNCFREE.")
             self._sk_ptotal_fixed = (
                 self._sparse_max_seq_len + self._sk_sub_page - 1) // self._sk_sub_page
             logger.info("SkylightSparseBackend: FULL-cudagraph slot path ON (max_bs=%d, P=%d)",
                         max_bs, self._sk_ptotal_fixed)
 
-        # --- PQ slot-codes hook (SKYLIGHT_SPARSE_METHOD=pq|pqrs). GPU-resident
-        # per-token K codes (per-request slot buffer) so selection can score
-        # pages WITHOUT reading the KV cache -- which is what keeps offloaded
-        # (CPU-resident) blocks selectable for fetch-back. Mirrors the
-        # block_minmax FULL-cudagraph hook; the maintainer exposes the same
-        # get_buf/init_layer call shape as SlotSummaryMaintainer.
-        self._sk_pq = (
-            not self._sk_fullcg
-            and os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
-            in ("pq", "pq_optimized", "pqrs", "pqrs_optimized", "pqis", "pqis_optimized")
-        )
-        if self._sk_pq:
-            from pq_optimized.slot_codes import SlotCodeMaintainer
-            max_bs = int(vllm_config.scheduler_config.max_num_seqs)
-            cap = getattr(vllm_config.compilation_config, "max_cudagraph_capture_size", None)
-            if cap:
-                max_bs = min(max_bs, int(cap))
-            # Codes buffer is [n_slots+1, H_kv, L_max, M] per layer; slot IS
-            # the batch position, so n_slots must cover the largest batch.
-            n_slots = max(int(os.environ.get("SKYLIGHT_PQ_SLOTS", "0")), max_bs)
-            self._sk_maint = SlotCodeMaintainer(
-                h_kv=int(self.kv_cache_spec.num_kv_heads),
-                m=int(os.environ.get("SKYLIGHT_PQ_SUBSPACES", "16")),
-                page=int(self.kv_cache_spec.block_size),
-                n_slots=n_slots,
-                l_max=self._sparse_max_seq_len,
-                max_batch=max_bs + 1,
-            )
-            # Selection channels must be fixed BEFORE get_buf() sizes the
-            # codebook; otherwise the combined K||V last dim (2*head_dim) would
-            # be mistaken for the key width.
-            self._sk_maint._ch = self._sparse_channel_num
-            self._sk_maxbs = max_bs
-            self._sk_owner = None     # GPU [max_bs] first-page id occupying each slot/position
-            self._sk_slots_d = torch.zeros(max_bs, dtype=torch.int32, device=device)
-            self._sk_seqlens_d = torch.zeros(max_bs, dtype=torch.int32, device=device)
-            self._sk_pos = torch.arange(max_bs, dtype=torch.int32, device=device)  # slot=position
-            self._sk_prev_sl = None
-            # For PQ the second get_buf arg is the token-level max length.
-            self._sk_ptotal_fixed = self._sparse_max_seq_len
-            logger.info(
-                "SkylightSparseBackend: PQ slot codes ON (n_slots=%d, L_max=%d, M=%d, ch=%d)",
-                n_slots, self._sparse_max_seq_len,
-                self._sk_maint.m, self._sk_maint._ch,
-            )
-
-        # Sync staging: if enabled, compute sparse pattern in build() and use for
-        # current step's staging (0 lag). Default is 1-step lag (prev step's pattern).
-        self._sk_sync_staging = os.environ.get("SKYLIGHT_SYNC_STAGING") == "1"
-        if self._sk_sync_staging:
-            logger.info("SkylightSparseBackend: SYNC staging enabled (0 lag)")
+        # KV offload + PQ: codes must be maintained per request slot (the
+        # FULL-cg slot path above). Without it pq_optimized encodes from the
+        # block table, which under offload holds freed / compacted pages.
+        if (self._sk_offload_cfg is not None and self._sk_offload_cfg.get("enabled", True)
+                and _sk_method in ("pq_optimized", "pqrs_optimized", "pqis_optimized")
+                and not self._sk_fullcg):
+            raise ValueError(
+                f"SKYLIGHT_SPARSE_METHOD={_sk_method} with OffloadPackageConnector "
+                "needs the PQ slot path: set SKYLIGHT_INCR_FULLCG=1 and "
+                "SKYLIGHT_INCR_SLOT=1 (eager is fine; add "
+                "SKYLIGHT_SPARSE_DYNAMIC_TOPK=1 for top-k over the live context).")
 
         logger.info(
             "SkylightSparseBackend: topk=%.4f sink=%d local=%d channel_num=%d max_seq_len=%d",
@@ -429,8 +486,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     ) -> Any:
         if self._sparse_wrapper_cls is None:
             self._sparse_wrapper_cls = _import_sparse_wrapper_cls()
-        _dbg(f"[SKYLIGHT DEBUG] _make_sparse_decode_wrapper called: use_cudagraph={use_cudagraph}, sync_staging={self._sk_sync_staging}")
-        wrapper = self._sparse_wrapper_cls(
+        return self._sparse_wrapper_cls(
             self._get_workspace_buffer(),
             get_flashinfer_layout_string(self.kv_cache_layout),
             use_cuda_graph=use_cudagraph,
@@ -444,15 +500,6 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             local_size=self._sparse_local_size,
             max_seq_len=self._sparse_max_seq_len,
         )
-        # Pass orchestrator to adapter for sync staging
-        orchestrator = SkylightSparseMetadataBuilder._offload_orchestrator
-        if self._sk_sync_staging and orchestrator is not None:
-            if hasattr(wrapper, 'set_orchestrator'):
-                wrapper.set_orchestrator(orchestrator)
-                # Also cache request_ids for staging
-                if hasattr(self, '_cached_request_ids'):
-                    wrapper._cached_request_ids = self._cached_request_ids
-        return wrapper
 
     @staticmethod
     def _set_n_keys_on_decode(decode: FIDecode | None, n_keys: int) -> None:
@@ -480,34 +527,67 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
-        _dbg(f"[SKYLIGHT DEBUG] build() called: num_decodes={getattr(common_attn_metadata, 'num_decodes', 'N/A')}")
+        num_decodes = self._sk_offload_prebuild(common_attn_metadata)
+        attn_metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=fast_build,
+        )
+        self._sk_offload_postbuild(attn_metadata, num_decodes)
+        # Token-level KV offload makes seq_lens PHYSICAL (logical - offloaded);
+        # top-k must scale with the LOGICAL context, so add the offset back.
+        _tok_off = self._sk_tok_offsets(int(getattr(attn_metadata, "num_decodes", 0) or 0))
+        _max_logical = int(common_attn_metadata.max_seq_len) + (
+            int(_tok_off.max()) if _tok_off is not None else 0)
+        if self._sk_fullcg:
+            # Under FULL cudagraph the selected-set size (total_k) MUST be fixed across replays,
+            # so do NOT push the dynamic per-batch length via set_n_keys (that would bake a
+            # capture-time total_k into the graph). Leaving n_keys=None makes the wrapper size
+            # total_k from the fixed max_seq_len; per-request L_per still masks invalid tokens.
+            self._sk_fill_slots(attn_metadata, common_attn_metadata)
+            if self._sk_dynamic_topk:
+                # Opt-in: match 'oracle', which gets this by virtue of not being
+                # on this path. Only valid eager -- see the flag's comment.
+                self._set_n_keys_on_decode(
+                    attn_metadata.decode
+                    if isinstance(attn_metadata.decode, FIDecode)
+                    else None,
+                    _max_logical,
+                )
+        elif not self._sk_fixed_topk:
+            self._set_n_keys_on_decode(
+                attn_metadata.decode
+                if isinstance(attn_metadata.decode, FIDecode)
+                else None,
+                _max_logical,
+            )
+        self._log_budget_once(common_attn_metadata)
+        return attn_metadata
+
+    # ---- KV offload: per-build hooks ----------------------------------------
+
+    def _sk_offload_prebuild(self, cm) -> int:
+        """Before the parent build: bump the step serial and record THIS
+        step's decode request ids from the runner's input batch. Returns the
+        number of decode rows (0 when offload is not wired)."""
         cls = type(self)
         self._patch_bail_reason = None
-        num_decodes = 0
-        # One pattern cache per engine step: _cache_sparse_pattern (called
-        # after EVERY layer's forward) uses this serial to cache only the
-        # first layer's pattern per step instead of 22 near-identical D2H
-        # copies of which only the last was ever consumed.
         cls._step_serial = getattr(cls, "_step_serial", 0) + 1
-
-        # Derive THIS step's decode request ids from the runner's input batch.
+        num_decodes = 0
         # reorder_batch_to_split_decodes_and_prefills has already run by now,
         # so req_ids[:num_decodes] is the true decode row order -- including
-        # mixed batches (decode + prefill-continuation rows), where the
-        # scheduler-side id order is not guaranteed to match row order.
-        # num_decodes is computed whenever the offload machinery is present
-        # (the fail-loud guard below needs it); only the id STASH is subject
-        # to the SKYLIGHT_OFFLOAD_DISABLE_RUNNER_IDS fault-injection switch.
+        # mixed batches, where the scheduler-side id order is not guaranteed
+        # to match row order. Only the id STASH is subject to the
+        # SKYLIGHT_OFFLOAD_DISABLE_RUNNER_IDS fault-injection switch.
         if (
             cls._offload_runner is not None
             and cls._offload_orchestrator is not None
-            and common_attn_metadata is not None
+            and cm is not None
             and not torch.cuda.is_current_stream_capturing()
         ):
             try:
                 num_decodes, _, _, _ = split_decodes_and_prefills(
-                    common_attn_metadata,
-                    decode_threshold=self.reorder_batch_threshold,
+                    cm, decode_threshold=self.reorder_batch_threshold,
                 )
             except Exception as e:
                 logger.warning("split_decodes_and_prefills failed: %s", e)
@@ -520,20 +600,17 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                 ids = [str(r) for r in all_ids[:num_decodes]]
                 if ids and not ids[0].startswith(("_dummy", "_warmup")):
                     cls._cached_request_ids = ids
-                    _sparse_pattern_cache["request_ids"] = list(ids)
+        return num_decodes
 
-        attn_metadata = super().build(
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build=fast_build,
-        )
-
-        # Fail-loud backstop: under true freeing, offloaded blocks' original
-        # GPU pages are freed, and the index patcher + in-run fetch are the
-        # only things standing between the kernel and those pages. A bail in
-        # either path on a step with decode rows means selected cold blocks
-        # would be read from stale/null pages with weight 1. Raise instead.
+    def _sk_offload_postbuild(self, attn_metadata, num_decodes: int) -> None:
+        """After the parent build: fail loudly on a hazardous index-patch
+        bail, and hand the orchestrator + this step's decode request order to
+        the sparse wrapper (wrapper instances are cached per batch size)."""
+        cls = type(self)
         orch = cls._offload_orchestrator
+        # Under true freeing, offloaded blocks' original GPU pages are freed;
+        # the index patcher + in-run fetch are all that stand between the
+        # kernel and those pages, so a bail on a decode step is an error.
         if (
             self._patch_bail_reason is not None
             and num_decodes > 0
@@ -547,47 +624,12 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                 "CPU-resident blocks under true freeing; refusing to let the "
                 "kernel read freed pages."
             )
-
-        # Hand the offload orchestrator + this step's decode request order to
-        # the sparse wrapper every step (wrapper instances are cached per batch
-        # size; class-level injection happens once in _build_orchestrator).
-        if self._sk_pq and attn_metadata.decode is not None:
-            inner = getattr(getattr(attn_metadata.decode, "wrapper", None), "_inner", None)
-            inner = inner if inner is not None else getattr(
-                attn_metadata.decode, "wrapper", None
-            )
-            cls = type(self)
+        if attn_metadata.decode is not None:
+            w = getattr(attn_metadata.decode, "wrapper", None)
+            inner = getattr(w, "_inner", w)
             if inner is not None and hasattr(inner, "set_offload_orchestrator"):
-                inner.set_offload_orchestrator(cls._offload_orchestrator)
+                inner.set_offload_orchestrator(orch)
                 inner.set_offload_request_ids(cls._cached_request_ids)
-
-        if (self._sk_fullcg or self._sk_pq) and not torch.cuda.is_current_stream_capturing():
-            # Under FULL cudagraph the selected-set size (total_k) MUST be fixed across replays,
-            # so do NOT push the dynamic per-batch length via set_n_keys (that would bake a
-            # capture-time total_k into the graph). Leaving n_keys=None makes the wrapper size
-            # total_k from the fixed max_seq_len; per-request L_per still masks invalid tokens.
-            self._sk_fill_slots(attn_metadata, common_attn_metadata)
-            if self._sk_pq and not self._sk_fullcg:
-                # Eager PQ: top-k is a fraction of the batch's REAL max
-                # context, not of max_model_len (which made short contexts
-                # effectively dense, padded with zero-weight picks). Logical
-                # length under token-level offloading (seq_lens is physical).
-                _tok_off = self._sk_tok_offsets(int(getattr(attn_metadata, "num_decodes", 0) or 0))
-                self._set_n_keys_on_decode(
-                    attn_metadata.decode
-                    if isinstance(attn_metadata.decode, FIDecode)
-                    else None,
-                    int(common_attn_metadata.max_seq_len)
-                    + (int(_tok_off.max()) if _tok_off is not None else 0),
-                )
-        else:
-            self._set_n_keys_on_decode(
-                attn_metadata.decode
-                if isinstance(attn_metadata.decode, FIDecode)
-                else None,
-                int(common_attn_metadata.max_seq_len),
-            )
-        return attn_metadata
 
     @override  # type: ignore[misc]
     def _compute_flashinfer_kv_metadata(
@@ -611,69 +653,38 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         return paged_kv_indices
 
     def _patch_indices_for_staging(self, paged_kv_indices, num_reqs: int) -> None:
-        """Stage CPU blocks per cached sparse pattern and patch index content.
+        """Re-point offloaded blocks' index entries at build time: STAGING
+        blocks to their staging slot, CPU blocks to the null page (under true
+        freeing). The PQ wrapper's in-run fetch then stages what this step
+        selects.
 
         Records ``self._patch_bail_reason`` for every early return that leaves
         offloaded blocks' index entries pointing at their original (possibly
         freed) GPU pages; ``build()`` turns hazardous bails into errors under
-        true freeing. A mismatch between the cached sparse pattern and the
-        current batch only skips the 1-step-lag prefetch -- the residency
-        remediation (null-fill / staging re-point) still runs, so the
-        in-run fetch path stays sound on composition changes.
+        true freeing.
         """
         if torch.cuda.is_current_stream_capturing():
             return
         cls = type(self)
         orchestrator = cls._offload_orchestrator
         if orchestrator is None:
-            _dbg("[PATCH DEBUG] _patch_indices_for_staging: no orchestrator")
             return
         request_ids = cls._cached_request_ids or []
         if len(request_ids) == 0:
             self._patch_bail_reason = "ids_empty"
-            _dbg("[PATCH DEBUG] _patch_indices_for_staging: no request ids")
             return
         if len(request_ids) > num_reqs:
             self._patch_bail_reason = "ids_gt_reqs"
-            _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: too many ids ({len(request_ids)}) for {num_reqs} rows")
             return
         try:
-            staging_map = {}
-            patch_sparse_idx = None
-            patch_sparse_len = None
-            # The 1-step-lag prefetch is only for methods WITHOUT a same-step
-            # in-run fetch (oracle family): they stage the previous step's
-            # picks at build time because their wrapper has no fetch of its
-            # own. PQ fetches at selection time (0-lag) inside the decode
-            # wrapper; prefetching here would only duplicate that work.
-            _method = _os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
-            if _method in ("oracle", "", "block_minmax", "sparse_optimized", "offload"):
-                sparse_idx = cls._cached_sparse_idx
-                sparse_len = cls._cached_sparse_len
-                if sparse_idx is not None and sparse_len is not None:
-                    # Pattern-cache batch must equal the current decode row
-                    # count, else the cached pattern belongs to a previous
-                    # batch composition and staging it would fetch for the
-                    # wrong rows. Skip ONLY the prefetch; the remediation
-                    # below still runs.
-                    if sparse_idx.shape[0] != len(request_ids):
-                        _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: lag pattern batch mismatch ({sparse_idx.shape[0]} vs {len(request_ids)}); skipping prefetch only")
-                    else:
-                        # Fetch CPU blocks needed by the previous step's top-k.
-                        _dbg(f"[PATCH DEBUG] _patch_indices_for_staging: calling prepare_staging with sparse_idx.shape={sparse_idx.shape}")
-                        staging_map = orchestrator.prepare_staging(
-                            request_ids, sparse_idx, sparse_len
-                        )
-                        _dbg(f"[PATCH DEBUG] prepare_staging returned {len(staging_map)} slots")
-                        patch_sparse_idx = sparse_idx
-                        patch_sparse_len = sparse_len
-
             # Defensive alignment check: per-row page counts in the current
             # batch must equal the request's tracked block count, otherwise the
             # request order does not match decode row order and we must not
             # patch (row-b is ReqX's span, and patching assumes request_ids[b]).
-            indptr_gpu = self.paged_kv_indptr.gpu[: len(request_ids) + 1]
-            indptr_list = indptr_gpu.detach().cpu().tolist()
+            # The parent filled the host side of paged_kv_indptr: no GPU sync.
+            n = len(request_ids)
+            indptr_gpu = self.paged_kv_indptr.gpu[: n + 1]
+            indptr_list = self.paged_kv_indptr.np[: n + 1].tolist()
             for b, rid in enumerate(request_ids):
                 row_pages = int(indptr_list[b + 1]) - int(indptr_list[b])
                 tracked = len(orchestrator.residency.refs_for_request(rid))
@@ -682,35 +693,30 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                         f"row_alignment b={b} rid={rid} "
                         f"tracked={tracked} row_pages={row_pages}"
                     )
-                    _dbg(f"[PATCH DEBUG] bail b={b} rid={rid} tracked={tracked} row_pages={row_pages}")
                     return
 
             from offload_package.selection.adapter import (
                 patch_paged_kv_indices_with_staging,
             )
             null_id = 0 if getattr(orchestrator, "true_freeing", False) else None
-            _dbg(f"[PATCH DEBUG] calling patch_paged_kv_indices_with_staging with {len(staging_map)} staged slots")
             _timing.start("build.patch")
             patch_paged_kv_indices_with_staging(
                 paged_kv_indices,
                 indptr_gpu,
                 request_ids,
-                patch_sparse_idx,
-                patch_sparse_len,
+                None,
+                None,
                 self.kv_cache_spec.block_size,
                 orchestrator.staging_base_page_idx,
                 orchestrator.residency,
-                staging_map,
+                {},
                 null_block_id=null_id,
                 indptr_host=indptr_list,
                 inplace=True,
             )
             _timing.end("build.patch")
-            cls._last_patched_indices = paged_kv_indices
-        except Exception as e:
-            _dbg(f"[SKYLIGHT DEBUG] Failed to patch staging indices: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("SkylightSparseBackend: patching staging indices failed")
             if (
                 getattr(orchestrator, "true_freeing", False)
                 and getattr(orchestrator.residency, "num_cpu_blocks", 0) > 0
@@ -719,6 +725,78 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
                 # pointing at freed pages; fail loudly under true freeing.
                 raise
 
+    def _log_budget_once(self, cm) -> None:
+        """SKYLIGHT_BUDGET_DBG=1: print the budget each method ACTUALLY uses.
+
+        The arms are not obviously comparable and the difference is invisible at
+        runtime. 'oracle' is off the FULL-cg path, so set_n_keys pushes the live
+        max_seq_len and its topk is a true fraction of the live context.
+        block_minmax and pq_optimized are on that path, where n_keys is withheld
+        (total_k is the captured shape of sparse_idx) and topk is a fixed token
+        count from max_model_len. This prints both, plus what an honest x% would
+        have selected, so the ratio is a measurement rather than an argument.
+
+        Lives in build(), which is EAGER every step for every method -- a print
+        inside the wrapper's run() would miss the captured methods entirely,
+        since their run() only executes during capture warmup.
+        """
+        if os.environ.get("SKYLIGHT_BUDGET_DBG") != "1":
+            return
+        if getattr(type(self), "_budget_dbg_done", False):
+            return
+        live = int(getattr(cm, "max_seq_len", 0) or 0)
+        if live <= self._sparse_sink_size + self._sparse_local_size:
+            return                      # middle is empty; nothing to report yet
+        setattr(type(self), "_budget_dbg_done", True)
+        sink, local = int(self._sparse_sink_size), int(self._sparse_local_size)
+        dynamic = self._sk_dynamic_topk or (
+            (not self._sk_fullcg) and not self._sk_fixed_topk)
+        n_keys = live if dynamic else int(self._sparse_max_seq_len)
+
+        def k_of(n):
+            mid = max(0, n - sink - local)
+            if mid <= 0:
+                return 0
+            return min(max(1, round(float(self._sparse_topk) * mid)), mid)
+
+        k_used, k_honest = k_of(n_keys), k_of(live)
+        tot_used, tot_honest = sink + k_used + local, sink + k_honest + local
+        # stderr, not logger.info: skylight's logger records do not reliably
+        # reach the captured server.log, which is why block_minmax's own
+        # SKYLIGHT_BMM_DBG writes to stderr too. A diagnostic you cannot read
+        # is worse than none, since its silence looks like a negative result.
+        import sys as _sys
+        print(
+            "[BUDGET] method=%s fullcg=%s dyn=%s fixed=%s topk=%.4g | live_L=%d "
+            "n_keys_used=%d -> k_mid=%d total_k=%d | honest x%%: k_mid=%d "
+            "total_k=%d | reading %.2fx honest (%.2f%% of live vs %.2f%% nominal)"
+            % (os.environ.get("SKYLIGHT_SPARSE_METHOD", "?"), self._sk_fullcg,
+               self._sk_dynamic_topk, self._sk_fixed_topk,
+               float(self._sparse_topk), live,
+               n_keys, k_used, tot_used, k_honest, tot_honest,
+               (tot_used / tot_honest) if tot_honest else float("nan"),
+               100.0 * tot_used / live, 100.0 * float(self._sparse_topk)),
+            file=_sys.stderr, flush=True,
+        )
+        logger.info("[BUDGET] (also on stderr) method=%s n_keys_used=%d total_k=%d",
+                    os.environ.get("SKYLIGHT_SPARSE_METHOD", "?"), n_keys, tot_used)
+
+    # ---- KV offload changes in _sk_fill_slots ------------------------------
+    # Upstream detects a slot's new occupant (first-page change or a break in
+    # the +1 seq-len progression) and re-encodes that row's PQ codes from the
+    # block table. Under KV offload that re-encode can read the wrong bytes:
+    #   * token-level offload compacts KV, so cm.seq_lens is PHYSICAL and
+    #     drops after every offload round -- read as a "discontinuity" -- and
+    #     the pages now hold packed / compacted tokens, not positions 0..L-1;
+    #   * block offload with true freeing frees the pages of offloaded blocks,
+    #     which may already hold another request's KV.
+    # The minimum changes, all no-ops without offload:
+    #   1. lengths are LOGICAL (seq_lens + per-row token-offload offset);
+    #   2. a row whose request just moved (vLLM condensed the batch) gets its
+    #      codes COPIED from the request's old row -- exact -- instead of a
+    #      re-encode (_sk_plan_row_moves; rows owned by request id);
+    #   3. any remaining re-encode is refused when the request's pages were
+    #      compacted or freed (_sk_assert_safe_reencode).
     def _sk_fill_slots(self, m, cm) -> None:
         """Eager, runs every build() (incl. the cudagraph-capture build): assign each DECODE
         request a stable dense slot (by first physical page id), write it into the PERSISTENT
@@ -737,9 +815,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         first_pages = bt[:nd, 0]                           # [nd] GPU
         # slot = batch position (stable within a captured uniform-decode run); GPU->GPU, NO sync.
         self._sk_slots_d[:nd].copy_(self._sk_pos[:nd])
-        # Token-level offloading compacts KV, so cm.seq_lens is the PHYSICAL
-        # length; PQ code rows and the continuity check are LOGICAL.
-        _logical_sl = cm.seq_lens[:nd]
+        _logical_sl = cm.seq_lens[:nd]                     # offload change (1)
         _tok_off = self._sk_tok_offsets(nd)
         if _tok_off is not None:
             _logical_sl = _logical_sl + _tok_off.to(_logical_sl.dtype)
@@ -757,20 +833,40 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             self._sk_prev_sl = torch.zeros(self._sk_maxbs, dtype=_cur_sl.dtype, device=dev)
         _prev_sl = self._sk_prev_sl[:nd]
         _seq_discont = (_cur_sl != _prev_sl + 1) & (_cur_sl != _prev_sl)
-        # Snapshot of every row's previous length (incl. rows >= nd that a
-        # shrinking batch just vacated) for the row-move lookup below; a
-        # device clone, read back only when something changed.
+        # Every row's previous length (incl. rows a shrinking batch just
+        # vacated), for the row-move lookup below (offload change (2)).
         _prev_all = self._sk_prev_sl.clone()
         self._sk_prev_sl[:nd] = _cur_sl
         changed = _page_changed | _seq_discont
-        if _os.environ.get("SKYLIGHT_DEBUG_SLOTS") == "1":
-            print(f"[SK SLOTS] nd={nd} cur={_cur_sl[:2].tolist()} "
-                  f"prev={_prev_sl[:2].tolist()} page_changed={_page_changed[:2].tolist()} "
-                  f"discont={_seq_discont[:2].tolist()} changed_any={bool(changed.any())}",
-                  flush=True)
+        # Deferred codebook fit. With SKYLIGHT_SPARSE_DENSE_UNTIL set, the PQ
+        # codebook deliberately does NOT fit at prefill -- centroids learned
+        # from a ~100-token prompt and then used for 32k of generation are
+        # close to worthless. It fits once a request has that many keys, and
+        # nothing else would ever bring the request back here: the two terms
+        # above are exactly false during steady decode, by design. So the
+        # crossing is detected explicitly, and only while a layer is still
+        # waiting -- one small D2H copy per step until the fit lands, then
+        # never again.
+        # Retry an unfitted codebook whenever enough keys exist -- NOT only
+        # when DENSE_UNTIL asked for a deferral. Measured: the AIME prompt is
+        # 255 tokens against a 256-key floor, so init_layer skipped the fit,
+        # nothing ever retried, and PQ ran on ZERO centroids for every result
+        # in the project. A codebook that silently stays zeros forever is the
+        # failure mode this guards.
+        # Only the PQ code maintainer has a codebook to be unfitted. The
+        # summary maintainer (block_minmax, oracle, qis) is exact from the
+        # first token and exposes neither method, so an unguarded call here
+        # crashed engine init with
+        #   AttributeError: 'SlotSummaryMaintainer' has no attribute 'any_unfitted'
+        # for every non-PQ method on the fullcg path.
+        if (self._sk_maint is not None
+                and hasattr(self._sk_maint, "any_unfitted")
+                and self._sk_maint.any_unfitted()
+                and int(_cur_sl.max().item()) >= self._sk_maint.fit_threshold()):
+            changed = changed | torch.ones_like(changed)
         # The ONLY potential sync: detect a position whose occupant changed (needs (re)init).
         # Fires on batch-composition change; steady decode -> all False -> no host work.
-        moves: list[tuple[int, int]] = []    # (src_row, dst_row)
+        moves: list[tuple[int, int]] = []    # (src_row, dst_row), offload change (2)
         if bool(changed.any()):
             idx = changed.nonzero(as_tuple=True)[0].tolist()
             seqs = _logical_sl.to("cpu").tolist()
@@ -869,7 +965,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         off = [eng.offset(r) for r in ids]
         if not any(off):
             return None
-        return torch.tensor(off, dtype=torch.int64, device=self._sk_slots_d.device)
+        return torch.tensor(off, dtype=torch.int64, device=self.device)
 
     def _sk_assert_safe_reencode(self, rows, ids) -> None:
         """Re-encoding reads K from the block table; refuse when any of the
@@ -878,7 +974,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         eng = getattr(orch, "token_offload", None) if orch is not None else None
         if eng is not None and rows:
             for b in rows:
-                if ids is None or eng.offset(ids[b]):
+                if ids is None or eng.remapped(ids[b]):
                     raise RuntimeError(
                         "PQ codes would be re-encoded from compacted pages "
                         "(token-level offloading); refusing -- codes must move.")
@@ -943,7 +1039,6 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
     def _get_decode_wrapper(
         self, batch_size: int, use_cudagraph: bool = False
     ) -> Any:
-        _dbg(f"[SKYLIGHT DEBUG] _get_decode_wrapper called: batch_size={batch_size}, use_cudagraph={use_cudagraph}")
         # Mirror ``FlashInferMetadataBuilder._get_decode_wrapper`` but build
         # the sparse wrapper. When ``use_cudagraph`` is requested, slice the
         # persistent paged-KV buffers and cache one wrapper per captured
@@ -978,10 +1073,6 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             else:
                 self._decode_wrapper = decode_wrapper  # type: ignore[assignment]
 
-        # Store the wrapper in class attribute for debugging access
-        SkylightSparseMetadataBuilder._last_decode_wrapper = decode_wrapper
-
-        _dbg(f"[SKYLIGHT DEBUG] _get_decode_wrapper returning wrapper: {type(decode_wrapper)}")
         return decode_wrapper
 
     @override  # type: ignore[misc]
@@ -1043,90 +1134,41 @@ class SkylightSparseImpl(FlashInferImpl):
                 inner._sk_meta = m
         out = super().forward(layer, query, key, value, kv_cache, attn_metadata, output,
                               *args, **kwargs)
-        
-        # After forward, cache the sparse pattern for next step's staging
-        _dbg(f"[IMPL DEBUG] Calling _cache_sparse_pattern")
-        self._cache_sparse_pattern(m, layer)
-
+        # KV offload: feed this step's selection to the orchestrator (LRU).
+        self._note_selection(m)
         self._log_layer_sparsity(m, layer)
         return out
 
-    def _cache_sparse_pattern(self, attn_metadata, layer=None):
-        """Cache sparse_idx and sparse_len from the kernel for next step's staging.
-
-        Only the FIRST layer of each step caches: the lag prefetch consumes
-        one pattern per step (the last writer wins), so caching per layer did
-        22 D2H copies/step of which 21 were immediately overwritten. Layer-0's
-        pattern is an equally good one-step predictor. The gate is the build
-        serial (models don't reliably expose layer indices on the attention
-        module).
-        """
-        if attn_metadata is None:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            # D2H syncs are illegal during graph capture; the pattern cache
-            # only feeds the *next* step's eager build()-time staging fetch, so
-            # skipping during capture is safe.
+    def _note_selection(self, attn_metadata) -> None:
+        """Hand this step's top-k selection (the PQ wrapper's GPU
+        ``_last_topk_idx``) to the offload orchestrator's ``note_selection``
+        (LRU recency for blocks). Once per engine step -- the first layer;
+        the build serial gates it (attention modules don't reliably expose
+        layer indices)."""
+        if attn_metadata is None or torch.cuda.is_current_stream_capturing():
             return
         builder_cls = SkylightSparseMetadataBuilder
         if getattr(builder_cls, "_pattern_cached_serial", -1) == getattr(
             builder_cls, "_step_serial", -1
         ):
-            return  # already cached this step
+            return  # already noted this step
         try:
-            # Get the decode wrapper
-            w = getattr(attn_metadata, "decode", None)
-            if w is None:
-                return
-            w = getattr(w, "wrapper", None)
-            if w is None:
-                return
+            w = getattr(getattr(attn_metadata, "decode", None), "wrapper", None)
             inner = getattr(w, "_inner", w)
-            if inner is None:
-                return
-
-            # Get the sparse indices from the kernel (stored in _last_topk_idx)
             sparse_idx = getattr(inner, "_last_topk_idx", None)
             if sparse_idx is None:
                 return
-
-            # Cache sparse pattern (request_ids will be filled by worker connector from model runner)
-            batch_size = sparse_idx.shape[0]
-            sparse_len = torch.full(
-                (batch_size, sparse_idx.shape[1], 1),
-                sparse_idx.shape[2], dtype=torch.int32, device=sparse_idx.device,
-            )
-
-            # Feed this step's selection to the LRU scorer first (no-op for
-            # scorers without a note_usage hook): recency by top-k selection.
-            # Consumes the GPU tensor directly -- no D2H needed.
             orch = builder_cls._offload_orchestrator
             ids = builder_cls._cached_request_ids or []
             if orch is not None and ids:
                 orch.note_selection(
                     ids, sparse_idx, int(getattr(orch, "page_size", 16)),
                 )
-
-            # The host-side pattern cache (D2H) only feeds the 1-step-lag
-            # prefetch used by methods WITHOUT an in-run fetch (oracle
-            # family). PQ fetches at selection time and skips the D2H.
-            _method = _os.environ.get("SKYLIGHT_SPARSE_METHOD", "oracle").strip().lower()
-            if _method in ("oracle", "", "block_minmax", "sparse_optimized", "offload"):
-                _timing.start("build.pattern_d2h")
-                global _sparse_pattern_cache
-                _sparse_pattern_cache['sparse_idx'] = sparse_idx.detach().cpu()
-                _sparse_pattern_cache['sparse_len'] = sparse_len.detach().cpu()
-                _timing.end("build.pattern_d2h")
-                # Also populate the class attrs read by the build()-time
-                # lag prefetch in _patch_indices_for_staging.
-                builder_cls._cached_sparse_idx = _sparse_pattern_cache['sparse_idx']
-                builder_cls._cached_sparse_len = _sparse_pattern_cache['sparse_len']
-            _dbg(f"[SKYLIGHT DEBUG] Cached sparse pattern: batch={batch_size}, k={sparse_idx.shape[2]}")
             builder_cls._pattern_cached_serial = getattr(
                 builder_cls, "_step_serial", -1
             )
-        except Exception as e:
-            _dbg(f"[SKYLIGHT DEBUG] Failed to cache sparse pattern: {e}")
+        except Exception:
+            logger.debug("SkylightSparseBackend: note_selection failed", exc_info=True)
 
     def _log_layer_sparsity(self, attn_metadata, layer) -> None:
         """Sample per-layer sparsity into micro_metrics.jsonl when enabled."""
