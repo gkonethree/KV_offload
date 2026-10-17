@@ -1480,7 +1480,13 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
+            tok = getattr(self, "token_offload", None)
+            row = tok.take_row_update(req_id) if tok is not None else None
+            if row is not None:
+                # An offload round compacted this request: its page list was
+                # truncated after this step's allocation, so take it whole.
+                self.input_batch.block_table.add_row((row,), req_index)
+            elif new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
@@ -2120,6 +2126,20 @@ class GPUModelRunner(
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
+        # Token-level KV offloading: attention spans and KV slots use the
+        # physical (compacted) length; positions stay logical for RoPE.
+        tok = getattr(self, "token_offload", None)
+        tok_off_np = None
+        if tok is not None:
+            tok_off_np = np.array(
+                [tok.offset(r) for r in self.input_batch.req_ids[:num_reqs]],
+                dtype=np.int32,
+            )
+            if tok_off_np.any():
+                self.optimistic_seq_lens_cpu[:num_reqs] -= torch.from_numpy(tok_off_np)
+            else:
+                tok_off_np = None
+
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         # Skipped under async scheduling (non-align): the CPU copy races with
@@ -2210,10 +2230,15 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        slot_positions = self.positions[:total_num_scheduled_tokens]
+        if tok_off_np is not None:
+            tok_off = torch.from_numpy(tok_off_np).to(self.device, non_blocking=True)
+            self.seq_lens[:num_reqs] -= tok_off
+            slot_positions = slot_positions - tok_off[req_indices_gpu].to(torch.int64)
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
+            slot_positions,
         )
 
         # Copy the tensors to the GPU.

@@ -1,0 +1,57 @@
+=== 2026-10-16 02:22:47 start pq_r1 (pq, attempt 1)
+  TTFT: 216.2 ms
+  decode-only TPOT: 65.40 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 56859 MiB, 41 %
+=== 2026-10-16 02:43:15 start pq_off70_r1 (pq+off70, attempt 1)
+  TTFT: 314.0 ms
+  decode-only TPOT: 372.33 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 17254 MiB, 60 %
+=== 2026-10-16 03:29:01 start pq_off70-lru_r1 (pq+off70-lru, attempt 1)
+  TTFT: 149.7 ms
+  decode-only TPOT: 179.33 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 58109 MiB, 68 %
+=== 2026-10-16 04:02:29 start pq_off70-rand_r1 (pq+off70-rand, attempt 1)
+  TTFT: 289.6 ms
+  decode-only TPOT: 187.87 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 22868 MiB, 30 %
+=== 2026-10-16 04:29:44 start pq_off70-rand_r2 (pq+off70-rand, attempt 1)
+  TTFT: 308.2 ms
+  decode-only TPOT: 165.47 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 24270 MiB, 30 %
+=== 2026-10-16 04:55:31 start pq_off70-lru_r2 (pq+off70-lru, attempt 1)
+  TTFT: 243.3 ms
+  decode-only TPOT: 205.40 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 24803 MiB, 47 %
+=== 2026-10-16 05:23:56 start pq_off70_r2 (pq+off70, attempt 1)
+  TTFT: 259.1 ms
+  decode-only TPOT: 192.18 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 24805 MiB, 43 %
+=== 2026-10-16 05:52:21 start pq_r2 (pq, attempt 1)
+  TTFT: 246.2 ms
+  decode-only TPOT: 84.57 ms/token
+code_md5 deb4ddf28ae2
+gpu_at_start 24809 MiB, 22 %
+Qwen3-4B | LongBench 8k prompt + 4096 decode | 70% offload, W=256 | token staging store, 400 pages
+TPOT = decode-only (after warm-up). Fetched: one-pass ceiling ~1255 MB.
+
+config           round  TPOT ms  TTFT ms disc ms/tok fetch ms/tok  fetched MB  gpu_at_start / code
+pq                  r1     65.4    216.2        0.00         0.00           0  deb4ddf28ae2 56859 MiB, 41 %
+pq                  r2     84.6    246.2        0.00         0.00           0  deb4ddf28ae2 24809 MiB, 22 %
+paged_eviction      r1    372.3    314.0      165.69       142.75       34864  deb4ddf28ae2 17254 MiB, 60 %
+paged_eviction      r2    192.2    259.1       76.17        57.31       24030  deb4ddf28ae2 24805 MiB, 43 %
+lru                 r1    179.3    149.7       65.76        55.93       21441  deb4ddf28ae2 58109 MiB, 68 %
+lru                 r2    205.4    243.3       76.96        62.03       22102  deb4ddf28ae2 24803 MiB, 47 %
+random              r1    187.9    289.6       68.19        55.01       22968  deb4ddf28ae2 22868 MiB, 30 %
+random              r2    165.5    308.2       61.74        48.05       24127  deb4ddf28ae2 24270 MiB, 30 %
+
+mean TPOT: pq 75.0 ms  paged_eviction 282.3 ms  lru 192.4 ms  random 176.7 ms
+vs pq:      paged_eviction +276.4%  lru +156.5%  random +135.6%
+code checksums seen: ['deb4ddf28ae2'] (must be a single value for a clean comparison)
+=== 2026-10-16 06:12:01 done

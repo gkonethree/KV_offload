@@ -455,6 +455,29 @@ class TestStagingSizing:
     """S2: auto staging-pool sizing must follow the documented formula and
     respect the pool-fraction cap."""
 
+    @pytest.fixture(autouse=True)
+    def _page_store(self, monkeypatch):
+        # The formula below is the page store's; token sizing is tested
+        # separately (test_staging_sizing_token_store).
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_STORE", "page")
+
+    def test_staging_sizing_token_store(self, monkeypatch):
+        """Token store: one layer's selected cold TOKENS, in pages."""
+        import math
+        from offload_package.integration.connector import _auto_staging_slots_for
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_STORE", "token")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_TOPK", "0.1")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_SINK", "0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_LOCAL", "0")
+        monkeypatch.setenv("SKYLIGHT_SPARSE_METHOD", "pq")
+        monkeypatch.setenv("SKYLIGHT_PQ_GQA_SHARE", "1")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_SAFETY", "1.10")
+        monkeypatch.setenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "1.0")
+        vc, kc = self._fake_configs(65536, 2, 16, 100000)
+        union = self._union_factor(0.1, 4)
+        want = max(64, math.ceil(2 * 0.7 * union * 65536 * 1.10 / 16))
+        assert _auto_staging_slots_for(vc, kc, {"offload_fraction": 0.7}) == want
+
     @staticmethod
     def _fake_configs(max_model_len: int, max_num_seqs: int,
                       block_size: int, num_blocks: int,

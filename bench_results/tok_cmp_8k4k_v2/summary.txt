@@ -1,0 +1,13 @@
+Qwen3-4B-Instruct-2507 | LongBench 8k prompt + 4096 decode | 70% token offload, W=256 | 230 staging pages | batched gate
+config          rnd  TPOT ms  TTFT ms KV peak KV mean KV final +stage fetched MB 1st diff vs pq pos-agree
+pq               r1     42.4    150.0     768     640      768      0          0              -     1.000
+pq               r2     41.8    152.4     768     640      768      0          0              -     1.000
+tok-fastkvzip    r1    103.9    170.7     513     198      242    230     360147              2     0.018  chunked=10989
+tok-fastkvzip    r2     98.5    170.8     513     198      242    230     345374             23     0.021  chunked=11259
+tok-random       r1    107.1    153.4     513     198      242    230     362312             20     0.018  chunked=16017
+tok-random       r2     97.6    150.6     513     198      242    230     312572              2     0.003  chunked=12970
+
+mean TPOT: pq 42.1 ms  tok-fastkvzip 101.2 ms  tok-random 102.3 ms
+vs pq:      tok-fastkvzip +140.3%  tok-random +143.0%
+pq r1 vs r2 (run-to-run baseline): first diff 20, pos-agree 0.020
+code checksums seen: ['d56ec1ec7215'] (must be a single value)

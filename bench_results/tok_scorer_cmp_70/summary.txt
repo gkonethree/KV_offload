@@ -1,0 +1,14 @@
+
+=== top-k 0.1 | Qwen3-4B-Instruct-2507 | 8k + 4096 | 70% token offload, W=256 ===
+config                 TPOT ms       TTFT ms   cold-sel % miss/layer-step   fetched GB  chunked  KV mean/final (+stage)  runs
+pq                   47.2 ±4.3    149.9 ±0.5            -               -            -        -            640/768 (+0)  2
+tok-fastkvzip        55.3 ±1.2    177.7 ±5.2    56.0 ±0.1      97.4 ±63.0   58.8 ±38.1   0 ±0.0          198/242 (+336)  2
+tok-random           53.9 ±0.2    151.8 ±0.5    58.9 ±0.4     113.0 ±75.3   68.2 ±45.5   0 ±0.0          198/242 (+336)  2
+
+=== top-k 0.2s336 | Qwen3-4B-Instruct-2507 | 8k + 4096 | 70% token offload, W=256 ===
+config                 TPOT ms       TTFT ms   cold-sel % miss/layer-step   fetched GB  chunked  KV mean/final (+stage)  runs
+pq                   40.5 ±0.5    149.9 ±0.2            -               -            -        -            640/768 (+0)  2
+tok-fastkvzip        57.7 ±0.4    170.6 ±0.2    62.0 ±0.0      403.4 ±0.3   243.6 ±0.218936 ±11.0          198/242 (+336)  2
+tok-random           60.8 ±1.3    161.7 ±2.9    63.3 ±0.0      430.7 ±0.3   260.1 ±0.224431 ±3.0          198/242 (+336)  2
+
+code checksums: ['2c2374ed1265']

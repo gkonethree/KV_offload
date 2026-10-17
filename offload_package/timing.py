@@ -44,6 +44,7 @@ _total: defaultdict[str, float] = defaultdict(float)
 _count: defaultdict[str, int] = defaultdict(int)
 _max: defaultdict[str, float] = defaultdict(float)
 _bytes: defaultdict[str, int] = defaultdict(int)
+_counts: defaultdict[str, int] = defaultdict(int)
 _t0: dict[str, float] = {}
 _step_counter = 0
 
@@ -72,10 +73,16 @@ def note_bytes(stage: str, nbytes: int) -> None:
         _bytes[stage] += int(nbytes)
 
 
+def note_count(name: str, n: int) -> None:
+    """Accumulate a plain event counter (printed with the report)."""
+    if ENABLED:
+        _counts[name] += int(n)
+
+
 def reset() -> None:
     """Drop everything accumulated so far (e.g. after a warm-up request)."""
     global _step_counter
-    for d in (_total, _count, _max, _bytes, _t0):
+    for d in (_total, _count, _max, _bytes, _counts, _t0):
         d.clear()
     _step_counter = 0
 
@@ -107,6 +114,9 @@ def report(final: bool = False) -> None:
     if _bytes:
         print(f"[bytes moved, MB] " + " ".join(
             f"{s}={_bytes[s] / 1e6:.1f}" for s in sorted(_bytes)), flush=True)
+    if _counts:
+        print("[counts] " + " ".join(f"{s}={_counts[s]}" for s in sorted(_counts)),
+              flush=True)
 
 
 @atexit.register

@@ -123,6 +123,22 @@ CONFIGS = {
                          staging_policy='auto', num_staging_slots=None,
                          scorer_type='lru',
                          fetch_granularity='per_layer_tokens'),
+    # Token-level offloading: per-layer FastKVzip eviction + compaction.
+    'pq+tok70': dict(method='pq', offload=True, fraction=0.7,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction', granularity='token'),
+    'pq+tokrand70': dict(method='pq', offload=True, fraction=0.7,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='paged_eviction', granularity='token',
+                         token_scorer='random'),
+    'pq-nopc': dict(method='pq', offload=False, granularity='nopc'),
+    'pq+tok0': dict(method='pq', offload=True, fraction=0.0,
+                    staging_policy='auto', num_staging_slots=None,
+                    scorer_type='paged_eviction', granularity='token'),
+    'pq+off70-rand': dict(method='pq', offload=True, fraction=0.7,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='random',
+                          fetch_granularity='per_layer_tokens'),
     # Explicit block-granularity baselines for the token-vs-block matrix
     # (independent of the fetch_granularity default).
     'pq+off50-blk': dict(method='pq', offload=True, fraction=0.5,
@@ -170,7 +186,8 @@ def shutdown_llm(llm):
 
 def run(name, method, offload, fraction=0.5, staging_policy='auto',
         num_staging_slots=None, scorer_type='paged_eviction',
-        fetch_granularity='per_layer_tokens'):
+        fetch_granularity='per_layer_tokens', granularity='block',
+        token_scorer='fastkvzip'):
     print(f"\n{'=' * 70}\nCONFIG: {name}\n{'=' * 70}", flush=True)
     for k, v in SPARSE_ENV.items():
         os.environ[k] = v
@@ -191,6 +208,8 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
             'true_free': True,
             'scorer_type': scorer_type,
             'fetch_granularity': fetch_granularity,
+            'offload_granularity': granularity,
+            'token_scorer': token_scorer,
         }
         if num_staging_slots is not None:
             extra['num_staging_slots'] = num_staging_slots
@@ -215,6 +234,9 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
         disable_log_stats=True,
         attention_config={'backend': 'CUSTOM'},
         async_scheduling=False,
+        # Token-level offloading compacts KV, which invalidates block hashes.
+        enable_prefix_caching=not ((offload and granularity == 'token')
+                                   or granularity == 'nopc'),
     )
     if kv is not None:
         kwargs['kv_transfer_config'] = kv
@@ -229,9 +251,33 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
         kwargs['disable_log_stats'] = False
         kwargs['enable_prefix_caching'] = False
 
+    forced = os.environ.get('BENCH_FORCE_TOKENS')
+    if forced:
+        from bench_force import ForcedTokens
+        kwargs['logits_processors'] = [ForcedTokens]
+
     t_init0 = time.time()
     llm = LLM(**kwargs)
     t_init = time.time() - t_init0
+
+    # Peak KV blocks in use, from vLLM's allocator (the KV pool is
+    # preallocated, so "peak GPU allocated" cannot show offload savings).
+    kv = {'min_free': None, 'free': []}
+    try:
+        _sched = llm.llm_engine.engine_core.engine_core.scheduler
+        _pool = _sched.kv_cache_manager.block_pool
+        _orig_schedule = _sched.schedule
+
+        def _schedule(*a, **k):
+            out = _orig_schedule(*a, **k)
+            f = _pool.get_num_free_blocks()
+            kv['min_free'] = f if kv['min_free'] is None else min(kv['min_free'], f)
+            kv['free'].append(f)
+            return out
+        _sched.schedule = _schedule
+        kv['pool'] = _pool
+    except AttributeError:
+        _pool = None
 
     sp = SamplingParams(temperature=0, top_p=1.0, max_tokens=MAX_NEW_TOKENS, ignore_eos=True)
     if warmup:
@@ -239,6 +285,10 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
             temperature=0, top_p=1.0, max_tokens=8, ignore_eos=True))
         from offload_package import timing as _timing
         _timing.reset()  # breakdown covers the timed request only
+        if forced:
+            ForcedTokens.instance.reset()
+        kv['min_free'] = None
+        kv['free'] = []
     torch.cuda.synchronize()
     t0 = time.time()
     if os.environ.get('BENCH_TRACE_MULTINOMIAL') == '1':
@@ -292,8 +342,23 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
               f"{(m.last_token_ts - m.first_token_ts) / (out_tokens - 1) * 1000:.2f} ms/token")
     print(f"  throughput: {out_tokens / max(elapsed, 1e-9):.1f} tok/s")
     print(f"  peak GPU allocated: {peak_gb:.2f} GB")
+    if kv.get('pool') is not None and kv['min_free'] is not None:
+        _total = kv['pool'].num_gpu_blocks - 1          # minus the null block
+        _conn = getattr(llm.llm_engine.engine_core.engine_core.scheduler, 'connector', None)
+        _mgr = getattr(_conn, '_scheduler_manager', None)
+        _reserved = len(getattr(_mgr, '_reserved_staging_ids', None) or [])
+        _peak = _total - _reserved - kv['min_free']
+        _used = [_total - _reserved - f for f in kv['free'][1:]]   # [0] = before prefill
+        _mean = sum(_used) / len(_used) if _used else 0
+        _final = _used[-1] if _used else 0
+        print(f"  KV blocks in use: peak {_peak}, mean {_mean:.0f}, final {_final} "
+              f"(+{_reserved} staging reserved, pool {_total})")
     print(f"  out: {outputs[0].outputs[0].text[:110]!r}")
     print(f"  token_ids[:32]: {list(outputs[0].outputs[0].token_ids)[:32]}")
+    if forced:
+        fs = ForcedTokens.instance.summary()
+        print(f"  forced: steps {fs['steps']}, agree {100 * fs['agree']:.2f}%, "
+              f"ref NLL {fs['nll']:.4f}, first disagreement at step {fs['first_disagree']}")
     if reuse is not None:
         rb = len(outputs_b[0].outputs[0].token_ids)
         print(f"  REUSE req#2: total {reuse:.1f}s, TPOT {reuse / max(rb,1) * 1000:.2f} ms/token "
@@ -307,7 +372,8 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
         'tokens': list(outputs[0].outputs[0].token_ids),
     }
     import json
-    with open(f"/tmp/opencode/tokens_{name.replace('+', '_')}.json", "w") as f:
+    with open(os.environ.get('BENCH_TOKENS_OUT')
+              or f"/tmp/opencode/tokens_{name.replace('+', '_')}.json", "w") as f:
         json.dump(result['tokens'], f)
     shutdown_llm(llm)
     del llm

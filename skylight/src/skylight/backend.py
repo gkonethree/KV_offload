@@ -570,12 +570,15 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
             if self._sk_pq and not self._sk_fullcg:
                 # Eager PQ: top-k is a fraction of the batch's REAL max
                 # context, not of max_model_len (which made short contexts
-                # effectively dense, padded with zero-weight picks).
+                # effectively dense, padded with zero-weight picks). Logical
+                # length under token-level offloading (seq_lens is physical).
+                _tok_off = self._sk_tok_offsets(int(getattr(attn_metadata, "num_decodes", 0) or 0))
                 self._set_n_keys_on_decode(
                     attn_metadata.decode
                     if isinstance(attn_metadata.decode, FIDecode)
                     else None,
-                    int(common_attn_metadata.max_seq_len),
+                    int(common_attn_metadata.max_seq_len)
+                    + (int(_tok_off.max()) if _tok_off is not None else 0),
                 )
         else:
             self._set_n_keys_on_decode(
@@ -734,7 +737,13 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         first_pages = bt[:nd, 0]                           # [nd] GPU
         # slot = batch position (stable within a captured uniform-decode run); GPU->GPU, NO sync.
         self._sk_slots_d[:nd].copy_(self._sk_pos[:nd])
-        self._sk_seqlens_d[:nd].copy_(cm.seq_lens[:nd].to(torch.int32))
+        # Token-level offloading compacts KV, so cm.seq_lens is the PHYSICAL
+        # length; PQ code rows and the continuity check are LOGICAL.
+        _logical_sl = cm.seq_lens[:nd]
+        _tok_off = self._sk_tok_offsets(nd)
+        if _tok_off is not None:
+            _logical_sl = _logical_sl + _tok_off.to(_logical_sl.dtype)
+        self._sk_seqlens_d[:nd].copy_(_logical_sl.to(torch.int32))
         if self._sk_owner is None:
             self._sk_owner = torch.full((self._sk_maxbs,), -1, dtype=first_pages.dtype, device=dev)
         # Rebuild a slot's summary when a NEW request occupies it. first-page change alone is
@@ -743,7 +752,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         # seqlen breaks the steady-decode +1 progression (== a new prompt / prefill->decode).
         _page_changed = self._sk_owner[:nd] != first_pages
         self._sk_owner[:nd] = first_pages
-        _cur_sl = cm.seq_lens[:nd]
+        _cur_sl = _logical_sl
         if getattr(self, '_sk_prev_sl', None) is None or self._sk_prev_sl.shape[0] < self._sk_maxbs:
             self._sk_prev_sl = torch.zeros(self._sk_maxbs, dtype=_cur_sl.dtype, device=dev)
         _prev_sl = self._sk_prev_sl[:nd]
@@ -764,7 +773,7 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         moves: list[tuple[int, int]] = []    # (src_row, dst_row)
         if bool(changed.any()):
             idx = changed.nonzero(as_tuple=True)[0].tolist()
-            seqs = cm.seq_lens[:nd].to("cpu").tolist()
+            seqs = _logical_sl.to("cpu").tolist()
             page = int(self.kv_cache_spec.block_size)
             moves = self._sk_plan_row_moves(idx, seqs, _prev_all.tolist(), nd)
             moved_dst = {d for _, d in moves}
@@ -847,10 +856,32 @@ class SkylightSparseMetadataBuilder(FlashInferMetadataBuilder):
         self._sk_assert_safe_reencode(need_init, ids)
         return moves
 
+    def _sk_tok_offsets(self, nd: int):
+        """Per decode row: tokens offloaded by token-level offloading
+        (logical - physical length), on device; None when all zero."""
+        orch = type(self)._offload_orchestrator
+        eng = getattr(orch, "token_offload", None) if orch is not None else None
+        if eng is None or nd <= 0:
+            return None
+        ids = self._sk_current_row_ids(nd)
+        if ids is None:
+            return None
+        off = [eng.offset(r) for r in ids]
+        if not any(off):
+            return None
+        return torch.tensor(off, dtype=torch.int64, device=self._sk_slots_d.device)
+
     def _sk_assert_safe_reencode(self, rows, ids) -> None:
         """Re-encoding reads K from the block table; refuse when any of the
         request's blocks is no longer on its original GPU page."""
         orch = type(self)._offload_orchestrator
+        eng = getattr(orch, "token_offload", None) if orch is not None else None
+        if eng is not None and rows:
+            for b in rows:
+                if ids is None or eng.offset(ids[b]):
+                    raise RuntimeError(
+                        "PQ codes would be re-encoded from compacted pages "
+                        "(token-level offloading); refusing -- codes must move.")
         if orch is None or not getattr(orch, "true_freeing", False) or not rows:
             return
         if ids is None:

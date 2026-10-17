@@ -1,0 +1,3 @@
+=== 2026-10-16 01:56:35 smoke
+  decode-only TPOT: 125.54 ms/token
+=== 2026-10-16 02:00:09 start 8k4k_paged

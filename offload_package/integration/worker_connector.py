@@ -167,6 +167,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             scorer_type=self.offload_config.scorer_type,
             staging_eviction=self.offload_config.staging_eviction,
             fetch_granularity=self.offload_config.fetch_granularity,
+            staging_store=self.offload_config.staging_store,
             max_model_len=int(self._vllm_config.model_config.max_model_len),
             max_num_seqs=int(self._vllm_config.scheduler_config.max_num_seqs),
         )
@@ -259,7 +260,54 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                 logger.info("Orchestrator injected into %d attention builders (no skylight)",
                             injected)
 
+        if self.offload_config.offload_granularity == "token":
+            self._build_token_offload(kv_cache_view)
         logger.info("OffloadPackageWorker orchestrator built successfully")
+
+    def _build_token_offload(self, kv_cache_view) -> None:
+        """Token-level offloading: per-layer FastKVzip scoring + compaction."""
+        from offload_package.integration.token_mode import (
+            TokenOffloadEngine, install_score_hooks,
+        )
+        from offload_package.scoring.fastkvzip import (
+            BatchedFastKVzipGates, BatchedRandomGates, RandomTokenGate, load_fastkvzip_gates)
+        from offload_package.staging.token_store import TokenStagingStore
+
+        cfg, vc = self.offload_config, self._vllm_config
+        hf = vc.model_config.hf_config
+        max_len = int(vc.model_config.max_model_len)
+        max_seqs = int(vc.scheduler_config.max_num_seqs)
+        engine = TokenOffloadEngine(
+            kv_caches=kv_cache_view.k_caches,
+            page_size=self.kv_cache_spec.block_size,
+            max_len=max_len,
+            num_req_slots=2 * max_seqs + 2,
+            num_cpu_tokens=cfg.num_cpu_tokens or max_seqs * max_len,
+            offload_fraction=cfg.offload_fraction,
+            token_budget=cfg.token_budget,
+            sink_tokens=cfg.token_sink,
+            window_tokens=cfg.token_window,
+        )
+        if cfg.token_scorer == "random":
+            gates = [RandomTokenGate(seed=i) for i in range(len(kv_cache_view.k_caches))]
+            batched = BatchedRandomGates(seed=len(gates))
+        else:
+            gates = load_fastkvzip_gates(
+                vc.model_config.model, hf.num_attention_heads, hf.num_key_value_heads,
+                kv_cache_view.device)
+            batched = BatchedFastKVzipGates(gates).to(kv_cache_view.device)
+        for h in getattr(self, "_token_hooks", []):
+            h.remove()
+        self._token_hooks = install_score_hooks(self._model_runner, engine, gates, batched)
+        self._token_engine = engine
+        self._model_runner.token_offload = engine
+        self._orchestrator.token_offload = engine
+        self._orchestrator.token_store = TokenStagingStore.for_token_engine(
+            self._orchestrator.staging_pool, engine)
+        logger.info(
+            "OffloadPackageWorker: token offloading on (FastKVzip, fraction=%.2f, "
+            "sink=%d, window=%d, cpu_tokens=%d)", cfg.offload_fraction,
+            cfg.token_sink, cfg.token_window, engine.cpu_pool.shape[1])
 
     def bind_worker(self, worker) -> None:
         """Bind to the GPU worker for accessing model runner."""
@@ -452,6 +500,10 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                 b._last_patched_indices = None
         except ImportError:
             pass
+        for h in getattr(self, "_token_hooks", []):
+            h.remove()
+        self._token_hooks = []
+        self._token_engine = None
         self._orchestrator = None
         self._model_runner = None
         self._metadata = None

@@ -24,8 +24,14 @@ _LOCK = threading.Lock()
 
 
 def _ensure_cuda_home() -> None:
-    if os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH"):
-        return
+    for var in ("CUDA_HOME", "CUDA_PATH"):
+        home = os.environ.get(var)
+        if home and os.path.exists(os.path.join(home, "bin", "nvcc")):
+            return
+        if home:
+            # A stale value (e.g. inherited from a tmux server's global
+            # environment) makes the JIT build shell out to a missing nvcc.
+            os.environ.pop(var)
     # venv's nvidia cu13 wheel ships nvcc
     for base in sys.path:
         nvcc = os.path.join(base, "nvidia", "cu13", "bin", "nvcc")
@@ -39,10 +45,21 @@ def _ensure_cuda_home() -> None:
 
 def _build():
     global _MODULE
+    import torch.utils.cpp_extension as cpp_ext
     from torch.utils.cpp_extension import load
     here = os.path.dirname(os.path.abspath(__file__))
     src = os.path.join(here, "csrc", "kv_norm_kernel.cu")
     _ensure_cuda_home()
+    # cpp_extension resolves CUDA_HOME once at import time (long before this
+    # runs, under vLLM), so the env var alone is ignored and the build fell
+    # back to a system nvcc too old for torch's headers. Point it at ours.
+    if os.environ.get("CUDA_HOME"):
+        cpp_ext.CUDA_HOME = os.environ["CUDA_HOME"]
+    # The JIT loader shells out to `ninja`, which sits next to the venv's
+    # interpreter and is not on PATH unless the venv is activated.
+    bindir = os.path.dirname(sys.executable)
+    if bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
     if torch.cuda.is_available() and "TORCH_CUDA_ARCH_LIST" not in os.environ:
         cap = torch.cuda.get_device_capability()
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{cap[0]}.{cap[1]}"

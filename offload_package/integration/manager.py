@@ -217,6 +217,8 @@ class OffloadOrchestrator:
         # gate re-arms on every transition (offload triggers, fetches,
         # evictions), so a freshly offloaded block is prefetched on the next
         # build after its transition.
+        if getattr(self, "token_store", None) is not None:
+            return {}  # the page pool shares the token store's tail pages
         version = self.residency.cpu_version
         if version == self._lag_seen_cpu_version:
             _dbg("[ORCHESTRATOR DEBUG] prepare_staging: skipped (no residency transitions)")

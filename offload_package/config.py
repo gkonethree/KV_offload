@@ -38,6 +38,19 @@ class OffloadConfig:
     # layer's selected in-page offsets of that layer's own slice (per-layer
     # 16-bit masks gate validity; incremental fill into the same page).
     fetch_granularity: str = "per_layer_tokens"
+    # Staging storage: "token" packs each layer's cold tokens into its own
+    # staging tail (TokenStagingStore); "page" is the shared whole-page
+    # KVStagingPool. None = "token" for per_layer_tokens, else "page".
+    staging_store: str | None = None
+    # "block": offload whole blocks (default). "token": score each token
+    # per layer (FastKVzip gate), offload the lowest-scored ones per layer,
+    # and compact survivors so emptied pages return to vLLM's allocator.
+    offload_granularity: str = "block"
+    token_scorer: str = "fastkvzip"  # or "random" (control)
+    token_sink: int = 64          # first tokens never offloaded
+    token_window: int = 128       # most recent tokens never offloaded
+    token_budget: int | None = None   # absolute per-layer keep count
+    num_cpu_tokens: int | None = None  # CPU token-pool capacity
     # Auto mode: cap staging at this fraction of the GPU KV pool.
     staging_max_pool_frac: float = 0.25
     # Auto mode: multiply the computed estimate by this headroom factor.
@@ -67,6 +80,7 @@ class OffloadConfig:
             staging_eviction=os.getenv("OFFLOAD_PACKAGE_STAGING_EVICTION", "lru"),
             fetch_granularity=os.getenv(
                 "OFFLOAD_PACKAGE_FETCH_GRANULARITY", "per_layer_tokens"),
+            staging_store=os.getenv("OFFLOAD_PACKAGE_STAGING_STORE") or None,
         )
 
     def __post_init__(self):
@@ -86,5 +100,16 @@ class OffloadConfig:
         if self.fetch_granularity not in ("block", "per_layer_tokens"):
             raise ValueError(
                 "fetch_granularity must be 'block' or 'per_layer_tokens'")
+        if self.staging_store is None:
+            object.__setattr__(self, "staging_store", (
+                "token" if self.fetch_granularity == "per_layer_tokens" else "page"))
+        if self.staging_store not in ("token", "page"):
+            raise ValueError("staging_store must be 'token' or 'page'")
+        if self.staging_store == "token" and self.fetch_granularity != "per_layer_tokens":
+            raise ValueError("staging_store='token' needs fetch_granularity='per_layer_tokens'")
         if self.staging_safety_margin < 1.0:
             raise ValueError("staging_safety_margin must be >= 1.0")
+        if self.offload_granularity not in ("block", "token"):
+            raise ValueError("offload_granularity must be 'block' or 'token'")
+        if self.offload_granularity == "token" and self.token_scorer not in ("fastkvzip", "random"):
+            raise ValueError("token offloading supports token_scorer='fastkvzip' or 'random'")

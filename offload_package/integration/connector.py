@@ -139,6 +139,15 @@ def _auto_staging_slots_for(vllm_config, kv_cache_config, extra_config=None) -> 
         _os.getenv("OFFLOAD_PACKAGE_STAGING_MAX_POOL_FRAC", "0.25")))
     num_blocks = int(kv_cache_config.num_blocks)
     est = int(max_seqs * staged_per_req * safety)
+    granularity = extra_config.get("fetch_granularity", _os.getenv(
+        "OFFLOAD_PACKAGE_FETCH_GRANULARITY", "per_layer_tokens"))
+    store = extra_config.get("staging_store") or _os.getenv(
+        "OFFLOAD_PACKAGE_STAGING_STORE") or (
+        "token" if granularity == "per_layer_tokens" else "page")
+    if store == "token":
+        # Token store: every layer has its own tail, so size by ONE layer's
+        # selected cold tokens (no cross-layer page-union inflation).
+        est = math.ceil(max_seqs * f * union_factor * mid * safety / page_size)
     cap = max(1, int(num_blocks * frac))
     result = max(64, min(est, cap))
     logger.info(
@@ -217,6 +226,16 @@ def build_offload_config(
         fetch_granularity=extra_config.get(
             "fetch_granularity",
             _os.getenv("OFFLOAD_PACKAGE_FETCH_GRANULARITY", "per_layer_tokens")),
+        staging_store=extra_config.get(
+            "staging_store", _os.getenv("OFFLOAD_PACKAGE_STAGING_STORE") or None),
+        offload_granularity=extra_config.get("offload_granularity", "block"),
+        token_scorer=extra_config.get("token_scorer", "fastkvzip"),
+        token_sink=int(extra_config.get("token_sink", 64)),
+        token_window=int(extra_config.get("token_window", 128)),
+        token_budget=(int(extra_config["token_budget"])
+                      if extra_config.get("token_budget") is not None else None),
+        num_cpu_tokens=(int(extra_config["num_cpu_tokens"])
+                        if extra_config.get("num_cpu_tokens") is not None else None),
     )
 
 
@@ -301,6 +320,10 @@ class OffloadPackageConnector(KVConnectorBase_V1):
             sched.bind_gpu_block_pool(
                 gpu_block_pool, kv_cache_manager=kv_cache_manager
             )
+        self._token_sched = None    # bound once per engine: fresh token driver
+        ts = self._token_scheduler()
+        if ts is not None:
+            ts.bind(kv_cache_manager=kv_cache_manager)
             worker = self._worker_handler
             if (
                 worker is not None
@@ -328,7 +351,28 @@ class OffloadPackageConnector(KVConnectorBase_V1):
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         pass
     
+    def _token_mode(self) -> bool:
+        return self.offload_config.offload_granularity == "token"
+
+    def _token_scheduler(self):
+        ts = getattr(self, "_token_sched", None)
+        if ts is None and self._token_mode():
+            from offload_package.integration.token_mode import TokenModeScheduler
+            ts = self._token_sched = TokenModeScheduler(
+                interval_tokens=self.offload_config.interval_tokens,
+                engine_getter=lambda: getattr(self._worker_handler, "_token_engine", None),
+            )
+        return ts
+
+    def bind_scheduler(self, scheduler) -> None:
+        ts = self._token_scheduler()
+        if ts is not None:
+            ts.bind(scheduler=scheduler)
+
     def request_finished(self, request, block_ids):
+        ts = self._token_scheduler()
+        if ts is not None:
+            ts.request_finished(request.request_id)
         if self._scheduler_manager is not None:
             return self._scheduler_manager.request_finished(request, block_ids)
         return False, None
@@ -414,7 +458,12 @@ class OffloadPackageConnector(KVConnectorBase_V1):
         # No blanket except: a swallowed failure here silently drops this
         # step's offloads/store events and can leave blocks marked CPU whose
         # pages are never freed. Fail loudly instead.
-        if self._scheduler_manager is not None:
+        ts = self._token_scheduler()
+        if ts is not None:
+            # Token-level offloading replaces block offload entirely (the
+            # block scheduler stays bound only for the staging-tail reserve).
+            ts.build_connector_meta(scheduler_output)
+        elif self._scheduler_manager is not None:
             result = self._scheduler_manager.build_connector_meta(scheduler_output)
             if result is not None:
                 return result

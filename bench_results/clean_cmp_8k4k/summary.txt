@@ -1,0 +1,16 @@
+Qwen3-4B | LongBench 8k prompt + 4096 decode | 70% offload, W=256 | token staging store, 400 pages
+TPOT = decode-only (after warm-up). Fetched: one-pass ceiling ~1255 MB.
+
+config           round  TPOT ms  TTFT ms disc ms/tok fetch ms/tok  fetched MB  gpu_at_start / code
+pq                  r1     65.4    216.2        0.00         0.00           0  deb4ddf28ae2 56859 MiB, 41 %
+pq                  r2     84.6    246.2        0.00         0.00           0  deb4ddf28ae2 24809 MiB, 22 %
+paged_eviction      r1    372.3    314.0      165.69       142.75       34864  deb4ddf28ae2 17254 MiB, 60 %
+paged_eviction      r2    192.2    259.1       76.17        57.31       24030  deb4ddf28ae2 24805 MiB, 43 %
+lru                 r1    179.3    149.7       65.76        55.93       21441  deb4ddf28ae2 58109 MiB, 68 %
+lru                 r2    205.4    243.3       76.96        62.03       22102  deb4ddf28ae2 24803 MiB, 47 %
+random              r1    187.9    289.6       68.19        55.01       22968  deb4ddf28ae2 22868 MiB, 30 %
+random              r2    165.5    308.2       61.74        48.05       24127  deb4ddf28ae2 24270 MiB, 30 %
+
+mean TPOT: pq 75.0 ms  paged_eviction 282.3 ms  lru 192.4 ms  random 176.7 ms
+vs pq:      paged_eviction +276.4%  lru +156.5%  random +135.6%
+code checksums seen: ['deb4ddf28ae2'] (must be a single value for a clean comparison)

@@ -58,6 +58,9 @@ class ResidencyTable:
         # source of truth; transitions only mark refs dirty (O(1)) and the
         # mirror is brought up to date in one batched write by flush_device().
         self._mirror = False
+        # Called with the mirror slot of every released request, before the
+        # slot can be reused (TokenStagingStore drops its token map there).
+        self.on_slot_release: list = []
 
     # ---- device mirror ------------------------------------------------------
 
@@ -120,6 +123,8 @@ class ResidencyTable:
             # that reuses the slot in the meantime still ends up correct.
             self._rows_to_clear.append(slot)
             self._free_slots.append(slot)
+            for cb in self.on_slot_release:
+                cb(slot)
 
     def _touch(self, ref: BlockRef) -> None:
         if self._mirror:

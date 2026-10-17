@@ -315,6 +315,8 @@ class Scheduler(SchedulerInterface):
                       kv_cache_manager=self.kv_cache_manager)
             else:
                 _bind(self.kv_cache_manager.block_pool)
+            if hasattr(self.connector, "bind_scheduler"):
+                self.connector.bind_scheduler(self)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner

@@ -454,6 +454,15 @@ class KVCacheManager:
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
+        # Token-level KV offloading compacts each request's surviving tokens
+        # into a shorter physical prefix: blocks are sized by the physical
+        # (logical - offloaded) token count.
+        num_offloaded = getattr(request, "num_offloaded_tokens", 0)
+        if num_offloaded:
+            assert not self.enable_caching, (
+                "token-level KV offloading requires prefix caching disabled"
+            )
+            num_local_computed_tokens -= num_offloaded
         total_computed_tokens = min(
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
@@ -470,7 +479,9 @@ class KVCacheManager:
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_num_tokens = min(
+                request.num_tokens - num_offloaded, self.max_model_len
+            )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,

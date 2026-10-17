@@ -32,6 +32,7 @@ class OrchestratorConfig:
     scorer_type: str = "paged_eviction"  # "paged_eviction" or "random"
     staging_eviction: str = "lru"  # "scorer", "lru" or "random"
     fetch_granularity: str = "per_layer_tokens"  # or "block"
+    staging_store: str = "page"  # or "token" (see OffloadConfig)
     # Sizing for the GPU residency mirror (vectorized fetch discovery);
     # 0 leaves the mirror off and discovery uses the host loop.
     max_model_len: int = 0
@@ -153,6 +154,12 @@ def build_orchestrator(
     # ("block" = whole-column fetch, "per_layer_tokens" = selected offsets
     # of the calling layer's slice only).
     orch.fetch_granularity = cfg.fetch_granularity
+    # Token store: per-layer packed staging in the same tail pages. Needs the
+    # device mirror; the page pool stays constructed but is never filled.
+    orch.token_store = None
+    if cfg.staging_store == "token":
+        from offload_package.staging.token_store import TokenStagingStore
+        orch.token_store = TokenStagingStore(staging_pool, residency)
     return orch
 
 

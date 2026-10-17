@@ -180,6 +180,9 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Tokens moved out of this request's KV pages by token-level offloading
+        # (physical KV length = num_computed_tokens - num_offloaded_tokens).
+        self.num_offloaded_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
