@@ -89,3 +89,6 @@ benchmarks/**/*.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+
+bench_results/

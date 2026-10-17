@@ -28,6 +28,8 @@ class RandomScorer(BlockScorer):
         block_ids: Sequence[Hashable],
         budget: int,
     ) -> list[Hashable]:
+        if len(block_ids) <= budget:
+            return []
         scored = [(b, self._scores.get(b, self._rng.random())) for b in block_ids]
         scored.sort(key=lambda x: x[1])
         return [b for b, _ in scored[:len(block_ids) - budget]]

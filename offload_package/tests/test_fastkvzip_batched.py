@@ -25,3 +25,20 @@ def test_batched_matches_per_layer():
         out = batched(h)
         assert out.shape == (4, n)
         assert torch.allclose(out, ref, atol=2e-3, rtol=0), (n, (out - ref).abs().max())
+
+
+def test_batched_per_head_matches_per_layer():
+    torch.manual_seed(1)
+    gates = []
+    for _ in range(3):
+        g = FastKVzipGate(256, 16, 8, 4, torch.bfloat16, sink=16).cuda()
+        with torch.no_grad():
+            for p in g.parameters():
+                p.copy_(torch.randn_like(p) * 0.2)
+        gates.append(g.eval())
+    batched = BatchedFastKVzipGates(gates, per_head=True).cuda()
+    h = torch.randn(3, 5, 256, device="cuda", dtype=torch.bfloat16)
+    ref = torch.stack([g(h[i]).t() for i, g in enumerate(gates)])       # [L, n, H]
+    out = batched(h)
+    assert out.shape == (3, 5, 8)
+    assert torch.allclose(out, ref, atol=2e-3, rtol=0), (out - ref).abs().max()

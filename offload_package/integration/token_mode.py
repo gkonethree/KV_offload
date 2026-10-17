@@ -127,6 +127,11 @@ class TokenOffloadEngine:
         r = self._reqs.get(req_id)
         return 0 if r is None else r.offloaded
 
+    def remapped(self, req_id: str) -> bool:
+        """True once a round has compacted this request's KV."""
+        r = self._reqs.get(req_id)
+        return r is not None and r.offloaded > 0
+
     def take_row_update(self, req_id: str) -> list[int] | None:
         """Runner side: this step's full page list for a request whose pages
         a round truncated (None = append this step's new blocks as usual)."""
@@ -345,10 +350,20 @@ class TokenModeScheduler:
             prompt = self._prompt_len.get(rid, 0)
             last = self._last_round.get(rid)
             # First round one step after prefill (the PQ codes are built from
-            # the pages at the first decode step), then every W tokens.
-            due = prompt > 0 and num_computed > prompt and (
+            # the pages at the first decode step), then every W tokens. Only
+            # while decoding: a request resumed after preemption recomputes
+            # its prompt + outputs, and compacting mid-recompute would make
+            # the rest of that prefill attend over a compacted prefix.
+            req = self.sched.requests.get(rid) if self.sched is not None else None
+            decoding = req is None or num_computed >= req.num_tokens - 1
+            due = prompt > 0 and num_computed > prompt and decoding and (
                 last is None or num_computed - last >= self.W)
             if due:
+                if last is None and getattr(eng, "prompt_scorer", None) is not None \
+                        and req is not None:
+                    # Reconstruction scorers (KVzip) rank the finished prompt
+                    # once, just before its first round.
+                    eng.prompt_scorer(rid, list(req.prompt_token_ids))
                 self._last_round[rid] = num_computed
                 freed = eng.run_round(rid, extra_tokens=n_sched)
                 if freed:
@@ -388,7 +403,8 @@ def install_score_hooks(runner, engine: TokenOffloadEngine, gates,
     tokens' LOGICAL positions. Tokens map to request slots through the
     runner's query_start_loc / req_ids (computed once per forward, at the
     first layer). Heads are combined by max: a token matters to the layer if
-    any of its KV heads needs it.
+    any of its KV heads needs it -- except for a per-head engine
+    (``engine.headwise``), which keeps one score per KV head.
 
     ``batched`` (``[L, N, D] -> [L, N]``, e.g. BatchedFastKVzipGates) scores
     small forwards for all layers at once: run per layer, the gate is launch
@@ -403,6 +419,8 @@ def install_score_hooks(runner, engine: TokenOffloadEngine, gates,
                            f"{len(gates)} gates, {engine.L} KV caches")
     step = {"rows": None, "pos": None, "stash": []}
     last = len(layers) - 1
+    per_head = bool(getattr(engine, "headwise", False))
+    combine = (lambda s: s.t()) if per_head else (lambda s: s.amax(0))   # [H, n] ->
 
     def _token_rows(n_tokens: int, device):
         ib = runner.input_batch
@@ -447,7 +465,7 @@ def install_score_hooks(runner, engine: TokenOffloadEngine, gates,
                 if _GATE_CHECK and step.setdefault("checks", 0) < 8:
                     # Debug: the stashed inputs must still be the layers'
                     # attention inputs, i.e. batched == per-layer gates.
-                    ref = torch.stack([gates[i](h).amax(0) for i, h in enumerate(stash)])
+                    ref = torch.stack([combine(gates[i](h)) for i, h in enumerate(stash)])
                     step["checks"] += 1
                     print(f"[TOKEN GATE CHECK] n={n} batched vs per-layer "
                           f"max|diff|={float((score - ref).abs().max()):.2e}", flush=True)
@@ -457,7 +475,7 @@ def install_score_hooks(runner, engine: TokenOffloadEngine, gates,
                     slot_t, pos, score = slot_t[keep], pos[keep], score[:, keep]
                 engine.score[:, slot_t, pos] = score
                 return None
-            score = gate(hidden[:n]).amax(0)                  # [n]
+            score = combine(gate(hidden[:n]))                 # [n] ([n, H] per head)
             pos = positions[:n].long()
             if not all_tracked:                               # host-side flag: no sync
                 keep = slot_t >= 0

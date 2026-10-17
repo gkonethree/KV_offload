@@ -38,18 +38,28 @@ class OffloadConfig:
     # layer's selected in-page offsets of that layer's own slice (per-layer
     # 16-bit masks gate validity; incremental fill into the same page).
     fetch_granularity: str = "per_layer_tokens"
-    # Staging storage: "token" packs each layer's cold tokens into its own
-    # staging tail (TokenStagingStore); "page" is the shared whole-page
-    # KVStagingPool. None = "token" for per_layer_tokens, else "page".
+    # Staging storage, implied by fetch_granularity: "token" (TokenStagingStore,
+    # each layer's cold tokens in its own staging tail) for per_layer_tokens,
+    # "page" (whole-page KVStagingPool) for block. None = derive it.
     staging_store: str | None = None
     # "block": offload whole blocks (default). "token": score each token
     # per layer (FastKVzip gate), offload the lowest-scored ones per layer,
     # and compact survivors so emptied pages return to vLLM's allocator.
     offload_granularity: str = "block"
-    token_scorer: str = "fastkvzip"  # or "random" (control)
+    token_scorer: str = "fastkvzip"  # "kvzip" (context reconstruction) or "random"
+    kvzip_device: str | None = None   # GPU for KVzip's private HF model (None = worker's)
+    kvzip_chunk: int = 2000           # context tokens per reconstruction chunk
     token_sink: int = 64          # first tokens never offloaded
     token_window: int = 128       # most recent tokens never offloaded
     token_budget: int | None = None   # absolute per-layer keep count
+    # Per-(layer, head) budgets (HeadTokenOffloadEngine, staging shared by all
+    # layers and heads): "global" (default) = one ranking over all (layer,
+    # head, token) scores, FastKVzip's own policy; "layer" = equal total per
+    # layer; "uniform" = equal count per (layer, head); "cells_shared" = the
+    # shared policy on the per-head machinery (parity checks). "shared" =
+    # the older TokenOffloadEngine: every KV head of a layer keeps the same
+    # tokens, the same count in every layer, per-layer staging.
+    token_budget_scope: str = "global"
     num_cpu_tokens: int | None = None  # CPU token-pool capacity
     # Auto mode: cap staging at this fraction of the GPU KV pool.
     staging_max_pool_frac: float = 0.25
@@ -105,11 +115,17 @@ class OffloadConfig:
                 "token" if self.fetch_granularity == "per_layer_tokens" else "page"))
         if self.staging_store not in ("token", "page"):
             raise ValueError("staging_store must be 'token' or 'page'")
-        if self.staging_store == "token" and self.fetch_granularity != "per_layer_tokens":
-            raise ValueError("staging_store='token' needs fetch_granularity='per_layer_tokens'")
+        if (self.staging_store == "token") != (self.fetch_granularity == "per_layer_tokens"):
+            raise ValueError("staging_store='token' goes with fetch_granularity="
+                             "'per_layer_tokens', 'page' with 'block'")
         if self.staging_safety_margin < 1.0:
             raise ValueError("staging_safety_margin must be >= 1.0")
         if self.offload_granularity not in ("block", "token"):
             raise ValueError("offload_granularity must be 'block' or 'token'")
-        if self.offload_granularity == "token" and self.token_scorer not in ("fastkvzip", "random"):
-            raise ValueError("token offloading supports token_scorer='fastkvzip' or 'random'")
+        if self.offload_granularity == "token" and self.token_scorer not in (
+                "fastkvzip", "kvzip", "random"):
+            raise ValueError("token offloading supports token_scorer='fastkvzip', 'kvzip' or "
+                             "'random'")
+        if self.token_budget_scope not in ("shared", "global", "layer", "uniform", "cells_shared"):
+            raise ValueError("token_budget_scope must be shared, global, layer, uniform "
+                             "or cells_shared")

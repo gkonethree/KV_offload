@@ -127,10 +127,11 @@ def test_release_and_missing_cpu_copy():
     assert int((store.tok_slot[1] >= 0).sum()) == 5
     store.release_slot(eng.slot_of("r"))
     assert int((store.tok_slot >= 0).sum()) == 0 and int((store.owner >= 0).sum()) == 0
-    # A cold position whose CPU copy is missing must raise (reported at the
-    # next counter readback).
+    # A cold position whose CPU copy is missing raises at THIS layer's
+    # readback, before any fetch; the flag does not stick to later calls.
     s = eng.slot_of("r")
     eng.cpu_slot[1, s, cold[6]] = -1
-    store.stage_tokens(1, torch.tensor([[cold[6]]], device="cuda"), rows)
     with pytest.raises(RuntimeError, match="no CPU copy"):
-        store.stage_tokens(1, torch.tensor([[cold[7]]], device="cuda"), rows)
+        store.stage_tokens(1, torch.tensor([[cold[6]]], device="cuda"), rows)
+    assert int((store.tok_slot[1] >= 0).sum()) == 0          # nothing was fetched
+    store.stage_tokens(1, torch.tensor([[cold[7]]], device="cuda"), rows)

@@ -26,12 +26,6 @@ class BlockLocation:
     cpu_slot: Optional[int] = None
     staging_slot: Optional[int] = None
     complete: bool = False
-    # Token-granular recall: per-layer 16-bit masks of which in-page offsets
-    # hold valid bytes in the staging page. None = the whole page is valid
-    # (block-mode fetch, or a full 16-offset token fetch). Dropped on every
-    # residency transition (mark_cpu/mark_gpu build fresh locations); only
-    # STAGING entries carry it, and only the token fetch path consults it.
-    staged_mask: Optional[dict] = None
 
 
 class ResidencyTable:
@@ -69,7 +63,6 @@ class ResidencyTable:
         """Allocate the GPU mirror:
 
         dev_state [S, MB] int8      DEV_GPU / DEV_STAGING / DEV_CPU per block
-        dev_cov   [L, S, MB] int64  per-layer staged-offset bitmask (-1 = all)
         dev_last_use [S, MB] int64  tick of the last layer that selected it
 
         S = request slots (stable per request, NOT the batch row), MB = max
@@ -95,15 +88,13 @@ class ResidencyTable:
         return self._mirror
 
     def _grow_mirror(self, n: int) -> None:
-        old = (getattr(self, "dev_state", None), getattr(self, "dev_cov", None),
-               getattr(self, "dev_last_use", None))
+        old = (getattr(self, "dev_state", None), getattr(self, "dev_last_use", None))
         st = torch.zeros((n, self._mb), dtype=torch.int8, device=self._dev)
-        cov = torch.zeros((self._nl, n, self._mb), dtype=torch.int64, device=self._dev)
         lu = torch.zeros((n, self._mb), dtype=torch.int64, device=self._dev)
         if old[0] is not None:
             k = old[0].shape[0]
-            st[:k].copy_(old[0]); cov[:, :k].copy_(old[1]); lu[:k].copy_(old[2])
-        self.dev_state, self.dev_cov, self.dev_last_use = st, cov, lu
+            st[:k].copy_(old[0]); lu[:k].copy_(old[1])
+        self.dev_state, self.dev_last_use = st, lu
         self._free_slots.extend(range(n - 1, self._num_slots - 1, -1))
         self._num_slots = n
 
@@ -142,12 +133,9 @@ class ResidencyTable:
         if self._rows_to_clear:
             rows = torch.tensor(self._rows_to_clear, dtype=torch.long, device=dev)
             self.dev_state[rows] = 0
-            self.dev_cov[:, rows] = 0
             self.dev_last_use[rows] = 0
             self._rows_to_clear = []
         rows, blks, states = [], [], []
-        full_r, full_b = [], []                  # staged, whole page valid
-        part_l, part_r, part_b, part_v = [], [], [], []   # per-layer masks
         mb = self._mb
         for ref in self._dirty:
             slot = self._slot_of.get(ref.request_id)
@@ -164,25 +152,12 @@ class ResidencyTable:
                 states.append(DEV_CPU)
             else:
                 states.append(DEV_STAGING)
-                if loc.staged_mask is None:
-                    full_r.append(slot); full_b.append(ref.block_idx)
-                else:
-                    for layer, m in loc.staged_mask.items():
-                        part_l.append(int(layer)); part_r.append(slot)
-                        part_b.append(ref.block_idx); part_v.append(int(m))
         self._dirty.clear()
         if not rows:
             return
         t = lambda x, dt=torch.long: torch.tensor(x, dtype=dt, device=dev)
         rows_t, blks_t = t(rows), t(blks)
         self.dev_state[rows_t, blks_t] = t(states, torch.int8)
-        # Coverage: clear every dirty block, then set the staged ones --
-        # O(dirty + per-layer masks) instead of a full L-vector per block.
-        self.dev_cov[:, rows_t, blks_t] = 0
-        if full_r:
-            self.dev_cov[:, t(full_r), t(full_b)] = -1
-        if part_l:
-            self.dev_cov[t(part_l), t(part_r), t(part_b)] = t(part_v, torch.int64)
 
     def last_use_of(self, refs) -> list[int]:
         """dev_last_use for each ref (one gather + one readback)."""
@@ -244,9 +219,7 @@ class ResidencyTable:
         )
         self._touch(ref)
 
-    def mark_staging(self, ref: BlockRef, staging_slot: int,
-                     *, layer: Optional[int] = None,
-                     offset_mask: Optional[int] = None) -> None:
+    def mark_staging(self, ref: BlockRef, staging_slot: int) -> None:
         old = self._blocks.get(ref)
         if old is None or old.gpu_block_id is None:
             raise KeyError(f"No GPU mapping recorded for {ref}")
@@ -255,47 +228,14 @@ class ResidencyTable:
         if old.residency == Residency.CPU:
             self._num_cpu -= 1
             self._cpu_version += 1
-        # Token mode: a partially-filled page starts with the fetched layer's
-        # mask; block mode (layer is None) leaves staged_mask None == full.
-        staged_mask = None
-        if layer is not None and offset_mask is not None:
-            staged_mask = {int(layer): int(offset_mask)}
-        elif layer is None and old.staged_mask is not None:
-            # Whole-block fill on top of a partially-filled page: every
-            # offset is now valid.
-            staged_mask = None
         self._blocks[ref] = BlockLocation(
             residency=Residency.STAGING,
             gpu_block_id=old.gpu_block_id,
             cpu_slot=old.cpu_slot,
             staging_slot=int(staging_slot),
             complete=old.complete,
-            staged_mask=staged_mask,
         )
         self._touch(ref)
-
-    def merge_staged_mask(self, ref: BlockRef, layer: int,
-                          offset_mask: int) -> None:
-        """OR additional fetched offsets into an already-STAGING block's
-        per-layer mask (incremental fill of the same page)."""
-        loc = self._blocks.get(ref)
-        if loc is None or loc.residency != Residency.STAGING:
-            raise RuntimeError(f"merge_staged_mask on non-staged block {ref}")
-        if loc.staged_mask is None:
-            return  # page is fully valid already
-        loc.staged_mask[int(layer)] = (
-            loc.staged_mask.get(int(layer), 0) | int(offset_mask))
-        self._touch(ref)
-
-    def staged_coverage(self, ref: BlockRef, layer: int) -> int:
-        """16-bit mask of valid in-page offsets for `layer` on a staged
-        block; 0xFFFF when the page is fully valid (block-mode fetch)."""
-        loc = self._blocks.get(ref)
-        if loc is None or loc.residency != Residency.STAGING:
-            return 0
-        if loc.staged_mask is None:
-            return 0xFFFF
-        return loc.staged_mask.get(int(layer), 0)
 
     def get(self, ref: BlockRef) -> Optional[BlockLocation]:
         return self._blocks.get(ref)

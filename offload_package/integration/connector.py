@@ -230,6 +230,9 @@ def build_offload_config(
             "staging_store", _os.getenv("OFFLOAD_PACKAGE_STAGING_STORE") or None),
         offload_granularity=extra_config.get("offload_granularity", "block"),
         token_scorer=extra_config.get("token_scorer", "fastkvzip"),
+        kvzip_device=extra_config.get("kvzip_device", _os.getenv("OFFLOAD_PACKAGE_KVZIP_DEVICE")),
+        kvzip_chunk=int(extra_config.get("kvzip_chunk", 2000)),
+        token_budget_scope=extra_config.get("token_budget_scope", "global"),
         token_sink=int(extra_config.get("token_sink", 64)),
         token_window=int(extra_config.get("token_window", 128)),
         token_budget=(int(extra_config["token_budget"])
@@ -357,7 +360,9 @@ class OffloadPackageConnector(KVConnectorBase_V1):
     def _token_scheduler(self):
         ts = getattr(self, "_token_sched", None)
         if ts is None and self._token_mode():
+            from offload_package.integration.scheduler_connector import check_token_mode_env
             from offload_package.integration.token_mode import TokenModeScheduler
+            check_token_mode_env(self._vllm_config)
             ts = self._token_sched = TokenModeScheduler(
                 interval_tokens=self.offload_config.interval_tokens,
                 engine_getter=lambda: getattr(self._worker_handler, "_token_engine", None),

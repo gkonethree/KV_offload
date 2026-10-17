@@ -14,6 +14,15 @@
 //   tok_phys      physical address per selected position (resident through the
 //                 row's compacted page list, staged cold from tok_slot).
 //
+// Per-(layer, head) cell mode (HeadTokenOffloadEngine): keys carry the KV
+// head, ``key = (row * H + kvh) * mbp + pos``; ``tok_discover`` looks the
+// cell up in ``cell [S, max_len, H]`` (kvh from the entry's q head), and
+// tok_fill_cells / tok_phys_cells move and address single 2C rows of the
+// flat cell array ``kv_rows [cells, C2]`` (see token_mode_heads.py). Staging
+// is one pool for all layers: slot v is cell ``stage_units[v / HP] * HP +
+// v % HP``, and ``owner[v]`` indexes the all-layer ``tok_slot`` (layer_off +
+// key).
+//
 // Layouts (per layer, all contiguous):
 //   phys_of_logical, cpu_slot : int32 [S, max_len]
 //   tok_slot                  : int32 [S * mbp]          (-1 = not staged)
@@ -34,10 +43,10 @@ using ull = unsigned long long;
 __global__ void tok_discover_kernel(
     const int64_t* __restrict__ idx, int64_t n_per_row, int64_t total,
     const int64_t* __restrict__ rows,
-    const int32_t* __restrict__ pol, int64_t max_len,
+    const int32_t* __restrict__ pol, const int32_t* __restrict__ cpu, int64_t max_len,
     const int32_t* __restrict__ tok_slot,
     int64_t* __restrict__ last_use, int64_t* __restrict__ seen,
-    int64_t tick, int64_t mbp,
+    int64_t tick, int64_t mbp, int64_t H, int64_t ksel, int64_t group,
     int32_t* __restrict__ phys_pos, bool* __restrict__ cold_out,
     int64_t* __restrict__ key_out, int64_t* __restrict__ need,
     int32_t* __restrict__ counters) {
@@ -46,11 +55,15 @@ __global__ void tok_discover_kernel(
   bool cold = false;
   int32_t p = 0;
   int64_t key = 0;
+  int64_t mi = 0;
   if (live) {
-    const int64_t row = rows[i / n_per_row];
+    const int64_t b = i / n_per_row;
+    const int64_t row = rows[b];
     const int64_t pos = idx[i];
-    p = pol[row * max_len + pos];
-    key = row * mbp + pos;
+    const int64_t kvh = H == 1 ? 0 : ((i - b * n_per_row) / ksel) / group;
+    mi = (row * max_len + pos) * H + kvh;
+    p = pol[mi];
+    key = (row * H + kvh) * mbp + pos;
     cold = p < 0;
   }
   // Selected-but-offloaded entries (diagnostics): one atomic per warp.
@@ -68,6 +81,9 @@ __global__ void tok_discover_kernel(
     if ((int64_t)atomicExch(reinterpret_cast<ull*>(last_use + s), (ull)tick) != tick)
       atomicAdd(counters + 1, 1);
   } else if ((int64_t)atomicExch(reinterpret_cast<ull*>(seen + key), (ull)tick) != tick) {
+    // A miss must have a CPU copy; report it in THIS layer's readback,
+    // before anything is fetched.
+    if (cpu[mi] < 0) atomicExch(counters + 2, 1);
     need[atomicAdd(counters, 1)] = key;
   }
 }
@@ -127,6 +143,56 @@ __global__ void tok_phys_kernel(
   }
 }
 
+// Cell mode: one warp per fetched key copies ONE 2C row (16-byte vectors)
+// host -> device zero-copy; lane 0 updates the maps.
+__global__ void tok_fill_cells_kernel(
+    const int64_t* __restrict__ keys, const int64_t* __restrict__ victims, int64_t n,
+    int64_t* __restrict__ owner, int32_t* __restrict__ tok_slot_all, int64_t layer_off,
+    int64_t* __restrict__ last_use, int64_t tick,
+    const int32_t* __restrict__ cpu_row, int64_t max_len, int64_t H, int64_t mbp,
+    const int4* __restrict__ pool, int64_t row_vecs, int4* __restrict__ kv_rows,
+    const int64_t* __restrict__ stage_units, int64_t HP,
+    int32_t* __restrict__ counters) {
+  const int64_t i = blockIdx.x * (int64_t)(blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  if (i >= n) return;
+  const int64_t key = keys[i];
+  const int64_t v = victims[i];
+  if (lane == 0) {
+    const int64_t old = owner[v];
+    if (old >= 0) tok_slot_all[old] = -1;   // may belong to another layer
+    owner[v] = layer_off + key;
+    tok_slot_all[layer_off + key] = (int32_t)v;
+    last_use[v] = tick;
+  }
+  const int64_t rh = key / mbp;              // row * H + kvh
+  const int64_t pos = key - rh * mbp;
+  const int64_t row = rh / H;
+  const int64_t cs = cpu_row[(row * max_len + pos) * H + (rh - row * H)];
+  if (cs < 0) {
+    if (lane == 0) atomicExch(counters + 2, 1);
+    return;
+  }
+  const int64_t cell = stage_units[v / HP] * HP + v % HP;
+  const int4* src = pool + cs * row_vecs;
+  int4* dst = kv_rows + cell * row_vecs;
+  for (int64_t e = lane; e < row_vecs; e += 32) dst[e] = src[e];
+}
+
+__global__ void tok_phys_cells_kernel(
+    const int32_t* __restrict__ cell, const int64_t* __restrict__ key,
+    const bool* __restrict__ cold, int64_t total, const int32_t* __restrict__ tok_slot,
+    const int64_t* __restrict__ stage_units, int64_t HP, int64_t* __restrict__ out) {
+  int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  if (cold[i]) {
+    const int64_t s = tok_slot[key[i]];
+    out[i] = s >= 0 ? stage_units[s / HP] * HP + s % HP : 0;
+  } else {
+    out[i] = cell[i];
+  }
+}
+
 constexpr int kThreads = 256;
 
 void check_cuda(const torch::Tensor& t, const char* name, at::ScalarType dt) {
@@ -139,29 +205,35 @@ void check_cuda(const torch::Tensor& t, const char* name, at::ScalarType dt) {
 
 // Returns nothing; writes phys_pos / cold / key / need / counters[0:2].
 void tok_discover(torch::Tensor idx, torch::Tensor rows, torch::Tensor pol,
-                  torch::Tensor tok_slot, torch::Tensor last_use, torch::Tensor seen,
-                  int64_t tick, int64_t mbp, torch::Tensor phys_pos, torch::Tensor cold,
+                  torch::Tensor cpu, torch::Tensor tok_slot, torch::Tensor last_use, torch::Tensor seen,
+                  int64_t tick, int64_t mbp, int64_t H, int64_t ksel, int64_t group,
+                  torch::Tensor phys_pos, torch::Tensor cold,
                   torch::Tensor key, torch::Tensor need, torch::Tensor counters) {
   check_cuda(idx, "idx", at::kLong);
   check_cuda(rows, "rows", at::kLong);
   check_cuda(pol, "phys_of_logical", at::kInt);
+  check_cuda(cpu, "cpu map", at::kInt);
+  TORCH_CHECK(cpu.sizes() == pol.sizes(), "cpu map must match the residency map");
   check_cuda(tok_slot, "tok_slot", at::kInt);
   check_cuda(last_use, "last_use", at::kLong);
   check_cuda(seen, "seen", at::kLong);
   check_cuda(counters, "counters", at::kInt);
-  TORCH_CHECK(idx.dim() == 2 && pol.dim() == 2, "idx [B, N], phys_of_logical [S, max_len]");
+  TORCH_CHECK(idx.dim() == 2 && (H == 1 ? pol.dim() == 2 : pol.dim() == 3 && pol.size(2) == H),
+              "idx [B, N], map [S, max_len] (or [S, max_len, H] per head)");
+  TORCH_CHECK(H == 1 || (ksel > 0 && group > 0 && idx.size(1) % ksel == 0 &&
+                         idx.size(1) / ksel == H * group),
+              "per-head discover: N must be H * group * ksel");
   TORCH_CHECK(need.numel() >= idx.numel(), "need buffer too small");
   const at::cuda::CUDAGuard guard(idx.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaMemsetAsync(counters.data_ptr<int32_t>(), 0, 2 * sizeof(int32_t), stream));
-  C10_CUDA_CHECK(cudaMemsetAsync(counters.data_ptr<int32_t>() + 3, 0, sizeof(int32_t), stream));
+  C10_CUDA_CHECK(cudaMemsetAsync(counters.data_ptr<int32_t>(), 0, 4 * sizeof(int32_t), stream));
   const int64_t total = idx.numel();
   if (total == 0) return;
   const int blocks = (int)((total + kThreads - 1) / kThreads);
   tok_discover_kernel<<<blocks, kThreads, 0, stream>>>(
       idx.data_ptr<int64_t>(), idx.size(1), total, rows.data_ptr<int64_t>(),
-      pol.data_ptr<int32_t>(), pol.size(1), tok_slot.data_ptr<int32_t>(),
-      last_use.data_ptr<int64_t>(), seen.data_ptr<int64_t>(), tick, mbp,
+      pol.data_ptr<int32_t>(), cpu.data_ptr<int32_t>(), pol.size(1), tok_slot.data_ptr<int32_t>(),
+      last_use.data_ptr<int64_t>(), seen.data_ptr<int64_t>(), tick, mbp, H, ksel, group,
       phys_pos.data_ptr<int32_t>(), cold.data_ptr<bool>(), key.data_ptr<int64_t>(),
       need.data_ptr<int64_t>(), counters.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -255,9 +327,69 @@ torch::Tensor tok_phys(torch::Tensor phys_pos, torch::Tensor key, torch::Tensor 
   return out;
 }
 
+void tok_fill_cells(torch::Tensor keys, torch::Tensor victims, torch::Tensor owner,
+                    torch::Tensor tok_slot_all, int64_t layer_off, torch::Tensor last_use,
+                    int64_t tick, torch::Tensor cpu_row, int64_t mbp, torch::Tensor pool,
+                    int64_t pool_dev_ptr, torch::Tensor kv_rows, torch::Tensor stage_units,
+                    int64_t HP, torch::Tensor counters) {
+  check_cuda(keys, "keys", at::kLong);
+  check_cuda(victims, "victims", at::kLong);
+  check_cuda(owner, "owner", at::kLong);
+  check_cuda(tok_slot_all, "tok_slot_all", at::kInt);
+  check_cuda(last_use, "last_use", at::kLong);
+  check_cuda(cpu_row, "cpu_row", at::kInt);
+  check_cuda(stage_units, "stage_units", at::kLong);
+  check_cuda(counters, "counters", at::kInt);
+  TORCH_CHECK(cpu_row.dim() == 3, "cpu_row [S, max_len, H]");
+  TORCH_CHECK(kv_rows.is_cuda() && kv_rows.dim() == 2 && kv_rows.stride(1) == 1 &&
+                  kv_rows.stride(0) == kv_rows.size(1),
+              "kv_rows [cells, C2] dense rows");
+  TORCH_CHECK(pool.dim() == 2 && pool.is_contiguous() && pool.size(1) == kv_rows.size(1) &&
+                  pool.scalar_type() == kv_rows.scalar_type(),
+              "pool [N, C2] contiguous, same row as kv_rows");
+  const int64_t row_bytes = kv_rows.size(1) * kv_rows.element_size();
+  TORCH_CHECK(row_bytes % 16 == 0 && reinterpret_cast<uintptr_t>(kv_rows.data_ptr()) % 16 == 0 &&
+                  pool_dev_ptr % 16 == 0 && pool_dev_ptr != 0,
+              "tok_fill_cells needs 16-byte aligned, device-mapped rows");
+  const int64_t n = keys.numel();
+  if (n == 0) return;
+  const at::cuda::CUDAGuard guard(keys.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int kWarps = 4;
+  tok_fill_cells_kernel<<<(unsigned)((n + kWarps - 1) / kWarps), 32 * kWarps, 0, stream>>>(
+      keys.data_ptr<int64_t>(), victims.data_ptr<int64_t>(), n, owner.data_ptr<int64_t>(),
+      tok_slot_all.data_ptr<int32_t>(), layer_off, last_use.data_ptr<int64_t>(), tick,
+      cpu_row.data_ptr<int32_t>(), cpu_row.size(1), cpu_row.size(2), mbp,
+      reinterpret_cast<const int4*>(pool_dev_ptr), row_bytes / 16,
+      reinterpret_cast<int4*>(kv_rows.data_ptr()), stage_units.data_ptr<int64_t>(), HP,
+      counters.data_ptr<int32_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor tok_phys_cells(torch::Tensor cell, torch::Tensor key, torch::Tensor cold,
+                             torch::Tensor tok_slot, torch::Tensor stage_units, int64_t HP) {
+  check_cuda(cell, "cell", at::kInt);
+  check_cuda(key, "key", at::kLong);
+  check_cuda(cold, "cold", at::kBool);
+  check_cuda(tok_slot, "tok_slot", at::kInt);
+  check_cuda(stage_units, "stage_units", at::kLong);
+  auto out = torch::empty(cell.sizes(), cell.options().dtype(at::kLong));
+  const int64_t total = cell.numel();
+  if (total == 0) return out;
+  const at::cuda::CUDAGuard guard(cell.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  tok_phys_cells_kernel<<<(int)((total + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+      cell.data_ptr<int32_t>(), key.data_ptr<int64_t>(), cold.data_ptr<bool>(), total,
+      tok_slot.data_ptr<int32_t>(), stage_units.data_ptr<int64_t>(), HP, out.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tok_discover", &tok_discover, "classify + LRU-stamp + dedup missing keys");
   m.def("tok_fill", &tok_fill, "map update + zero-copy host->staging copy");
   m.def("tok_phys", &tok_phys, "physical address per selected position");
+  m.def("tok_fill_cells", &tok_fill_cells, "cell mode: map update + zero-copy row fill");
+  m.def("tok_phys_cells", &tok_phys_cells, "cell mode: global cell per selected position");
   m.def("device_alias", &device_alias, "device pointer of a pinned host tensor (0 if none)");
 }

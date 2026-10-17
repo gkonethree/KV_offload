@@ -1461,6 +1461,15 @@ class GPUModelRunner(
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
 
+            # Token-level offloading: a round compacted this request and
+            # truncated its page list after this step's allocation. Keep the
+            # cached state in sync too -- a request re-added to the
+            # persistent batch is rebuilt from req_state.block_ids.
+            tok = getattr(self, "token_offload", None)
+            row = tok.take_row_update(req_id) if tok is not None else None
+            if row is not None:
+                req_state.block_ids = (list(row),)
+
             if req_index is None:
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
@@ -1480,8 +1489,6 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            tok = getattr(self, "token_offload", None)
-            row = tok.take_row_update(req_id) if tok is not None else None
             if row is not None:
                 # An offload round compacted this request: its page list was
                 # truncated after this step's allocation, so take it whole.

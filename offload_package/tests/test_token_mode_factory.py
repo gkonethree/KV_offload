@@ -56,3 +56,31 @@ def test_block_mode_factory_unchanged():
     assert orch.offload_manager is not None
     assert orch.staging_pool is not None
     assert orch.residency is not None
+
+
+def _vc(async_scheduling=False, world=1, cg="NONE"):
+    from types import SimpleNamespace as N
+    return N(scheduler_config=N(async_scheduling=async_scheduling),
+             parallel_config=N(world_size=world),
+             compilation_config=N(cudagraph_mode=N(name=cg)))
+
+
+def test_token_mode_env_check(monkeypatch):
+    from offload_package.integration.scheduler_connector import check_token_mode_env
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    check_token_mode_env(_vc())                                   # supported: no error
+    for bad, match in ((_vc(async_scheduling=True), "async_scheduling"),
+                       (_vc(world=2), "world_size=2"),
+                       (_vc(cg="FULL_AND_PIECEWISE"), "CUDA graphs")):
+        with pytest.raises(RuntimeError, match=match):
+            check_token_mode_env(bad)
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    with pytest.raises(RuntimeError, match="MULTIPROCESSING"):
+        check_token_mode_env(_vc())
+
+
+def test_token_mode_defaults_to_fastkvzip_global_policy():
+    """Default token offloading = FastKVzip's own policy: per-(layer, head)
+    budgets from one global ranking (HeadTokenOffloadEngine, shared staging)."""
+    cfg = OffloadConfig(offload_granularity="token")
+    assert cfg.token_budget_scope == "global" and cfg.token_scorer == "fastkvzip"

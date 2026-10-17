@@ -1,7 +1,9 @@
 """Forced decoding: FastKVzip vs random at 70% offload, per top-k."""
 import glob, os, re, statistics
 D = os.path.dirname(os.path.abspath(__file__))
-NAMES = [("pq", "pq"), ("pq_tok70", "tok-fastkvzip"), ("pq_tokrand70", "tok-random")]
+NAMES = [("pq", "pq"), ("pq_tok70", "tok-fastkvzip"), ("pq_tokrand70", "tok-random"),
+         ("pq_tok70l", "fkvz-head-layer"), ("pq_tok70g", "fkvz-head-glob"),
+         ("pq_tokrand70g", "rand-head-glob")]
 L = 36
 
 def parse(p):
@@ -34,9 +36,9 @@ def fmt(vals, f="{:.1f}"):
 for tk in sorted({os.path.basename(p).split("_")[0] for p in glob.glob(os.path.join(D, "k*_r?.log"))}):
     print(f"\n=== top-k {tk[1:]} | Qwen3-4B-Instruct-2507 | 8k + 4096 | 70% token offload, W=256 ===")
     print(f"{'config':<15}{'TPOT ms':>15}{'TTFT ms':>14}{'cold-sel %':>13}{'miss/layer-step':>16}"
-          f"{'fetched GB':>13}{'chunked':>9}{'agree %':>9}{'ref NLL':>9}{'1st diff':>9}{'KV mean/final (+stage)':>24}  runs")
+          f"{'fetched GB':>13}{'chunked':>12}{'agree %':>12}{'ref NLL':>16}{'1st diff':>10}{'KV mean/final (+stage)':>24}  runs")
     for stem, name in NAMES:
-        rs = [parse(p) for p in sorted(glob.glob(os.path.join(D, f"{tk}_{stem}_r*.log")))]
+        rs = [parse(p) for p in sorted(glob.glob(os.path.join(D, f"{tk}_{stem}_r[0-9].log")))]
         rs = [r for r in rs if r["tpot"] is not None and not r["err"]]
         if not rs:
             print(f"{name:<15}  (not done)"); continue
@@ -46,10 +48,10 @@ for tk in sorted({os.path.basename(p).split("_")[0] for p in glob.glob(os.path.j
               f"{(fmt([100 * r['cold_rate'] for r in rs]) if tok else '-'):>13}"
               f"{(fmt([r['miss_per_ls'] for r in rs]) if tok else '-'):>16}"
               f"{(fmt([r['gb'] for r in rs]) if tok else '-'):>13}"
-              f"{(fmt([r['chunked'] for r in rs], '{:.0f}') if tok else '-'):>9}"
-              f"{fmt([r['agree'] for r in rs if r['agree'] is not None], '{:.2f}'):>9}"
-              f"{fmt([r['nll'] for r in rs if r['nll'] is not None], '{:.4f}'):>9}"
-              f"{'/'.join(str(r['first']) for r in rs):>9}"
+              f"{(fmt([r['chunked'] for r in rs], '{:.0f}') if tok else '-'):>12}"
+              f"{fmt([r['agree'] for r in rs if r['agree'] is not None], '{:.2f}'):>12}"
+              f"{fmt([r['nll'] for r in rs if r['nll'] is not None], '{:.4f}'):>16}"
+              f"{'/'.join(str(r['first']) for r in rs):>10}"
               f"{f'{kv[1]}/{kv[2]} (+{kv[3]})':>24}  {len(rs)}"
               + ("  FALLBACK!" if any(r["fallback"] for r in rs) else ""))
 md5 = {open(p).read().split()[1] for p in glob.glob(os.path.join(D, "*.meta"))}

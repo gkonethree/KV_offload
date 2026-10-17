@@ -728,18 +728,16 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        print(f"[GPU WORKER DEBUG] initialize_from_config: calling model_runner.initialize_kv_cache, model_runner={type(self.model_runner)}, id={id(self.model_runner)}", flush=True)
         self.model_runner.initialize_kv_cache(
             kv_cache_config,
             kv_cache_allocation_context=self._maybe_get_memory_pool_context(
                 tag="kv_cache"
             ),
         )
-        
+
         # Call set_runner on the global KV connector for offload package
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
-            print(f"[GPU WORKER DEBUG] calling set_runner on connector={type(connector)}", flush=True)
             if hasattr(connector, 'set_runner'):
                 connector.set_runner(self.model_runner)
 

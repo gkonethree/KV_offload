@@ -85,11 +85,12 @@ class BatchedFastKVzipGates(nn.Module):
     offload rounds, so the hook stashes each layer's attention input and this
     module scores every layer at once (stacked weights, bmm + einsum).
     Same math as ``FastKVzipGate`` with the heads combined by max:
-    ``forward(H [L, N, D]) -> [L, N]`` float32.
+    ``forward(H [L, N, D]) -> [L, N]`` float32 (``per_head``: ``[L, N, H]``).
     """
 
-    def __init__(self, gates: list[FastKVzipGate]) -> None:
+    def __init__(self, gates: list[FastKVzipGate], per_head: bool = False) -> None:
         super().__init__()
+        self.per_head = per_head
         g0 = gates[0]
         self.nhead, self.ngroup, self.output_dim = g0.nhead, g0.ngroup, g0.output_dim
         self.d = g0.d
@@ -122,40 +123,44 @@ class BatchedFastKVzipGates(nn.Module):
         logit = torch.einsum("lnhd,lnhgd->lnhg", k, q) / self.d + self.b.unsqueeze(1)
         base = torch.einsum("lhsd,lnhgd->lnhsg", self.k_base, q) / self.d
         score = 1 / (1 + torch.exp(base - logit.unsqueeze(3)).sum(3))     # L, n, H, G
-        return score.mean(-1).amax(-1).float()                            # L, n
+        score = score.mean(-1).float()                                    # L, n, H
+        return score if self.per_head else score.amax(-1)
 
 
 class RandomTokenGate(nn.Module):
     """Control scorer with the gate's interface: i.i.d. uniform scores, so a
     round offloads a random subset of each layer's non-protected tokens."""
 
-    def __init__(self, seed: int = 0) -> None:
+    def __init__(self, seed: int = 0, nhead: int = 1) -> None:
         super().__init__()
         self.seed = seed
+        self.nhead = nhead
         self._gen = None
 
     @torch.no_grad()
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._gen is None or self._gen.device != hidden_states.device:
             self._gen = torch.Generator(device=hidden_states.device).manual_seed(self.seed)
-        return torch.rand(1, hidden_states.shape[0], device=hidden_states.device,
+        return torch.rand(self.nhead, hidden_states.shape[0], device=hidden_states.device,
                           generator=self._gen)
 
 
 class BatchedRandomGates(nn.Module):
-    """``RandomTokenGate`` for all layers at once: ``[L, N, D] -> [L, N]``."""
+    """``RandomTokenGate`` for all layers at once: ``[L, N, D] -> [L, N]``
+    (``nhead``: ``[L, N, nhead]``, one score per KV head)."""
 
-    def __init__(self, seed: int = 0) -> None:
+    def __init__(self, seed: int = 0, nhead: int | None = None) -> None:
         super().__init__()
         self.seed = seed
+        self.nhead = nhead
         self._gen = None
 
     @torch.no_grad()
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._gen is None or self._gen.device != hidden.device:
             self._gen = torch.Generator(device=hidden.device).manual_seed(self.seed)
-        return torch.rand(hidden.shape[0], hidden.shape[1], device=hidden.device,
-                          generator=self._gen)
+        shape = tuple(hidden.shape[:2]) + ((self.nhead,) if self.nhead else ())
+        return torch.rand(shape, device=hidden.device, generator=self._gen)
 
 
 def gate_file_for(model_name: str, num_attention_heads: int,

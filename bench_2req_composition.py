@@ -68,17 +68,32 @@ SPARSE_ENV = {
     'SKYLIGHT_PQ_GQA_SHARE': '1',   # operating mode: selection per kv-head
 }
 
+_TOK = dict(offload_granularity='token', token_scorer='random', offload_fraction=0.7)
 CONFIGS = {
     'pq': dict(method='pq', offload=False),
     'pq+offload': dict(method='pq', offload=True),
+    # Token-level offloading under batching (prefix caching off for all three).
+    'pq-nopc': dict(method='pq', offload=False, nopc=True),
+    'pq+tok': dict(method='pq', offload=True, nopc=True, extra=dict(_TOK)),
+    'pq+tokh': dict(method='pq', offload=True, nopc=True,
+                    extra=dict(_TOK, token_budget_scope='layer')),
 }
 
 
-def run(name, method, offload):
+def run(name, method, offload, nopc=False, extra=None):
     print(f"\n{'=' * 70}\nCONFIG: {name}\n{'=' * 70}", flush=True)
     for k, v in SPARSE_ENV.items():
         os.environ[k] = v
     os.environ['SKYLIGHT_SPARSE_METHOD'] = method
+    if method == 'pq':
+        # Skylight upstream (ak/pq): 'pq' is the pure-torch reference; the
+        # production path is 'pq_optimized' with its slot-code maintainer,
+        # driven on the FULL-cg slot path (eager here) with top-k sized from
+        # the live context.
+        os.environ['SKYLIGHT_SPARSE_METHOD'] = 'pq_optimized'
+        os.environ['SKYLIGHT_INCR_FULLCG'] = '1'
+        os.environ['SKYLIGHT_INCR_SLOT'] = '1'
+        os.environ['SKYLIGHT_SPARSE_DYNAMIC_TOPK'] = '1'
 
     kv = None
     if offload:
@@ -92,6 +107,7 @@ def run(name, method, offload):
                 'staging_policy': 'auto',
                 'interval_tokens': INTERVAL_TOKENS,
                 'true_free': True,
+                **(extra or {}),
             },
             kv_role='kv_both',
         )
@@ -110,6 +126,7 @@ def run(name, method, offload):
         disable_log_stats=True,
         attention_config={'backend': 'CUSTOM'},
         async_scheduling=False,
+        enable_prefix_caching=not nopc,
     )
     if kv is not None:
         kwargs['kv_transfer_config'] = kv
@@ -141,6 +158,13 @@ def run(name, method, offload):
         'texts': [o.outputs[0].text for o in outputs],
         'tokens': [list(o.outputs[0].token_ids) for o in outputs],
     }
+    # vLLM gc.freeze()s the heap at engine start: `del llm` alone frees
+    # nothing; EngineCore.shutdown() unfreezes and shuts the connector down.
+    try:
+        llm.llm_engine.engine_core.shutdown()
+    except Exception as e:
+        print(f"  engine shutdown failed ({e}); falling back to gc.unfreeze", flush=True)
+    gc.unfreeze()
     del llm
     gc.collect()
     torch.cuda.empty_cache()
@@ -156,14 +180,15 @@ if __name__ == '__main__':
         results[name] = run(name, **CONFIGS[name])
 
     print(f"\n{'=' * 92}")
-    print("CORRECTNESS (per-request greedy token-for-token vs 'pq'):")
-    base = results.get('pq')
+    base_name = 'pq' if 'pq' in results else 'pq-nopc'
+    print(f"CORRECTNESS (per-request greedy token-for-token vs {base_name!r}):")
+    base = results.get(base_name)
     ok = True
     if base is None:
         print("  pq baseline not run; skipping comparison")
     else:
         for name, r in results.items():
-            if name == 'pq':
+            if name == base_name:
                 continue
             for i, (bt, ot) in enumerate(zip(base['tokens'], r['tokens'])):
                 # Compare over the common prefix length (B finishes earlier).

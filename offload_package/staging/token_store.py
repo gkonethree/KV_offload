@@ -15,6 +15,19 @@ token -> address map without a kernel change.
 
 Keys are ``mirror_slot * (MB * P) + logical_position`` (mirror slot from the
 residency device mirror, stable per request). All maps live on the GPU.
+
+Per-(layer, head) cell mode (``HeadTokenOffloadEngine``): each KV head of a
+token is staged on its own, keys are ``(slot * H + kv_head) * (MB * P) +
+position``, and addresses are global cells of the engine's flat ``kv_rows``.
+Staging is ONE pool shared by every layer and head: all layers' units of the
+staging pages (``num_slots * L * H * P`` cells), so a layer with many misses
+can use what another leaves idle. ``owner`` holds ``layer * S * kps + key``.
+Lookup per decode step and layer: resident on the GPU, else staged, else
+fetched from the CPU. Victims are NOT chosen by recency: a hand walks the
+pool and takes the next cells in ring order, skipping only cells stamped
+this tick (used by the current layer's selection); anything else -- any
+layer, any head -- may be evicted. The cost depends on the fetch size and
+this tick's hits, not on the pool size.
 """
 
 from __future__ import annotations
@@ -35,14 +48,25 @@ class TokenStagingStore:
         self.pool = pool                      # pinned ring + copy stream + caches
         self.res = residency
         self.P = int(pool._page_size)
-        self.C = int(pool.num_slots) * self.P  # token slots per layer
+        eng = getattr(residency, "engine", None)
+        self.heads = bool(getattr(eng, "headwise", False))
+        self.Hm = int(eng.H) if self.heads else 1       # keys per token
         self.L = len(pool.gpu_k_caches)
+        # Staging slots: per layer (token mode), or one pool of cells for all
+        # layers and heads (cell mode).
+        self.C = int(pool.num_slots) * self.P * self.Hm * (self.L if self.heads else 1)
         self.mbp = int(residency._mb) * self.P
+        self.kps = self.Hm * self.mbp                   # keys per request slot
         self.dev = pool.gpu_k_caches[0].device
         self._tick = 0
         self._stamped = 0        # slots stamped with the current tick (kernel path)
         self._S = 0
         self._kern = None        # resolved on first token-engine stage (see _kernels)
+        if self.heads:
+            self._stage_units = torch.tensor(
+                [eng.unit(l, pool.base + b) for b in range(int(pool.num_slots))
+                 for l in range(self.L)], dtype=torch.long, device=self.dev)
+            self._hand = 0
         residency.on_slot_release.append(self.release_slot)
 
     @property
@@ -79,6 +103,14 @@ class TokenStagingStore:
         self._pool_dev = int(mod.device_alias(eng.cpu_pool))
         if not self._pool_dev:
             return "CPU token pool is not device-mapped pinned memory"
+        if self.heads:
+            rows = eng.kv_rows
+            es = rows.element_size()
+            if (rows.shape[1] * es) % 16 or rows.data_ptr() % 16 or (eng.cpu_pool.stride(0) * es) % 16:
+                return "cell rows are not 16-byte aligned"
+            if eng.cpu_pool.shape[1] != rows.shape[1]:
+                return "CPU token pool row shape != KV cell row shape"
+            return None
         k = self.pool.gpu_k_caches[0]
         es = k.element_size()
         if (k.stride(3) != 1 or any((k.stride(d) * es) % 16 for d in range(3))
@@ -106,21 +138,26 @@ class TokenStagingStore:
             self._alloc(S)
 
     def _alloc(self, S: int) -> None:
-        tok =torch.full((self.L, S, self.mbp), -1, dtype=torch.int32, device=self.dev)
+        tok = torch.full((self.L, S, self.kps), -1, dtype=torch.int32, device=self.dev)
         # seen: tick at which each key was last requested (kernel-path dedup);
         # ticks only grow, so stale stamps never need clearing.
-        seen = torch.zeros((self.L, S, self.mbp), dtype=torch.int64, device=self.dev)
+        seen = torch.zeros((self.L, S, self.kps), dtype=torch.int64, device=self.dev)
         if self._S:
             tok[:, : self._S].copy_(self.tok_slot)
             seen[:, : self._S].copy_(self.seen)
+            if self.heads:          # owner = layer * S * kps + key: re-base on S
+                o = self.owner
+                lay = torch.div(o, self._S * self.kps, rounding_mode="floor")
+                self.owner = torch.where(o >= 0, o + lay * (S - self._S) * self.kps, o)
         else:
             # counters {n_need, n_hit_new, err, pad} + pinned host copy.
             self._ctr = torch.zeros(4, dtype=torch.int32, device=self.dev)
             self._ctr_host = torch.zeros(4, dtype=torch.int32, pin_memory=True)
             self._need = torch.empty(0, dtype=torch.int64, device=self.dev)
             # owner: key held by each slot (-1 free); last_use: LRU tick.
-            self.owner = torch.full((self.L, self.C), -1, dtype=torch.int64, device=self.dev)
-            self.last_use = torch.zeros((self.L, self.C), dtype=torch.int64, device=self.dev)
+            shape = (self.C,) if self.heads else (self.L, self.C)
+            self.owner = torch.full(shape, -1, dtype=torch.int64, device=self.dev)
+            self.last_use = torch.zeros(shape, dtype=torch.int64, device=self.dev)
         self.tok_slot = tok
         self.seen = seen
         self._S = S
@@ -130,7 +167,8 @@ class TokenStagingStore:
         if s >= self._S:
             return
         self.tok_slot[:, s] = -1
-        gone = (self.owner >= 0) & (torch.div(self.owner, self.mbp, rounding_mode="floor") == s)
+        key = self.owner % (self._S * self.kps) if self.heads else self.owner
+        gone = (self.owner >= 0) & (torch.div(key, self.kps, rounding_mode="floor") == s)
         self.owner[gone] = -1
         self.last_use[gone] = 0
 
@@ -161,24 +199,33 @@ class TokenStagingStore:
         _timing.end("wrap.fetch")
         return key, cold, None if ok else need
 
-    def stage_tokens(self, layer: int, idx: torch.Tensor, rows: torch.Tensor):
+    def stage_tokens(self, layer: int, idx: torch.Tensor, rows: torch.Tensor,
+                     qheads: tuple[int, int] | None = None):
         """Token-engine mode: like ``stage`` but per-layer token residency.
 
         Returns ``(key, cold, phys_pos, missing)``: ``phys_pos`` is each
         position's physical slot in the request's (compacted) pages, -1 when
-        offloaded."""
+        offloaded. Cell mode: ``idx`` is ``[B, Hq * ksel]`` (q-head major) with
+        ``qheads = (ksel, group)``, and ``phys_pos`` is a global cell."""
         eng = self.res.engine
+        if self.heads and qheads is None:
+            raise ValueError("per-head token staging needs qheads=(ksel, group)")
         kern = self._kernels()
         if kern is not None:
-            return self._stage_tokens_kernel(kern, eng, layer, idx, rows)
+            return self._stage_tokens_kernel(kern, eng, layer, idx, rows, qheads)
         _timing.start("wrap.discover")
         self._ensure()
-        phys_pos = eng.phys_of_logical[layer][rows, idx]
+        if self.heads:
+            kvh = self._kv_heads(idx.shape[1], qheads, idx.device)
+            phys_pos = eng.cell[layer][rows, idx, kvh]
+            key = (rows * self.Hm + kvh) * self.mbp + idx
+        else:
+            phys_pos = eng.phys_of_logical[layer][rows, idx]
+            key = rows * self.mbp + idx
         cold = phys_pos < 0
-        key = rows * self.mbp + idx
         slot = self.tok_slot[layer].view(-1)[key]
         self.tick += 1
-        self.last_use[layer][slot[cold & (slot >= 0)].long()] = self.tick
+        self._lu(layer)[slot[cold & (slot >= 0)].long()] = self.tick
         need_d = torch.unique(key[cold & (slot < 0)])
         need = need_d.cpu()
         _timing.end("wrap.discover")
@@ -189,7 +236,37 @@ class TokenStagingStore:
         _timing.end("wrap.fetch")
         return key, cold, phys_pos, None if ok else need
 
-    def _stage_tokens_kernel(self, kern, eng, layer, idx, rows):
+    @staticmethod
+    def _kv_heads(n: int, qheads, device) -> torch.Tensor:
+        """KV head of each entry of a q-head-major ``[B, Hq * ksel]`` row."""
+        ksel, group = qheads
+        return torch.div(torch.arange(n, device=device), ksel * group,
+                         rounding_mode="floor").view(1, -1)
+
+    def _lu(self, layer: int) -> torch.Tensor:
+        return self.last_use if self.heads else self.last_use[layer]
+
+    def _stage_cell(self, slot: torch.Tensor) -> torch.Tensor:
+        """Global cell of shared staging slot(s) (cell mode)."""
+        HP = self.res.engine.HP
+        u = torch.div(slot, HP, rounding_mode="floor")
+        return self._stage_units[u] * HP + (slot - u * HP)
+
+    def _victims(self, n: int, stamped: int) -> torch.Tensor:
+        """Cell mode: the next ``n`` cells after the hand, in ring order,
+        skipping cells stamped this tick (in use by the current layer). At
+        most ``stamped`` cells are protected, so a window of n + stamped
+        always holds n victims; the hand moves past the window."""
+        G = self.C
+        W = min(G, n + stamped)
+        r = torch.arange(W, device=self.dev)
+        idx = (self._hand + r) % G
+        order = torch.where(self.last_use[idx] == self.tick, _NEVER, r)
+        _, sel = torch.topk(order, n, largest=False, sorted=True)
+        self._hand = (self._hand + W) % G
+        return idx[sel]
+
+    def _stage_tokens_kernel(self, kern, eng, layer, idx, rows, qheads=None):
         """``stage_tokens`` on the CUDA kernels: one classify/stamp/dedup
         launch and ONE counter readback, then (if anything is missing) one
         victim topk and one map-update + zero-copy fill launch."""
@@ -204,10 +281,14 @@ class TokenStagingStore:
         phys_pos = torch.empty(idx.shape, dtype=torch.int32, device=self.dev)
         cold = torch.empty(idx.shape, dtype=torch.bool, device=self.dev)
         key = torch.empty(idx.shape, dtype=torch.int64, device=self.dev)
+        ksel, group = qheads if self.heads else (idx.shape[1], 1)
         kern.tok_discover(idx, rows.reshape(-1).long().contiguous(),
-                          eng.phys_of_logical[layer], self.tok_slot[layer].view(-1),
-                          self.last_use[layer], self.seen[layer].view(-1), self.tick,
-                          self.mbp, phys_pos, cold, key, self._need, self._ctr)
+                          eng.cell[layer] if self.heads else eng.phys_of_logical[layer],
+                          eng.cpu_row[layer] if self.heads else eng.cpu_slot[layer],
+                          self.tok_slot[layer].view(-1),
+                          self._lu(layer), self.seen[layer].view(-1), self.tick,
+                          self.mbp, self.Hm, ksel, group, phys_pos, cold, key,
+                          self._need, self._ctr)
         self._ctr_host.copy_(self._ctr, non_blocking=True)
         torch.cuda.current_stream(self.dev).synchronize()   # the one per-layer readback
         n_need, n_hit, err, n_cold = (int(x) for x in self._ctr_host.tolist())
@@ -234,6 +315,15 @@ class TokenStagingStore:
         tokens through the row's compacted page list, cold ones from the
         staged slot (0 if unfetched -- only read with weight 0)."""
         kern = self._kernels()
+        if self.heads:
+            eng = self.res.engine
+            if kern is not None:
+                return kern.tok_phys_cells(phys_pos.contiguous(), key.contiguous(),
+                                           cold.contiguous(), self.tok_slot[layer].view(-1),
+                                           self._stage_units, eng.HP)
+            slot = self.tok_slot[layer].view(-1)[key].long()
+            staged = torch.where(slot >= 0, self._stage_cell(slot.clamp(min=0)), 0)
+            return torch.where(cold, staged, phys_pos.long())
         if kern is not None:
             if indices.dtype != indptr.dtype:
                 indices = indices.to(indptr.dtype)
@@ -258,6 +348,19 @@ class TokenStagingStore:
         kern = self._kernels()
         if kern is not None:
             return self._fetch_kernel(kern, layer, keys_d, n)
+        if self.heads:
+            stamped = int((self.last_use == self.tick).sum())
+            if n > self.C - stamped:
+                return False
+            victims = self._victims(n, stamped)
+            flat_all = self.tok_slot.view(-1)
+            old = self.owner[victims]
+            flat_all[old[old >= 0]] = -1
+            self.owner[victims] = keys_d + layer * self._S * self.kps
+            self.tok_slot[layer].view(-1)[keys_d] = victims.to(torch.int32)
+            self.last_use[victims] = self.tick
+            self._copy(layer, keys, victims)
+            return True
         lu = self.last_use[layer]
         vals, victims = torch.topk(lu.masked_fill(lu == self.tick, _NEVER), n, largest=False)
         if int(vals.max()) == _NEVER:
@@ -277,6 +380,19 @@ class TokenStagingStore:
         if n > self.C - self._stamped:
             return False
         eng = self.res.engine
+        if self.heads:
+            victims = self._victims(n, self._stamped)
+            rows = eng.kv_rows
+            _timing.note_bytes("pool.d2h_token", n * rows.shape[1] * rows.element_size())
+            _timing.start("pool.h2d")
+            kern.tok_fill_cells(keys_d.contiguous(), victims.contiguous(), self.owner,
+                                self.tok_slot.view(-1), layer * self._S * self.kps,
+                                self.last_use, self.tick, eng.cpu_row[layer],
+                                self.mbp, eng.cpu_pool, self._pool_dev, rows,
+                                self._stage_units, eng.HP, self._ctr)
+            _timing.end("pool.h2d")
+            self._stamped += n
+            return True
         lu = self.last_use[layer]
         _, victims = torch.topk(lu.masked_fill(lu == self.tick, _NEVER), n, largest=False)
         k_cache = self.pool.gpu_k_caches[layer]
@@ -330,6 +446,13 @@ class TokenStagingStore:
 
     def _copy(self, layer: int, keys: torch.Tensor, victims: torch.Tensor) -> None:
         """CPU source -> this layer's staging slots, via the pool's pinned ring."""
+        if self.heads:
+            # Reference path (the kernels are the runtime path): plain copy.
+            rows = self.res.engine.kv_rows
+            host = self.res.host_tokens(layer, keys)
+            _timing.note_bytes("pool.d2h_token", host.numel() * host.element_size())
+            rows[self._stage_cell(victims)] = host.to(self.dev)
+            return
         P = self.P
         src = getattr(self.res, "host_tokens", None)
         host = src(layer, keys) if src is not None else self._host_tokens(layer, keys)
@@ -382,9 +505,18 @@ class _EngineSlots:
         pass
 
     def host_tokens(self, layer: int, keys: torch.Tensor) -> torch.Tensor:
-        """Keys -> CPU token-pool rows of this layer (``[n, H, 2C]``)."""
+        """Keys -> CPU token-pool rows of this layer (``[n, H, 2C]``; cell
+        mode ``[n, 2C]``)."""
         eng = self.engine
         mbp = self._mb * eng.P
+        if getattr(eng, "headwise", False):
+            k = keys.to(eng.dev)
+            rh = torch.div(k, mbp, rounding_mode="floor")
+            row = torch.div(rh, eng.H, rounding_mode="floor")
+            rows = eng.cpu_row[layer][row, k - rh * mbp, rh - row * eng.H].long().cpu()
+            if bool((rows < 0).any()):
+                raise RuntimeError("token fetch: selected token has no CPU copy")
+            return eng.cpu_pool.index_select(0, rows)
         s = torch.div(keys, mbp, rounding_mode="floor")
         pos = keys - s * mbp
         slots = eng.cpu_slot[layer][s.to(eng.dev), pos.to(eng.dev)].long().cpu()

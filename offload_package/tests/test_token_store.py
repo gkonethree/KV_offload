@@ -107,3 +107,57 @@ def test_identity_tables_decode_bitwise_equal():
     out_b, lse_b = run(torch.zeros(2, dtype=torch.int32, device="cuda"),
                        torch.arange(pages, dtype=torch.int32, device="cuda"), phys)
     assert torch.equal(out_a, out_b) and torch.equal(lse_a, lse_b)
+
+
+@pytest.mark.parametrize("layout", ["layer_outer", "block_outer", "token_major"])
+def test_flat_cell_decode_bitwise_equal(layout):
+    """Cell mode: the decode kernel reading the whole KV buffer through global
+    cells (page_size = H * P, stride_h = 0, identity tables) equals the normal
+    paged decode, also when tokens' rows sit in OTHER layers' pages."""
+    from offload_package.integration.token_mode_heads import flat_cells
+    ops_mod = pytest.importorskip("sparse_optimized.cuda_ops")
+    ops = ops_mod.get_sparse_decode_ops()
+    torch.manual_seed(0)
+    L, H, group, D, PS, pages, K = 3, 2, 2, 128, 16, 20, 32
+    Hq = H * group
+    buf = torch.randn(L * pages * H * PS * 2 * D, dtype=torch.bfloat16, device="cuda")
+    if layout == "layer_outer":
+        caches = list(buf.view(L, pages, H, PS, 2 * D).unbind(0))
+    elif layout == "token_major":
+        caches = list(buf.view(L, pages, PS, H, 2 * D).permute(0, 1, 3, 2, 4).unbind(0))
+    else:
+        caches = list(buf.view(pages, L, H, PS, 2 * D).unbind(1))
+    rows, ub, us, n_units, head_major = flat_cells(caches)
+    layer = 1
+    kv = caches[layer]
+    q = torch.randn(1, Hq, D, dtype=torch.bfloat16, device="cuda")
+    indices = torch.tensor([7, 3, 11, 5], dtype=torch.int32, device="cuda")
+    indptr = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    idx = torch.randint(0, 4 * PS, (1, Hq, K), device="cuda")
+    w = torch.ones(1, Hq, K, device="cuda")
+    slen = torch.full((1, Hq, 1), K, dtype=torch.int32, device="cuda")
+    ks = int(ops.pick_k_split(1, Hq, K, 64))
+    out_a, lse_a = ops.sparse_decode_run(
+        q, kv, kv, int(kv.stride(0)), int(kv.stride(2)), int(kv.stride(1)), D,
+        indptr, indices, slen, idx, w, H, PS, D ** -0.5, 0.0, ks, True)
+    kvh = (torch.arange(Hq, device="cuda") // group).view(1, Hq, 1)
+    page = indices[idx // PS].long()
+    o = idx % PS
+    cell = (ub[layer] + page * us) * H * PS + (kvh * PS + o if head_major else o * H + kvh)
+    # Move the first half of the selection's rows into layer 0's / layer 2's
+    # unused pages (16..19) -- a layer borrowing another layer's units.
+    uniq = cell[:, :, : K // 2].unique()
+    spare = torch.cat([((ub[l] + torch.arange(16, 20, device="cuda") * us).view(-1, 1) * H * PS
+                        + torch.arange(H * PS, device="cuda").view(1, -1)).reshape(-1)
+                       for l in (0, 2)])[: uniq.numel()]
+    rows[spare] = rows[uniq]
+    remap = torch.full((n_units * H * PS,), -1, dtype=torch.long, device="cuda")
+    remap[uniq] = spare
+    moved = remap[cell]
+    cell = torch.where(moved >= 0, moved, cell)
+    out_b, lse_b = ops.sparse_decode_run(
+        q, rows, rows[:, D:], H * PS * 2 * D, 2 * D, 0, 0,
+        torch.zeros(2, dtype=torch.int32, device="cuda"),
+        torch.arange(n_units, dtype=torch.int32, device="cuda"),
+        slen, cell.contiguous(), w, H, H * PS, D ** -0.5, 0.0, ks, True)
+    assert torch.equal(out_a, out_b) and torch.equal(lse_a, lse_b)

@@ -309,6 +309,16 @@ class KVOffloadManager:
         n = len(gpu_block_ids)
         if n <= 0:
             raise ValueError("empty batch")
+        # The copy reads K and V from ONE combined [pages, H, N, 2C] tensor
+        # per layer (this fork's layout); a separate (K, V) pair would be
+        # copied as garbage.
+        C = self.cpu_cache.shape[-1]
+        for k_cache, v_cache in zip(self.gpu_k_caches, self.gpu_v_caches):
+            if k_cache is not v_cache or k_cache.shape[-1] != 2 * C:
+                raise RuntimeError(
+                    "GPU->CPU block copy needs combined per-layer KV tensors "
+                    f"[pages, H, N, 2*{C}] (k_cache is v_cache); got "
+                    f"{tuple(k_cache.shape)} / {tuple(v_cache.shape)}")
         if n > self._cpu_pool.num_free:
             raise RuntimeError(
                 f"CPU offload pool exhausted: need {n}, free {self._cpu_pool.num_free}"

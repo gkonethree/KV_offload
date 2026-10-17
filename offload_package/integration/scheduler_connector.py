@@ -53,6 +53,40 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def runtime_env(vllm_config) -> tuple[bool, bool, int, bool]:
+    """``(async_scheduling, multiprocess, world_size, cuda_graphs)``: the
+    engine properties that decide whether the scheduler may touch KV pages
+    synchronously (true freeing; token-level offloading)."""
+    import os as _os
+    _async = bool(getattr(vllm_config.scheduler_config, "async_scheduling", False))
+    _mp = _os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") not in ("0", "false", "False")
+    _world = vllm_config.parallel_config.world_size
+    _cg_mode = getattr(getattr(vllm_config, "compilation_config", None), "cudagraph_mode", None)
+    _graphs = getattr(_cg_mode, "name", str(_cg_mode)).upper() not in (
+        None, "NONE", "OFF",
+    ) if _cg_mode is not None else False
+    return _async, _mp, _world, _graphs
+
+
+def check_token_mode_env(vllm_config) -> None:
+    """Token-level offloading compacts KV pages inside ``schedule()`` and
+    reaches the worker's engine through the shared connector object: it is
+    only correct for an in-process, single-worker, synchronously scheduled,
+    eager engine. Refuse anything else instead of silently doing nothing or
+    racing the in-flight forward."""
+    _async, _mp, _world, _graphs = runtime_env(vllm_config)
+    bad = [name for name, on in (
+        ("async_scheduling", _async),
+        ("VLLM_ENABLE_V1_MULTIPROCESSING", _mp),
+        (f"world_size={_world}", _world != 1),
+        ("CUDA graphs (use enforce_eager)", _graphs),
+    ) if on]
+    if bad:
+        raise RuntimeError("token-level offloading (offload_granularity='token') "
+                           "needs an in-process, single-worker, synchronous, eager "
+                           "engine; unsupported: " + ", ".join(bad))
+
+
 class OffloadPackageScheduler:
     """Scheduler-side offloading manager. Binds GPU BlockPool for memory savings."""
 
@@ -126,16 +160,7 @@ class OffloadPackageScheduler:
         # scheduling the next step may already be reading those pages when the
         # completion event is processed. With CUDA graphs the in-run fetch can't
         # run during replay, so freed pages must stay readable (shadow tier).
-        import os as _os
-        _async = bool(getattr(vllm_config.scheduler_config, "async_scheduling", False))
-        _mp = _os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") not in ("0", "false", "False")
-        _world = vllm_config.parallel_config.world_size
-        _cg_mode = getattr(
-            getattr(vllm_config, "compilation_config", None), "cudagraph_mode", None
-        )
-        _graphs = getattr(_cg_mode, "name", str(_cg_mode)).upper() not in (
-            None, "NONE", "OFF",
-        ) if _cg_mode is not None else False
+        _async, _mp, _world, _graphs = runtime_env(vllm_config)
         self._graphs_active = _graphs
         self._true_free_enabled = (
             offload_config.enabled

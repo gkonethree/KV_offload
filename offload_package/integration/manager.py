@@ -8,10 +8,7 @@ from vllm.logger import init_logger
 
 from ..controller import KVCompressionController
 from ..offload.manager import KVOffloadManager
-from ..selection.adapter import (
-    collect_needed_block_refs,
-    patch_paged_kv_indices_with_staging,
-)
+from ..selection.adapter import collect_needed_block_refs
 from ..scoring.base import BlockRef
 from ..staging.pool import KVStagingPool
 from ..staging.residency import Residency, ResidencyTable
@@ -293,27 +290,6 @@ class OffloadOrchestrator:
             for scorer in scorers:
                 scorer.note_usage(rid, blocks)
         _timing.end("lru.note")
-
-    def patch_paged_kv_indices(
-        self,
-        paged_kv_indices: torch.Tensor,
-        paged_kv_indptr: torch.Tensor,
-        request_ids: Sequence[str],
-        sparse_idx: torch.Tensor,
-        sparse_len: torch.Tensor,
-        staging_map: dict[BlockRef, int],
-    ) -> torch.Tensor:
-        return patch_paged_kv_indices_with_staging(
-            paged_kv_indices,
-            paged_kv_indptr,
-            request_ids,
-            sparse_idx,
-            sparse_len,
-            self.page_size,
-            self.staging_base_page_idx,
-            self.residency,
-            staging_map,
-        )
 
     def on_request_done(self, request_id: str) -> None:
         self._cleanup_request(request_id)

@@ -670,10 +670,6 @@ class FlashInferMetadata:
     paged_kv_indices: torch.Tensor | None = None
     paged_kv_indptr: torch.Tensor | None = None
 
-    # Paged KV indices for staging (used by offload package)
-    paged_kv_indices: torch.Tensor | None = None
-    paged_kv_indptr: torch.Tensor | None = None
-
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec

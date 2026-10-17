@@ -123,7 +123,8 @@ CONFIGS = {
                          staging_policy='auto', num_staging_slots=None,
                          scorer_type='lru',
                          fetch_granularity='per_layer_tokens'),
-    # Token-level offloading: per-layer FastKVzip eviction + compaction.
+    # Token-level offloading, default policy (FastKVzip's): per-(layer, head)
+    # budgets from one global ranking, staging shared by all layers/heads.
     'pq+tok70': dict(method='pq', offload=True, fraction=0.7,
                      staging_policy='auto', num_staging_slots=None,
                      scorer_type='paged_eviction', granularity='token'),
@@ -131,6 +132,60 @@ CONFIGS = {
                          staging_policy='auto', num_staging_slots=None,
                          scorer_type='paged_eviction', granularity='token',
                          token_scorer='random'),
+    # Older shared engine: same tokens for every head of a layer, same count
+    # in every layer, per-layer LRU staging.
+    'pq+tok70s': dict(method='pq', offload=True, fraction=0.7,
+                      staging_policy='auto', num_staging_slots=None,
+                      scorer_type='paged_eviction', granularity='token',
+                      budget_scope='shared'),
+    'pq+tokrand70s': dict(method='pq', offload=True, fraction=0.7,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='paged_eviction', granularity='token',
+                          token_scorer='random', budget_scope='shared'),
+    # Per-(layer, head) budgets: g = global ranking over (layer, head, token)
+    # (FastKVzip's policy), l = equal per-layer totals, u = equal per head.
+    'pq+tok70g': dict(method='pq', offload=True, fraction=0.7,
+                      staging_policy='auto', num_staging_slots=None,
+                      scorer_type='paged_eviction', granularity='token',
+                      budget_scope='global'),
+    'pq+tokrand70g': dict(method='pq', offload=True, fraction=0.7,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='paged_eviction', granularity='token',
+                          token_scorer='random', budget_scope='global'),
+    'pq+tokkvz70g': dict(method='pq', offload=True, fraction=0.7,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='paged_eviction', granularity='token',
+                         token_scorer='kvzip', budget_scope='global'),
+    'pq+tokkvz70l': dict(method='pq', offload=True, fraction=0.7,
+                         staging_policy='auto', num_staging_slots=None,
+                         scorer_type='paged_eviction', granularity='token',
+                         token_scorer='kvzip', budget_scope='layer'),
+    'pq+tok70l': dict(method='pq', offload=True, fraction=0.7,
+                      staging_policy='auto', num_staging_slots=None,
+                      scorer_type='paged_eviction', granularity='token',
+                      budget_scope='layer'),
+    'pq+tok70u': dict(method='pq', offload=True, fraction=0.7,
+                      staging_policy='auto', num_staging_slots=None,
+                      scorer_type='paged_eviction', granularity='token',
+                      budget_scope='uniform'),
+    # 50% offload, equal budget per (layer, head): FastKVzip vs random with the
+    # same budget shape (only the scorer differs).
+    'pq+tok50u': dict(method='pq', offload=True, fraction=0.5,
+                      staging_policy='auto', num_staging_slots=None,
+                      scorer_type='paged_eviction', granularity='token',
+                      budget_scope='uniform'),
+    'pq+tokrand50u': dict(method='pq', offload=True, fraction=0.5,
+                          staging_policy='auto', num_staging_slots=None,
+                          scorer_type='paged_eviction', granularity='token',
+                          token_scorer='random', budget_scope='uniform'),
+    'pq+tok70c': dict(method='pq', offload=True, fraction=0.7,
+                      staging_policy='auto', num_staging_slots=None,
+                      scorer_type='paged_eviction', granularity='token',
+                      budget_scope='cells_shared'),
+    'pq+tok0g': dict(method='pq', offload=True, fraction=0.0,
+                     staging_policy='auto', num_staging_slots=None,
+                     scorer_type='paged_eviction', granularity='token',
+                     budget_scope='global'),
     'pq-nopc': dict(method='pq', offload=False, granularity='nopc'),
     'pq+tok0': dict(method='pq', offload=True, fraction=0.0,
                     staging_policy='auto', num_staging_slots=None,
@@ -187,11 +242,20 @@ def shutdown_llm(llm):
 def run(name, method, offload, fraction=0.5, staging_policy='auto',
         num_staging_slots=None, scorer_type='paged_eviction',
         fetch_granularity='per_layer_tokens', granularity='block',
-        token_scorer='fastkvzip'):
+        token_scorer='fastkvzip', budget_scope='global'):
     print(f"\n{'=' * 70}\nCONFIG: {name}\n{'=' * 70}", flush=True)
     for k, v in SPARSE_ENV.items():
         os.environ[k] = v
     os.environ['SKYLIGHT_SPARSE_METHOD'] = method
+    if method == 'pq':
+        # Skylight upstream (ak/pq): 'pq' is the pure-torch reference; the
+        # production path is 'pq_optimized' with its slot-code maintainer,
+        # driven on the FULL-cg slot path (eager here) with top-k sized from
+        # the live context.
+        os.environ['SKYLIGHT_SPARSE_METHOD'] = 'pq_optimized'
+        os.environ['SKYLIGHT_INCR_FULLCG'] = '1'
+        os.environ['SKYLIGHT_INCR_SLOT'] = '1'
+        os.environ['SKYLIGHT_SPARSE_DYNAMIC_TOPK'] = '1'
 
     kv = None
     if offload and os.environ.get('BENCH_STAGING_SLOTS'):
@@ -210,6 +274,7 @@ def run(name, method, offload, fraction=0.5, staging_policy='auto',
             'fetch_granularity': fetch_granularity,
             'offload_granularity': granularity,
             'token_scorer': token_scorer,
+            'token_budget_scope': budget_scope,
         }
         if num_staging_slots is not None:
             extra['num_staging_slots'] = num_staging_slots

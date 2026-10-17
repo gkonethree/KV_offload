@@ -59,7 +59,6 @@ class ActiveKVConnector(KVConnector):
 
     def set_runner(self, runner) -> None:
         """Delegate set_runner to the wrapped connector."""
-        print(f"[ACTIVE KV CONNECTOR DEBUG] set_runner called, wrapped_connector={type(self.kv_connector)}", flush=True)
         if hasattr(self.kv_connector, 'set_runner'):
             self.kv_connector.set_runner(runner)
 

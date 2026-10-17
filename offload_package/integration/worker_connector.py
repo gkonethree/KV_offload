@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import logging
 from typing import Optional
 
 import torch
@@ -12,7 +11,6 @@ from collections import defaultdict
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -24,20 +22,11 @@ from vllm.forward_context import ForwardContext
 
 from offload_package.config import OffloadConfig
 from offload_package.debug import dbg as _dbg
-from offload_package.controller import KVCompressionController
 from offload_package.integration.manager import OffloadOrchestrator
-from offload_package.scoring.base import BlockRef
 from offload_package.integration.metadata import (
     OffloadPackageMetadata,
     OffloadPackageWorkerMetadata,
 )
-from offload_package.offload.manager import KVOffloadManager
-from offload_package.selection.adapter import (
-    collect_needed_block_refs,
-    patch_paged_kv_indices_with_staging,
-)
-from offload_package.staging.pool import KVStagingPool
-from offload_package.staging.residency import Residency, ResidencyTable
 from offload_package.shared.types import (
     OrchestratorConfig,
     build_orchestrator,
@@ -69,7 +58,6 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         self._orchestrator: Optional[OffloadOrchestrator] = None
 
         # Worker reference for getting request IDs
-        self._worker = None
 
         # Stream for async copies
         self._load_stream = torch.cuda.Stream()
@@ -246,8 +234,6 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                 # the first builds of the new engine cannot act on stale
                 # request ids.
                 skylight_backend.SkylightSparseMetadataBuilder._cached_request_ids = []
-                skylight_backend.SkylightSparseMetadataBuilder._cached_sparse_idx = None
-                skylight_backend.SkylightSparseMetadataBuilder._cached_sparse_len = None
                 armed = (skylight_backend.SkylightSparseMetadataBuilder
                          ._offload_orchestrator is self._orchestrator)
                 assert not injected or armed, (
@@ -269,6 +255,7 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         from offload_package.integration.token_mode import (
             TokenOffloadEngine, install_score_hooks,
         )
+        from offload_package.integration.token_mode_heads import HeadTokenOffloadEngine
         from offload_package.scoring.fastkvzip import (
             BatchedFastKVzipGates, BatchedRandomGates, RandomTokenGate, load_fastkvzip_gates)
         from offload_package.staging.token_store import TokenStagingStore
@@ -277,7 +264,9 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         hf = vc.model_config.hf_config
         max_len = int(vc.model_config.max_model_len)
         max_seqs = int(vc.scheduler_config.max_num_seqs)
-        engine = TokenOffloadEngine(
+        scope = cfg.token_budget_scope
+        per_head = scope != "shared"
+        kw = dict(
             kv_caches=kv_cache_view.k_caches,
             page_size=self.kv_cache_spec.block_size,
             max_len=max_len,
@@ -288,14 +277,40 @@ class OffloadPackageWorker(KVConnectorBase_V1):
             sink_tokens=cfg.token_sink,
             window_tokens=cfg.token_window,
         )
+        if per_head:
+            engine = HeadTokenOffloadEngine(
+                **kw, scope="shared" if scope == "cells_shared" else scope)
+        else:
+            engine = TokenOffloadEngine(**kw)
+        nkv = int(hf.num_key_value_heads)
         if cfg.token_scorer == "random":
-            gates = [RandomTokenGate(seed=i) for i in range(len(kv_cache_view.k_caches))]
-            batched = BatchedRandomGates(seed=len(gates))
+            gates = [RandomTokenGate(seed=i, nhead=nkv if per_head else 1)
+                     for i in range(len(kv_cache_view.k_caches))]
+            batched = BatchedRandomGates(seed=len(gates), nhead=nkv if per_head else None)
+        elif cfg.token_scorer == "kvzip":
+            from offload_package.scoring.kvzip import (
+                DefaultScoreGate, DefaultScoreGates, KVzipScorer, write_prompt_scores)
+            nl = len(kv_cache_view.k_caches)
+            batched = DefaultScoreGates(nl, nkv, per_head, kv_cache_view.device)
+            gates = [DefaultScoreGate(batched, i) for i in range(nl)]
+            holder = {}
+
+            def prompt_scorer(rid, prompt_ids, engine=engine, batched=batched):
+                sc = holder.get("scorer")
+                if sc is None:      # lazy: after vLLM has sized its KV cache
+                    sc = holder["scorer"] = KVzipScorer(
+                        vc.model_config.model, cfg.kvzip_device or kv_cache_view.device,
+                        dtype=vc.model_config.dtype, sink=cfg.token_sink,
+                        chunk_size=cfg.kvzip_chunk)
+                scores = sc.score(prompt_ids)
+                write_prompt_scores(engine, engine.slot_of(rid), scores)
+                batched.set_default(scores[..., cfg.token_sink:])
+            engine.prompt_scorer = prompt_scorer
         else:
             gates = load_fastkvzip_gates(
                 vc.model_config.model, hf.num_attention_heads, hf.num_key_value_heads,
                 kv_cache_view.device)
-            batched = BatchedFastKVzipGates(gates).to(kv_cache_view.device)
+            batched = BatchedFastKVzipGates(gates, per_head=per_head).to(kv_cache_view.device)
         for h in getattr(self, "_token_hooks", []):
             h.remove()
         self._token_hooks = install_score_hooks(self._model_runner, engine, gates, batched)
@@ -305,13 +320,9 @@ class OffloadPackageWorker(KVConnectorBase_V1):
         self._orchestrator.token_store = TokenStagingStore.for_token_engine(
             self._orchestrator.staging_pool, engine)
         logger.info(
-            "OffloadPackageWorker: token offloading on (FastKVzip, fraction=%.2f, "
-            "sink=%d, window=%d, cpu_tokens=%d)", cfg.offload_fraction,
-            cfg.token_sink, cfg.token_window, engine.cpu_pool.shape[1])
-
-    def bind_worker(self, worker) -> None:
-        """Bind to the GPU worker for accessing model runner."""
-        self._worker = worker
+            "OffloadPackageWorker: token offloading on (%s, scope=%s, fraction=%.2f, "
+            "sink=%d, window=%d, cpu rows=%d)", cfg.token_scorer, scope, cfg.offload_fraction,
+            cfg.token_sink, cfg.token_window, engine.cpu_pool.numel() // engine.C2)
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         """Set the connector metadata from the scheduler.
@@ -494,10 +505,6 @@ class OffloadPackageWorker(KVConnectorBase_V1):
                 b._offload_orchestrator = None
                 b._offload_runner = None
                 b._cached_request_ids = []
-                b._cached_sparse_idx = None
-                b._cached_sparse_len = None
-                b._last_decode_wrapper = None
-                b._last_patched_indices = None
         except ImportError:
             pass
         for h in getattr(self, "_token_hooks", []):
